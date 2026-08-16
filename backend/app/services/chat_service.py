@@ -22,7 +22,6 @@ from app.services.topic_service import (
 )
 from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
-from app.services.event_timing_service import find_candidate_windows, format_event_timing_for_prompt, TOPIC_RULES
 
 class ChatService:
     def __init__(self):
@@ -628,7 +627,7 @@ class ChatService:
         """Returns {emphasis, divisional, consistency, missing_evidence,
         timeline, evidence_vote} for this topic — from cache if already
         computed this session, otherwise computes once and caches."""
-        empty = {"emphasis": "", "divisional": "", "consistency": "", "missing_evidence": "", "timeline": "", "evidence_vote": None, "event_timing": ""}
+        empty = {"emphasis": "", "divisional": "", "consistency": "", "missing_evidence": "", "timeline": "", "evidence_vote": None}
         if not topic:
             return empty
 
@@ -637,10 +636,7 @@ class ChatService:
             logger.info(f"Using cached topic bundle for '{topic}'")
             if "evidence_vote" not in cached:
                 cached["evidence_vote"] = None
-            if "event_timing" not in cached:
-                cached["event_timing"] = ""
             return cached
-        
 
         bundle = dict(empty)
         try:
@@ -682,20 +678,7 @@ class ChatService:
                     topic, planets, ascendant_sign, dasha_info, bundle["divisional"]
                 )
 
-
             bundle["timeline"] = self._get_dasha_timeline(session_id, session, topic, language)
-
-            if topic in TOPIC_RULES and cached_raw:
-                try:
-                    cached_tree_raw = session.get("dasha_tree_raw")
-                    if cached_tree_raw:
-                        dasha_tree = json.loads(cached_tree_raw)
-                        flattened = dasha_api_service.flatten_periods(dasha_tree, level="antardasha")
-                        if planets and ascendant_sign:
-                            timing_result = find_candidate_windows(topic, planets, ascendant_sign, flattened)
-                            bundle["event_timing"] = format_event_timing_for_prompt(timing_result, topic, language)
-                except Exception as timing_err:
-                    logger.error(f"Event timing search failed: {timing_err}")
         except Exception as e:
             logger.error(f"Topic bundle build failed for '{topic}': {e}")
 
@@ -751,11 +734,11 @@ class ChatService:
     def _get_yoga_text(self, session: Dict) -> str:
         return session.get("yoga_text") or ""
 
-   
     def _build_final_kundli_data(self, kundli_str: str, topic_emphasis: str, divisional_text: str,
-                                   yoga_text: str, missing_evidence: str = "", event_timing: str = "") -> str:
-        parts = [p for p in [kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence, event_timing] if p]
+                                   yoga_text: str, missing_evidence: str = "") -> str:
+        parts = [p for p in [kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence] if p]
         return "\n\n".join(parts)
+
     # ------------------------------------------------------------------
     # Response Novelty Checker
     # ------------------------------------------------------------------
@@ -945,7 +928,7 @@ class ChatService:
 
             yoga_text = self._get_yoga_text(session) if (is_astrology and not missing_fields) else ""
 
-            topic_emphasis = divisional_text = consistency_note = missing_evidence = dasha_timeline_str = event_timing_str = ""
+            topic_emphasis = divisional_text = consistency_note = missing_evidence = dasha_timeline_str = ""
             evidence_vote = None
             if is_astrology and not missing_fields and topic:
                 bundle = self._get_topic_bundle(session_id, session, topic, language)
@@ -955,11 +938,9 @@ class ChatService:
                 missing_evidence = bundle["missing_evidence"]
                 dasha_timeline_str = bundle["timeline"]
                 evidence_vote = bundle.get("evidence_vote")
-                event_timing_str = bundle.get("event_timing", "")
 
             final_kundli_data = self._build_final_kundli_data(
-                kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence,
-                event_timing=event_timing_str
+                kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence
             )
             if targeted_facts:
                 final_kundli_data = (
@@ -1005,8 +986,6 @@ class ChatService:
 
                         response_text = llm_service.generate(prompt=retry_prompt, temperature=0.75)
 
-                        # Re-validate once after the fix attempt, log-only —
-                        # don't loop indefinitely if the model still misses it.
                         remaining = validate_claims(response_text, dasha_timeline_str, evidence_vote)
                         if remaining:
                             logger.warning(f"Claim validation still found {len(remaining)} issue(s) after regeneration")
@@ -1124,8 +1103,6 @@ class ChatService:
                     else self._fetch_and_cache_kundli(session_id, session)
                 )
 
-            # RAG-first: the knowledge base determines which chart factors
-            # matter before those facts are supplied to the LLM.
             if is_astrology and not missing_fields:
                 if self._is_followup_retrieval_question(message_text, history):
                     context_str, rag_hits = self._get_followup_rag_context(
@@ -1146,7 +1123,7 @@ class ChatService:
 
             yoga_text = self._get_yoga_text(session) if (is_astrology and not missing_fields) else ""
 
-            topic_emphasis = divisional_text = consistency_note = missing_evidence = dasha_timeline_str = event_timing_str = ""
+            topic_emphasis = divisional_text = consistency_note = missing_evidence = dasha_timeline_str = ""
             evidence_vote = None
             if is_astrology and not missing_fields and topic:
                 bundle = self._get_topic_bundle(session_id, session, topic, language)
@@ -1156,11 +1133,9 @@ class ChatService:
                 missing_evidence = bundle["missing_evidence"]
                 dasha_timeline_str = bundle["timeline"]
                 evidence_vote = bundle.get("evidence_vote")
-                event_timing_str = bundle.get("event_timing", "")
 
             final_kundli_data = self._build_final_kundli_data(
-                kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence,
-                event_timing=event_timing_str
+                kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence
             )
             if targeted_facts:
                 final_kundli_data = (
@@ -1203,10 +1178,6 @@ class ChatService:
 
             db.add_message(session_id, "assistant", full_text)
 
-            # Claim validation is LOG-ONLY here — tokens are already streamed
-            # to the user, so there's nothing left to regenerate cleanly.
-            # This still gives you visibility into hallucination rate for
-            # streamed responses without breaking the streaming UX.
             if is_astrology and not missing_fields:
                 try:
                     claim_failures = validate_claims(full_text, dasha_timeline_str, evidence_vote)
@@ -1272,9 +1243,6 @@ class ChatService:
 
             steps = []
 
-            # --------------------------------------------------------------
-            # 1. Classical framework
-            # --------------------------------------------------------------
             framework_lines = []
 
             if houses:
@@ -1331,9 +1299,6 @@ class ChatService:
                 "type": "rag",
             })
 
-            # --------------------------------------------------------------
-            # 2. Targeted chart facts
-            # --------------------------------------------------------------
             if targeted_facts:
                 chart_detail = (
                     "The user's Kundli was examined for the factors "
@@ -1353,9 +1318,6 @@ class ChatService:
                 "type": "chart",
             })
 
-            # --------------------------------------------------------------
-            # 3. Personalized evidence
-            # --------------------------------------------------------------
             personalized_hits = [
                 hit for hit in rag_hits
                 if hit.get("stage") == "personalized"
@@ -1398,9 +1360,6 @@ class ChatService:
                 "type": "personalized_rag",
             })
 
-            # --------------------------------------------------------------
-            # 4. Dasha
-            # --------------------------------------------------------------
             dasha_detail = ""
 
             try:
@@ -1455,9 +1414,6 @@ class ChatService:
                 "type": "dasha",
             })
 
-            # --------------------------------------------------------------
-            # 4. Classical evidence
-            # --------------------------------------------------------------
             reference_lines = []
             seen_references = set()
 
@@ -1508,9 +1464,6 @@ class ChatService:
                 "type": "evidence",
             })
 
-            # --------------------------------------------------------------
-            # 5. Evidence synthesis
-            # --------------------------------------------------------------
             synthesis_lines = []
 
             try:

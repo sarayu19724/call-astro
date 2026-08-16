@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/knowledge_base:/app/knowledge_base
+      - ./backend/vector_db_data:/app/vector_db_data
+      # Map the SQLite file database to preserve history
+      - db_data:/app/database
+    env_file:
+      - ./backend/.env
+    environment:
+      - DATABASE_PATH=/app/database/astro_chat.db
+      # If running Ollama on host machine (Windows/Mac), connect using host.docker.internal
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: always
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: always
+
+volumes:
+  db_data:

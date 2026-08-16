@@ -9,3 +9,4 @@ python-docx>=1.1.0
 python-dotenv>=1.0.0
 pydantic-settings
 sentence-transformers
+pypdf

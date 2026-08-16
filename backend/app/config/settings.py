@@ -1,7 +1,7 @@
 import os
 from pydantic_settings import BaseSettings
 from pathlib import Path
-
+from typing import Optional
 # Resolve base directories
 BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 BASE_DIR = BACKEND_DIR.parent
@@ -14,13 +14,17 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
 
     # Ollama Settings
+    # Ollama Settings
     OLLAMA_HOST: str = "http://localhost:11434"
-    OLLAMA_LLM_MODEL: str = "llama3"         # Default to Llama3 or user config
-    OLLAMA_EMBED_MODEL: str = "nomic-embed-text" # Default embedding model in Ollama
+    OLLAMA_LLM_MODEL: str = "llama3"
+
+    OLLAMA_API_KEY: Optional[str] = None
+    OLLAMA_CLOUD_MODEL: str = "qwen3.5"
+   
 
     # Embedding Settings (ollama | local)
     # If "local", it will fall back to using sentence-transformers on CPU
-    EMBEDDING_PROVIDER: str = "ollama"
+    EMBEDDING_PROVIDER: str = "local"
     LOCAL_EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
 
     # Database

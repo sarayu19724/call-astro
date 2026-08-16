@@ -1,10 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import  { useState, useEffect } from 'react';
 import { ChatWindow } from './components/ChatWindow';
 import { ChatInput } from './components/ChatInput';
 import { ProfileCard } from './components/ProfileCard';
 import { Sparkles, Database, CheckCircle, ArrowLeft, Download, Trash2 } from 'lucide-react';
 import OnboardingForm from './components/OnboardingForm';
-import QuickTopics from './components/QuickTopics';
 import KundliChartToggle from './components/KundliChartToggle';
 import LifeDashboard from './components/LifeDashboard';
 import EditDetailsModal from './components/EditDetailsModal';

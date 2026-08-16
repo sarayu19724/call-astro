@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import  { useState } from 'react';
 import KundliChart from './KundliChart';
 import SouthIndianChart from './SouthIndianChart';
 

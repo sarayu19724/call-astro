@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     # Ollama Settings
     OLLAMA_HOST: str = "http://localhost:11434"
     OLLAMA_LLM_MODEL: str = "llama3"
-
+    OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
     OLLAMA_API_KEY: Optional[str] = None
     OLLAMA_CLOUD_MODEL: str = "qwen3.5"
    

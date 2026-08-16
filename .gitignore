@@ -2,7 +2,7 @@
 .venv/
 venv/
 env/
-
+.env.example/
 # Node/Frontend
 frontend/node_modules/
 frontend/dist/
@@ -16,7 +16,6 @@ __pycache__/
 .Python
 backend/astro_chat.db
 backend/vector_db_data/
-backend/astro_chat.db
 
 # Auto-generated vector store — never commit or merge these
 # They are rebuilt automatically on server startup

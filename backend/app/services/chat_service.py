@@ -1103,6 +1103,8 @@ class ChatService:
                     else self._fetch_and_cache_kundli(session_id, session)
                 )
 
+            # RAG-first: the knowledge base determines which chart factors
+            # matter before those facts are supplied to the LLM.
             if is_astrology and not missing_fields:
                 if self._is_followup_retrieval_question(message_text, history):
                     context_str, rag_hits = self._get_followup_rag_context(
@@ -1178,6 +1180,8 @@ class ChatService:
 
             db.add_message(session_id, "assistant", full_text)
 
+            # Claim validation is LOG-ONLY here — tokens are already streamed
+            # to the user, so there's nothing left to regenerate cleanly.
             if is_astrology and not missing_fields:
                 try:
                     claim_failures = validate_claims(full_text, dasha_timeline_str, evidence_vote)
@@ -1243,6 +1247,9 @@ class ChatService:
 
             steps = []
 
+            # --------------------------------------------------------------
+            # 1. Classical framework
+            # --------------------------------------------------------------
             framework_lines = []
 
             if houses:
@@ -1299,6 +1306,9 @@ class ChatService:
                 "type": "rag",
             })
 
+            # --------------------------------------------------------------
+            # 2. Targeted chart facts
+            # --------------------------------------------------------------
             if targeted_facts:
                 chart_detail = (
                     "The user's Kundli was examined for the factors "
@@ -1318,6 +1328,9 @@ class ChatService:
                 "type": "chart",
             })
 
+            # --------------------------------------------------------------
+            # 3. Personalized evidence
+            # --------------------------------------------------------------
             personalized_hits = [
                 hit for hit in rag_hits
                 if hit.get("stage") == "personalized"
@@ -1360,6 +1373,9 @@ class ChatService:
                 "type": "personalized_rag",
             })
 
+            # --------------------------------------------------------------
+            # 4. Dasha
+            # --------------------------------------------------------------
             dasha_detail = ""
 
             try:
@@ -1414,6 +1430,9 @@ class ChatService:
                 "type": "dasha",
             })
 
+            # --------------------------------------------------------------
+            # 5. Classical evidence
+            # --------------------------------------------------------------
             reference_lines = []
             seen_references = set()
 
@@ -1464,6 +1483,9 @@ class ChatService:
                 "type": "evidence",
             })
 
+            # --------------------------------------------------------------
+            # 6. Evidence synthesis
+            # --------------------------------------------------------------
             synthesis_lines = []
 
             try:

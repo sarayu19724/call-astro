@@ -2,7 +2,7 @@
 .venv/
 venv/
 env/
-.env.example/
+.env
 # Node/Frontend
 frontend/node_modules/
 frontend/dist/

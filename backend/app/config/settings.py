@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     OLLAMA_LLM_MODEL: str = "llama3"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
     OLLAMA_API_KEY: Optional[str] = None
-    OLLAMA_CLOUD_MODEL: str = "qwen3.5"
+    OLLAMA_CLOUD_MODEL: str = "gpt-oss:20b"
    
 
     # Embedding Settings (ollama | local)

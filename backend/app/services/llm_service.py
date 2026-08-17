@@ -34,7 +34,7 @@ class LLMService:
         self.cloud_model = getattr(
             settings,
             "OLLAMA_CLOUD_MODEL",
-            "qwen3.5"
+            "gpt-oss:20b"
         )
         self.cloud_url = "https://ollama.com/api"
 

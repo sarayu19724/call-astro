@@ -161,7 +161,7 @@ export default function ReasoningTrace({
             <ol className="space-y-4">
               {steps.map((s, index) => {
                 const stepType = s.type || 'general';
-                const Icon =STEP_ICONS[s.type as keyof typeof STEP_ICONS] ?? Sparkles;
+                const Icon =STEP_ICONS[stepType as keyof typeof STEP_ICONS] ?? Sparkles;
                 if (!(stepType in STEP_ICONS)) {console.warn('Unknown reasoning step type:', stepType, s);}
                 return (
                   <li

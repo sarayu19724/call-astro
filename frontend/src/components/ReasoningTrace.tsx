@@ -1,4 +1,8 @@
 import { useEffect, useState } from 'react';
+const API_BASE =
+  ((import.meta as ImportMeta & {
+    env?: { VITE_API_BASE?: string }
+  }).env?.VITE_API_BASE) || '/api';
 import {
   Sparkles,
   ChevronDown,
@@ -79,7 +83,7 @@ export default function ReasoningTrace({
 
     setLoading(true);
 
-    fetch(`/api/session/${sessionId}/reasoning-trace`)
+    fetch(`${API_BASE}/session/${sessionId}/reasoning-trace`)
       .then((res) => {
         if (!res.ok) {
           throw new Error('Failed to fetch reasoning trace');
@@ -156,8 +160,7 @@ export default function ReasoningTrace({
           ) : (
             <ol className="space-y-4">
               {steps.map((s, index) => {
-                const Icon = STEP_ICONS[s.type || 'general'];
-
+                const Icon =STEP_ICONS[s.type as keyof typeof STEP_ICONS] || Sparkles;
                 return (
                   <li
                     key={`${s.step}-${index}`}

@@ -1,5 +1,5 @@
 
-from typing import Optional, List, Dict, Any
+from typing import Dict, Any, List, Optional, Set
 from app.services.kundli_service import get_house_lord
 
 # Simplified but reasonable chart-factor mapping per life topic.
@@ -823,3 +823,49 @@ def build_missing_evidence_note(
         f"entirely or speak in slightly more general terms for that part only, while still "
         f"staying confident about what IS available."
     )
+    
+def get_evidence_consensus_label(vote: Optional[Dict]) -> str:
+    """Converts the numeric evidence vote into a plain confidence label —
+    HIGH / MEDIUM / LOW / CONFLICTING — for prompt calibration and for
+    surfacing directly in the UI/reasoning trace."""
+    if not vote:
+        return "LOW"
+
+    positive = vote.get("positive_count", 0)
+    negative = vote.get("negative_count", 0)
+    confidence = vote.get("confidence_pct", 50)
+
+    if positive > 0 and negative > 0:
+        return "CONFLICTING"
+    if confidence >= 70:
+        return "HIGH"
+    if confidence >= 45:
+        return "MEDIUM"
+    return "LOW"
+
+
+CONSENSUS_INSTRUCTIONS = {
+    "HIGH": (
+        "Evidence confidence is HIGH — multiple independent sources agree. "
+        "You may state the prediction with direct, confident language."
+    ),
+    "MEDIUM": (
+        "Evidence confidence is MEDIUM — the signal leans in one direction "
+        "but isn't unanimous. State the prediction with grounded but "
+        "slightly softer confidence."
+    ),
+    "LOW": (
+        "Evidence confidence is LOW — little or no clear signal was found. "
+        "Avoid strong claims; speak in general terms and acknowledge the "
+        "limited evidence rather than inventing certainty."
+    ),
+    "CONFLICTING": (
+        "Evidence is CONFLICTING — different sources point in different "
+        "directions. Do NOT force a single confident verdict. Explain the "
+        "supportive factor and the limiting factor separately, honestly."
+    ),
+}
+
+
+def get_consensus_instruction(label: str) -> str:
+    return CONSENSUS_INSTRUCTIONS.get(label, CONSENSUS_INSTRUCTIONS["LOW"])

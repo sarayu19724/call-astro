@@ -12,13 +12,14 @@ import {
   Clock3,
   ShieldCheck,
   Brain,
+  Search,
 } from 'lucide-react';
 
 interface TraceStep {
   step: number;
   title: string;
   detail: string;
-  type?: 'rag' | 'chart' | 'dasha' | 'evidence' | 'synthesis' | 'general';
+  type?: 'rag' | 'chart' | 'personalized_rag' | 'dasha' | 'evidence' | 'synthesis' | 'general';
 }
 
 interface ReasoningTraceProps {
@@ -58,14 +59,35 @@ const STRINGS: Record<
   },
 };
 
+// personalized_rag added — backend's Stage 2 retrieval step (see
+// _get_rag_first_context / _build_reasoning_trace's "step": 3 entry)
+// didn't have an icon mapping before, so it silently fell back to
+// Sparkles and logged a console warning on every render.
 const STEP_ICONS = {
   rag: BookOpen,
   chart: CircleUserRound,
+  personalized_rag: Search,
   dasha: Clock3,
   evidence: ShieldCheck,
   synthesis: Brain,
   general: Sparkles,
 };
+
+// The synthesis step's detail text now includes a line like
+// "Evidence consensus: HIGH" (added via bundle["consensus_label"] +
+// get_evidence_consensus_label in chat_service.py). Pulled out here so
+// it can render as a badge instead of staying buried in the paragraph.
+const CONSENSUS_STYLES: Record<string, string> = {
+  HIGH: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  MEDIUM: 'bg-amber-50 text-amber-700 border-amber-200',
+  LOW: 'bg-slate-100 text-slate-500 border-slate-200',
+  CONFLICTING: 'bg-rose-50 text-rose-700 border-rose-200',
+};
+
+function extractConsensusLabel(detail: string): string | null {
+  const match = detail.match(/Evidence consensus:\s*(HIGH|MEDIUM|LOW|CONFLICTING)/i);
+  return match ? match[1].toUpperCase() : null;
+}
 
 export default function ReasoningTrace({
   sessionId,
@@ -161,8 +183,14 @@ export default function ReasoningTrace({
             <ol className="space-y-4">
               {steps.map((s, index) => {
                 const stepType = s.type || 'general';
-                const Icon =STEP_ICONS[stepType as keyof typeof STEP_ICONS] ?? Sparkles;
-                if (!(stepType in STEP_ICONS)) {console.warn('Unknown reasoning step type:', stepType, s);}
+                const Icon = STEP_ICONS[stepType as keyof typeof STEP_ICONS] ?? Sparkles;
+                if (!(stepType in STEP_ICONS)) {
+                  console.warn('Unknown reasoning step type:', stepType, s);
+                }
+
+                const consensusLabel =
+                  stepType === 'synthesis' ? extractConsensusLabel(s.detail) : null;
+
                 return (
                   <li
                     key={`${s.step}-${index}`}
@@ -175,8 +203,19 @@ export default function ReasoningTrace({
 
                     {/* Step content */}
                     <div className="min-w-0 flex-1">
-                      <div className="text-xs font-semibold text-slate-700">
-                        {s.step}. {s.title}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-xs font-semibold text-slate-700">
+                          {s.step}. {s.title}
+                        </span>
+                        {consensusLabel && (
+                          <span
+                            className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
+                              CONSENSUS_STYLES[consensusLabel] || CONSENSUS_STYLES.LOW
+                            }`}
+                          >
+                            {consensusLabel} CONFIDENCE
+                          </span>
+                        )}
                       </div>
 
                       <div className="text-xs text-slate-500 mt-1 leading-relaxed whitespace-pre-line">

@@ -13,13 +13,15 @@ import {
   ShieldCheck,
   Brain,
   Search,
+  Gauge,
+  FileCheck2,
 } from 'lucide-react';
 
 interface TraceStep {
   step: number;
   title: string;
   detail: string;
-  type?: 'rag' | 'chart' | 'personalized_rag' | 'dasha' | 'evidence' | 'synthesis' | 'general';
+  type?: 'rag' | 'chart' | 'personalized_rag' | 'consensus' | 'dasha' | 'evidence' | 'synthesis' | 'specificity' | 'general';
 }
 
 interface ReasoningTraceProps {
@@ -59,24 +61,25 @@ const STRINGS: Record<
   },
 };
 
-// personalized_rag added — backend's Stage 2 retrieval step (see
-// _get_rag_first_context / _build_reasoning_trace's "step": 3 entry)
-// didn't have an icon mapping before, so it silently fell back to
-// Sparkles and logged a console warning on every render.
+// Backend's 8-step trace (see chat_service.py _build_reasoning_trace):
+// 1 rag, 2 chart, 3 personalized_rag, 4 consensus, 5 dasha,
+// 6 evidence, 7 synthesis, 8 specificity.
 const STEP_ICONS = {
   rag: BookOpen,
   chart: CircleUserRound,
   personalized_rag: Search,
+  consensus: Gauge,
   dasha: Clock3,
   evidence: ShieldCheck,
   synthesis: Brain,
+  specificity: FileCheck2,
   general: Sparkles,
 };
 
-// The synthesis step's detail text now includes a line like
-// "Evidence consensus: HIGH" (added via bundle["consensus_label"] +
-// get_evidence_consensus_label in chat_service.py). Pulled out here so
-// it can render as a badge instead of staying buried in the paragraph.
+// Step 4 ("Evidence Consensus") detail text contains a line like
+// "Evidence confidence: HIGH" (see consensus_lines in chat_service.py).
+// NOTE: backend says "Evidence confidence:", not "Evidence consensus:" —
+// the regex below matches the backend's actual wording.
 const CONSENSUS_STYLES: Record<string, string> = {
   HIGH: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   MEDIUM: 'bg-amber-50 text-amber-700 border-amber-200',
@@ -85,7 +88,20 @@ const CONSENSUS_STYLES: Record<string, string> = {
 };
 
 function extractConsensusLabel(detail: string): string | null {
-  const match = detail.match(/Evidence consensus:\s*(HIGH|MEDIUM|LOW|CONFLICTING)/i);
+  const match = detail.match(/Evidence confidence:\s*(HIGH|MEDIUM|LOW|CONFLICTING)/i);
+  return match ? match[1].toUpperCase() : null;
+}
+
+// Step 8 ("Chart-Specificity Check") detail text contains a line like
+// "Status: SPECIFIC" or "Status: GENERIC" (see specificity_lines in
+// chat_service.py).
+const SPECIFICITY_STYLES: Record<string, string> = {
+  SPECIFIC: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  GENERIC: 'bg-rose-50 text-rose-700 border-rose-200',
+};
+
+function extractSpecificityLabel(detail: string): string | null {
+  const match = detail.match(/Status:\s*(SPECIFIC|GENERIC)/i);
   return match ? match[1].toUpperCase() : null;
 }
 
@@ -189,7 +205,9 @@ export default function ReasoningTrace({
                 }
 
                 const consensusLabel =
-                  stepType === 'synthesis' ? extractConsensusLabel(s.detail) : null;
+                  stepType === 'consensus' ? extractConsensusLabel(s.detail) : null;
+                const specificityLabel =
+                  stepType === 'specificity' ? extractSpecificityLabel(s.detail) : null;
 
                 return (
                   <li
@@ -214,6 +232,15 @@ export default function ReasoningTrace({
                             }`}
                           >
                             {consensusLabel} CONFIDENCE
+                          </span>
+                        )}
+                        {specificityLabel && (
+                          <span
+                            className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
+                              SPECIFICITY_STYLES[specificityLabel] || SPECIFICITY_STYLES.GENERIC
+                            }`}
+                          >
+                            {specificityLabel}
                           </span>
                         )}
                       </div>

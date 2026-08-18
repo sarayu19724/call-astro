@@ -24,7 +24,9 @@ from app.services.topic_service import (
 )
 from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
-
+from app.services.chart_activation_service import (
+    compute_activation_scores, get_top_activated_planets, format_activation_summary_for_prompt
+)
 
 
 class ChatService:
@@ -278,6 +280,48 @@ class ChatService:
             parts.append(targeted_facts)
         return " ".join(p for p in parts if p).strip()
 
+    def _get_multihop_evidence(self, topic: str, ranked_factors: List[Dict], seen_keys: set):
+        """Multi-hop RAG: separate retrieval per top-activated planet."""
+        chunks = []
+        hits = []
+        if not ranked_factors:
+            return "", []
+
+        for factor in ranked_factors:
+            planet = factor["planet"]
+            query = f"{planet} in {topic} astrology — house placement, strength, classical effects"
+            try:
+                query_vector = self.embeddings_provider.get_embedding(query)
+                results = vector_store.hybrid_search(
+                    query=query, query_vector=query_vector,
+                    top_k=3, alpha=settings.HYBRID_ALPHA
+                )
+            except Exception as e:
+                logger.error(f"[MultiHop] retrieval failed for '{planet}': {e}")
+                continue
+
+            for hit in results:
+                if hit["score"] < settings.MIN_RAG_RELEVANCE:
+                    continue
+                source = hit["metadata"].get("source", "Unknown")
+                page = hit["metadata"].get("page")
+                key = (source, page)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                page_label = f", Page: {page}" if page is not None else ""
+                chunks.append(
+                    f"--- Multi-Hop Evidence ({planet}) [Source: {source}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
+                )
+                hits.append({
+                    "source": source, "page": page, "score": hit["score"],
+                    "text": hit["text"], "stage": "multihop", "factor": planet,
+                })
+
+        logger.info(f"[MultiHop] retrieved {len(hits)} additional chunks across {len(ranked_factors)} factor(s)")
+        return "\n".join(chunks), hits
+
     def _get_rag_first_context(self, message_text: str, topic: Optional[str], session: Dict):
         try:
             from app.services.topic_service import TOPIC_RELEVANT_BOOKS
@@ -304,10 +348,12 @@ class ChatService:
 
             framework_rag_hits = []
             framework_chunks = []
+            seen_keys = set()
 
             for i, hit in enumerate(framework_hits):
                 source = hit["metadata"].get("source", "Unknown")
                 page = hit["metadata"].get("page")
+                seen_keys.add((source, page))
                 page_label = f", Page: {page}" if page is not None else ""
 
                 framework_chunks.append(
@@ -325,6 +371,24 @@ class ChatService:
                 f"[RAGFirst] framework factors houses={referenced['houses']} "
                 f"planets={referenced['planets']} charts={referenced['charts']} concepts={referenced['concepts']}"
             )
+
+            # --- Deterministic Chart Fact Graph + Activation Scoring ---
+            ranked_factors = []
+            cached_raw = session.get("kundli_raw")
+            cached_dasha = session.get("kundli_dasha")
+            if topic and cached_raw:
+                try:
+                    parsed = json.loads(cached_raw)
+                    chart_planets = parsed.get("planets", []) or []
+                    chart_ascendant = parsed.get("ascendant_sign")
+                    chart_dasha = json.loads(cached_dasha) if cached_dasha else None
+                    ranked_factors = get_top_activated_planets(topic, chart_planets, chart_ascendant, chart_dasha, top_n=3)
+                    if ranked_factors:
+                        activation_summary = format_activation_summary_for_prompt(topic, ranked_factors)
+                        targeted_facts = f"{targeted_facts}\n\n{activation_summary}" if targeted_facts else activation_summary
+                        logger.info(f"[ActivationScore] top factors: {[(r['planet'], r['score']) for r in ranked_factors]}")
+                except Exception as e:
+                    logger.error(f"Activation scoring failed: {e}")
 
             personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts)
             personalized_vector = self.embeddings_provider.get_embedding(personalized_query)
@@ -348,6 +412,10 @@ class ChatService:
             for i, hit in enumerate(personalized_hits):
                 source = hit["metadata"].get("source", "Unknown")
                 page = hit["metadata"].get("page")
+                key = (source, page)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
                 page_label = f", Page: {page}" if page is not None else ""
 
                 personalized_chunks.append(
@@ -358,14 +426,21 @@ class ChatService:
                     "text": hit["text"], "stage": "personalized",
                 })
 
-            all_hits = framework_rag_hits + personalized_rag_hits
+            multihop_chunks_str, multihop_hits = self._get_multihop_evidence(topic, ranked_factors, seen_keys) if (topic and ranked_factors) else ("", [])
 
+            all_hits = framework_rag_hits + personalized_rag_hits + multihop_hits
+
+            context_parts = ["\n".join(framework_chunks)]
             if personalized_chunks:
-                context = "\n".join(framework_chunks) + "\n" + "\n".join(personalized_chunks)
-            else:
-                context = "\n".join(framework_chunks)
+                context_parts.append("\n".join(personalized_chunks))
+            if multihop_chunks_str:
+                context_parts.append(multihop_chunks_str)
+            context = "\n".join(p for p in context_parts if p)
 
-            logger.info(f"[RAGFirst] framework={len(framework_rag_hits)}, personalized={len(personalized_rag_hits)}")
+            logger.info(
+                f"[RAGFirst] framework={len(framework_rag_hits)}, "
+                f"personalized={len(personalized_rag_hits)}, multihop={len(multihop_hits)}"
+            )
 
             return context, all_hits, targeted_facts
 
@@ -665,7 +740,6 @@ class ChatService:
             logger.error(f"Follow-up suggestion generation failed: {followup_err}")
             return []
 
-    
     # ------------------------------------------------------------------
     # NON-STREAMING — POST /api/chat
     # ------------------------------------------------------------------
@@ -729,8 +803,6 @@ class ChatService:
                         "birth_place": session.get("birth_place"), "language": language
                     }
 
-            
-
             topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
             intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
             response_contract = get_response_contract(intent)
@@ -791,7 +863,6 @@ class ChatService:
                     recent_texts = self._get_recent_assistant_texts(session_id)
                     similar_to = self._is_too_similar(response_text, recent_texts)
 
-                    # Pull real chart data for claim verification
                     verify_planets, verify_ascendant = [], None
                     cached_raw_for_verify = session.get("kundli_raw")
                     if cached_raw_for_verify:
@@ -929,8 +1000,6 @@ class ChatService:
                            "birth_place": session.get("birth_place"), "language": language}
                     return
 
-          
-
             topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
             intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
             response_contract = get_response_contract(intent)
@@ -1060,22 +1129,9 @@ class ChatService:
         targeted_facts: str = "",
         response_text: str = "",
     ) -> list:
-        """Builds an auditable trace of the RAG-first pipeline as 8 distinct
-        steps:
-          1. Classical Framework Retrieved
-          2. Relevant Chart Factors
-          3. Personalized Evidence Retrieved
-          4. Evidence Consensus   (HIGH/MEDIUM/LOW/CONFLICTING + vote breakdown)
-          5. Dasha & Timing
-          6. Classical Evidence   (source list)
-          7. Evidence Synthesis   (short summary line)
-          8. Chart-Specificity Check (GENERIC/SPECIFIC)
-
-        Nothing here recomputes RAG, the evidence vote, or the specificity
-        score — it only reads what's already been calculated elsewhere
-        (topic bundle cache, session cache, and the response_text passed in)
-        and lays it out as separate, inspectable steps.
-        """
+        """9-step trace: Classical Framework, Chart Factors, Factor Activation
+        Ranking, Personalized+Multi-Hop Evidence, Evidence Consensus, Dasha &
+        Timing, Classical Evidence, Evidence Synthesis, Chart-Specificity Check."""
         if not topic and not rag_hits:
             return []
 
@@ -1090,9 +1146,7 @@ class ChatService:
 
             steps = []
 
-            # ----------------------------------------------------------
             # STEP 1 — CLASSICAL FRAMEWORK RETRIEVED
-            # ----------------------------------------------------------
             framework_lines = []
             if houses:
                 house_labels = []
@@ -1118,9 +1172,7 @@ class ChatService:
 
             steps.append({"step": 1, "title": "Classical Framework Retrieved", "detail": framework_detail, "type": "rag"})
 
-            # ----------------------------------------------------------
             # STEP 2 — RELEVANT CHART FACTORS
-            # ----------------------------------------------------------
             if targeted_facts:
                 chart_detail = (
                     "The user's Kundli was examined for the factors identified by the retrieved classical sources.\n\n"
@@ -1131,37 +1183,71 @@ class ChatService:
 
             steps.append({"step": 2, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
 
-            # ----------------------------------------------------------
-            # STEP 3 — PERSONALIZED EVIDENCE RETRIEVED
-            # ----------------------------------------------------------
+            # STEP 3 — FACTOR ACTIVATION RANKING (deterministic)
+            activation_detail = "Not applicable — no topic classified for this question."
+            if topic:
+                try:
+                    cached_raw = session.get("kundli_raw")
+                    cached_dasha = session.get("kundli_dasha")
+                    if cached_raw:
+                        parsed = json.loads(cached_raw)
+                        chart_planets = parsed.get("planets", []) or []
+                        chart_ascendant = parsed.get("ascendant_sign")
+                        chart_dasha = json.loads(cached_dasha) if cached_dasha else None
+                        ranked = get_top_activated_planets(topic, chart_planets, chart_ascendant, chart_dasha, top_n=3)
+                        if ranked:
+                            lines = [
+                                f"{i}. {r['planet']} — score {r['score']} ({', '.join(r['reasons'])})"
+                                for i, r in enumerate(ranked, 1)
+                            ]
+                            activation_detail = (
+                                "Deterministic scoring (house lordship, significator status, occupancy, "
+                                "aspects, Dasha activation, own-sign) — not derived from RAG text:\n"
+                                + "\n".join(lines)
+                            )
+                        else:
+                            activation_detail = "No planets scored above zero for this topic."
+                except Exception as act_err:
+                    logger.warning(f"Could not build activation ranking trace: {act_err}")
+                    activation_detail = "Activation ranking not available."
+
+            steps.append({"step": 3, "title": "Factor Activation Ranking", "detail": activation_detail, "type": "activation"})
+
+            # STEP 4 — PERSONALIZED + MULTI-HOP EVIDENCE RETRIEVED
             personalized_hits = [hit for hit in rag_hits if hit.get("stage") == "personalized"]
+            multihop_hits = [hit for hit in rag_hits if hit.get("stage") == "multihop"]
+
+            evidence_lines = []
             if personalized_hits:
-                personalized_sources = []
-                seen_personalized = set()
+                seen_p = set()
+                p_sources = []
                 for hit in personalized_hits:
-                    source = hit.get("source", "Unknown source")
-                    page = hit.get("page")
-                    key = (source, page)
-                    if key in seen_personalized:
+                    key = (hit.get("source"), hit.get("page"))
+                    if key in seen_p:
                         continue
-                    seen_personalized.add(key)
-                    reference = f"{source} — Page {page}" if page is not None else source
-                    personalized_sources.append(f"• {reference}")
+                    seen_p.add(key)
+                    ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
+                    p_sources.append(f"• {ref}")
+                evidence_lines.append("Personalized retrieval (using chart configuration):")
+                evidence_lines.extend(p_sources)
 
-                personalized_detail = (
-                    "A second retrieval pass used the actual chart facts identified in Stage 1 "
-                    "to find classical evidence specific to this chart configuration."
-                )
-                if personalized_sources:
-                    personalized_detail += "\n\n" + "\n".join(personalized_sources)
-            else:
-                personalized_detail = "No additional personalized evidence was retrieved."
+            if multihop_hits:
+                seen_m = set()
+                m_sources = []
+                for hit in multihop_hits:
+                    key = (hit.get("source"), hit.get("page"), hit.get("factor"))
+                    if key in seen_m:
+                        continue
+                    seen_m.add(key)
+                    ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
+                    m_sources.append(f"• {ref} [hop: {hit.get('factor')}]")
+                evidence_lines.append("\nMulti-hop retrieval (separate query per top-activated factor):")
+                evidence_lines.extend(m_sources)
 
-            steps.append({"step": 3, "title": "Personalized Evidence Retrieved", "detail": personalized_detail, "type": "personalized_rag"})
+            evidence_detail = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or multi-hop evidence was retrieved."
+            steps.append({"step": 4, "title": "Personalized + Multi-Hop Evidence Retrieved", "detail": evidence_detail, "type": "personalized_rag"})
 
-            # ----------------------------------------------------------
-            # STEP 4 — EVIDENCE CONSENSUS
-            # ----------------------------------------------------------
+            # STEP 5 — EVIDENCE CONSENSUS
             consensus_label = None
             evidence_vote = None
             consistency = ""
@@ -1217,11 +1303,9 @@ class ChatService:
             if consistency:
                 consensus_lines.append(f"\nSignal consistency:\n{consistency}")
 
-            steps.append({"step": 4, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
+            steps.append({"step": 5, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
 
-            # ----------------------------------------------------------
-            # STEP 5 — DASHA & TIMING
-            # ----------------------------------------------------------
+            # STEP 6 — DASHA & TIMING
             dasha_detail = ""
             try:
                 cached_dasha = session.get("kundli_dasha")
@@ -1241,11 +1325,9 @@ class ChatService:
             if not dasha_detail:
                 dasha_detail = "Current Dasha information was not available in the cached chart data."
 
-            steps.append({"step": 5, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
+            steps.append({"step": 6, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
 
-            # ----------------------------------------------------------
-            # STEP 6 — CLASSICAL EVIDENCE
-            # ----------------------------------------------------------
+            # STEP 7 — CLASSICAL EVIDENCE
             reference_lines = []
             seen_references = set()
             for hit in rag_hits:
@@ -1268,20 +1350,16 @@ class ChatService:
                 reference_lines.append(f"• {reference}")
 
             evidence_detail = "\n".join(reference_lines) if reference_lines else "No classical references were available."
-            steps.append({"step": 6, "title": "Classical Evidence", "detail": evidence_detail, "type": "evidence"})
+            steps.append({"step": 7, "title": "Classical Evidence", "detail": evidence_detail, "type": "evidence"})
 
-            # ----------------------------------------------------------
-            # STEP 7 — EVIDENCE SYNTHESIS
-            # ----------------------------------------------------------
+            # STEP 8 — EVIDENCE SYNTHESIS
             synthesis_detail = (
-                "The final interpretation combines the retrieved classical evidence "
-                "with the relevant Kundli and Dasha information."
+                "The final interpretation combines the retrieved classical evidence, deterministic factor "
+                "activation ranking, and the relevant Kundli and Dasha information."
             )
-            steps.append({"step": 7, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
+            steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 
-            # ----------------------------------------------------------
-            # STEP 8 — CHART-SPECIFICITY CHECK
-            # ----------------------------------------------------------
+            # STEP 9 — CHART-SPECIFICITY CHECK
             specificity_lines = []
 
             if response_text:
@@ -1299,7 +1377,7 @@ class ChatService:
             else:
                 specificity_lines.append("Status: Not available — no response text supplied")
 
-            steps.append({"step": 8, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
+            steps.append({"step": 9, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
 
             logger.info(f"[RAGFirst] Reasoning trace built: {len(steps)} steps")
             return steps

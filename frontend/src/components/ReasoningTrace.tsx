@@ -15,13 +15,24 @@ import {
   Search,
   Gauge,
   FileCheck2,
+  ListOrdered,
 } from 'lucide-react';
 
 interface TraceStep {
   step: number;
   title: string;
   detail: string;
-  type?: 'rag' | 'chart' | 'personalized_rag' | 'consensus' | 'dasha' | 'evidence' | 'synthesis' | 'specificity' | 'general';
+  type?:
+    | 'rag'
+    | 'chart'
+    | 'activation'
+    | 'personalized_rag'
+    | 'consensus'
+    | 'dasha'
+    | 'evidence'
+    | 'synthesis'
+    | 'specificity'
+    | 'general';
 }
 
 interface ReasoningTraceProps {
@@ -61,12 +72,13 @@ const STRINGS: Record<
   },
 };
 
-// Backend's 8-step trace (see chat_service.py _build_reasoning_trace):
-// 1 rag, 2 chart, 3 personalized_rag, 4 consensus, 5 dasha,
-// 6 evidence, 7 synthesis, 8 specificity.
+// Backend's 9-step trace (see chat_service.py _build_reasoning_trace):
+// 1 rag, 2 chart, 3 activation, 4 personalized_rag, 5 consensus,
+// 6 dasha, 7 evidence, 8 synthesis, 9 specificity.
 const STEP_ICONS = {
   rag: BookOpen,
   chart: CircleUserRound,
+  activation: ListOrdered,
   personalized_rag: Search,
   consensus: Gauge,
   dasha: Clock3,
@@ -76,7 +88,7 @@ const STEP_ICONS = {
   general: Sparkles,
 };
 
-// Step 4 ("Evidence Consensus") detail text contains a line like
+// Step 5 ("Evidence Consensus") detail text contains a line like
 // "Evidence confidence: HIGH" (see consensus_lines in chat_service.py).
 // NOTE: backend says "Evidence confidence:", not "Evidence consensus:" —
 // the regex below matches the backend's actual wording.
@@ -92,7 +104,7 @@ function extractConsensusLabel(detail: string): string | null {
   return match ? match[1].toUpperCase() : null;
 }
 
-// Step 8 ("Chart-Specificity Check") detail text contains a line like
+// Step 9 ("Chart-Specificity Check") detail text contains a line like
 // "Status: SPECIFIC" or "Status: GENERIC" (see specificity_lines in
 // chat_service.py).
 const SPECIFICITY_STYLES: Record<string, string> = {

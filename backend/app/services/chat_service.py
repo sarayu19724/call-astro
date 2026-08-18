@@ -912,11 +912,11 @@ class ChatService:
             if is_astrology and not missing_fields:
                 try:
                     trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, response_text)
+                    logger.info(f"[TRACE_V9_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
                     db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
+                    logger.info(f"[TRACE_V9_ACTIVE] Save confirmed for session {session_id}")
                 except Exception as trace_err:
-                    logger.error(f"Reasoning trace caching failed: {trace_err}")
-                self._update_topic_memory(session_id, session, topic, response_text)
-
+                    logger.error(f"[TRACE_V9_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
             suggestions = []
             if response_text and len(response_text) > 20:
                 suggestions = self._safe_generate_followups(response_text, language)
@@ -1101,11 +1101,12 @@ class ChatService:
 
             if is_astrology and not missing_fields:
                 try:
-                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, full_text)
+                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, response_text)
+                    logger.info(f"[TRACE_V9_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
                     db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
+                    logger.info(f"[TRACE_V9_ACTIVE] Save confirmed for session {session_id}")
                 except Exception as trace_err:
-                    logger.error(f"Reasoning trace caching failed: {trace_err}")
-                self._update_topic_memory(session_id, session, topic, full_text)
+                    logger.error(f"[TRACE_V9_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
 
             suggestions = get_instant_suggestions(topic, language)
 
@@ -1145,7 +1146,7 @@ class ChatService:
             concepts = sorted(referenced.get("concepts", set()))
 
             steps = []
-
+            logger.info("[TRACE_V9_ACTIVE] _build_reasoning_trace entered — this log line only exists in the 9-step version")
             # STEP 1 — CLASSICAL FRAMEWORK RETRIEVED
             framework_lines = []
             if houses:
@@ -1183,7 +1184,7 @@ class ChatService:
 
             steps.append({"step": 2, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
 
-            # STEP 3 — FACTOR ACTIVATION RANKING (deterministic)
+                        # STEP 3 — FACTOR ACTIVATION RANKING (deterministic)
             activation_detail = "Not applicable — no topic classified for this question."
             if topic:
                 try:
@@ -1194,22 +1195,31 @@ class ChatService:
                         chart_planets = parsed.get("planets", []) or []
                         chart_ascendant = parsed.get("ascendant_sign")
                         chart_dasha = json.loads(cached_dasha) if cached_dasha else None
-                        ranked = get_top_activated_planets(topic, chart_planets, chart_ascendant, chart_dasha, top_n=3)
-                        if ranked:
+
+                        all_scores = compute_activation_scores(topic, chart_planets, chart_ascendant, chart_dasha)
+                        logger.info(f"[TRACE_V9_ACTIVE] compute_activation_scores returned {len(all_scores)} scored planet(s) for topic '{topic}'")
+
+                        if all_scores:
+                            top_ranked = all_scores[:3]
                             lines = [
                                 f"{i}. {r['planet']} — score {r['score']} ({', '.join(r['reasons'])})"
-                                for i, r in enumerate(ranked, 1)
+                                for i, r in enumerate(top_ranked, 1)
                             ]
                             activation_detail = (
                                 "Deterministic scoring (house lordship, significator status, occupancy, "
                                 "aspects, Dasha activation, own-sign) — not derived from RAG text:\n"
                                 + "\n".join(lines)
                             )
+                            if len(all_scores) > 3:
+                                remaining = ", ".join(f"{r['planet']} ({r['score']})" for r in all_scores[3:])
+                                activation_detail += f"\n\nAlso scored: {remaining}"
                         else:
                             activation_detail = "No planets scored above zero for this topic."
+                    else:
+                        activation_detail = "No cached chart data available for activation scoring."
                 except Exception as act_err:
-                    logger.warning(f"Could not build activation ranking trace: {act_err}")
-                    activation_detail = "Activation ranking not available."
+                    logger.error(f"[TRACE_V9_ACTIVE] Activation ranking build FAILED: {act_err}", exc_info=True)
+                    activation_detail = f"Activation ranking not available (error: {act_err})"
 
             steps.append({"step": 3, "title": "Factor Activation Ranking", "detail": activation_detail, "type": "activation"})
 

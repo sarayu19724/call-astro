@@ -73,9 +73,6 @@ Prior Conversation Memory (use only if relevant to the current question):
 Signal Consistency Check:
 {consistency_note}
 
-Full Chart Data:
-{full_chart_data}
-
 Retrieved Book Context (use only to inform your wording — NEVER mention this exists):
 {context}
 

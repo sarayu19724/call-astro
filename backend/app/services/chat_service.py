@@ -9,7 +9,7 @@ from app.services.geocoding_service import geocoding_service
 from app.services.kundli_service import kundli_service
 from app.rag.vector_store import vector_store
 from app.rag.embeddings import EmbeddingsProvider
-from app.prompts.templates import ASTROLOGER_PROMPT, MISSING_INFO_PROMPT, EXPLAIN_CHART_PROMPT
+from app.prompts.templates import ASTROLOGER_PROMPT, MISSING_INFO_PROMPT
 from app.config.settings import settings
 from app.utils.logger import logger
 from app.services.intent_service import classify_intent, get_response_contract
@@ -24,7 +24,7 @@ from app.services.topic_service import (
 )
 from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
-from app.services.chat_explainer_service import is_explain_chart_request, build_full_chart_data
+
 
 
 class ChatService:
@@ -665,29 +665,7 @@ class ChatService:
             logger.error(f"Follow-up suggestion generation failed: {followup_err}")
             return []
 
-    def _try_explain_chart(self, session_id: str, session: Dict, message_text: str, language: str) -> str:
-        """Shared full-chart-explanation handler for the non-streaming path."""
-        cached_kundli = session.get("kundli_data")
-        if not cached_kundli:
-            self._fetch_and_cache_kundli(session_id, session)
-
-        full_chart_data = self._build_full_chart_explanation(session)
-        context_str, _ = self._get_rag_context(
-            "houses planets lords yogas nakshatra dasha meaning explanation", None
-        )
-
-        try:
-            prompt = EXPLAIN_CHART_PROMPT.format(
-                name=session.get("name") or "Friend",
-                language=language,
-                full_chart_data=full_chart_data or "No chart data available.",
-                context=context_str or "No book context."
-            )
-            return llm_service.generate(prompt=prompt, temperature=0.5)
-        except Exception as gen_err:
-            logger.error(f"Chart explanation generation failed: {gen_err}")
-            return "Mujhe samajhne mein kuch pareshani ho gayi."
-
+    
     # ------------------------------------------------------------------
     # NON-STREAMING — POST /api/chat
     # ------------------------------------------------------------------
@@ -751,16 +729,7 @@ class ChatService:
                         "birth_place": session.get("birth_place"), "language": language
                     }
 
-            if is_astrology and not missing_fields and is_explain_chart_request(message_text):
-                logger.info("Explain-chart request detected — full chart mode")
-                response_text = self._try_explain_chart(session_id, session, message_text, language)
-                db.add_message(session_id, "assistant", response_text)
-                return {
-                    "session_id": session_id, "message": response_text,
-                    "dob": session.get("dob"), "birth_time": session.get("birth_time"),
-                    "birth_place": session.get("birth_place"), "language": language,
-                    "suggestions": []
-                }
+            
 
             topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
             intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
@@ -946,40 +915,7 @@ class ChatService:
                            "birth_place": session.get("birth_place"), "language": language}
                     return
 
-            if is_astrology and not missing_fields and is_explain_chart_request(message_text):
-                logger.info("Explain-chart request detected — full chart mode (streaming)")
-                cached_kundli = session.get("kundli_data")
-                if not cached_kundli:
-                    self._fetch_and_cache_kundli(session_id, session)
-
-                full_chart_data = self._build_full_chart_explanation(session)
-                context_str, _ = self._get_rag_context(
-                    "houses planets lords yogas nakshatra dasha meaning explanation", None
-                )
-
-                prompt = EXPLAIN_CHART_PROMPT.format(
-                    name=session.get("name") or "Friend",
-                    language=language,
-                    full_chart_data=full_chart_data or "No chart data available.",
-                    context=context_str or "No book context."
-                )
-
-                full_text = ""
-                try:
-                    for token in llm_service.generate_stream(prompt=prompt, temperature=0.5):
-                        full_text += token
-                        yield {"type": "chunk", "text": token}
-                except Exception as gen_err:
-                    logger.error(f"Chart explanation streaming failed: {gen_err}")
-                    full_text = "Mujhe samajhne mein kuch pareshani ho gayi."
-                    yield {"type": "chunk", "text": full_text}
-
-                db.add_message(session_id, "assistant", full_text)
-                yield {"type": "done", "session_id": session_id, "message": full_text,
-                       "dob": session.get("dob"), "birth_time": session.get("birth_time"),
-                       "birth_place": session.get("birth_place"), "language": language,
-                       "suggestions": []}
-                return
+          
 
             topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
             intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
@@ -1304,23 +1240,6 @@ class ChatService:
             except Exception:
                 return None
         return None
-
-    def _build_full_chart_explanation(self, session: Dict) -> str:
-        try:
-            cached_raw = session.get("kundli_raw")
-            cached_dasha = session.get("kundli_dasha")
-            if not cached_raw:
-                return ""
-            parsed = json.loads(cached_raw)
-            planets = parsed.get("planets", [])
-            ascendant_sign = parsed.get("ascendant_sign")
-            dasha_info = json.loads(cached_dasha) if cached_dasha else None
-            yoga_text = session.get("yoga_text") or ""
-
-            return build_full_chart_data(planets, ascendant_sign, dasha_info, None, yoga_text)
-        except Exception as e:
-            logger.error(f"Full chart explanation build failed: {e}")
-            return ""
 
 
 chat_service = ChatService()

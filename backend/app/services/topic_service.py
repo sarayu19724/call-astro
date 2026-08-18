@@ -824,48 +824,62 @@ def build_missing_evidence_note(
         f"staying confident about what IS available."
     )
     
+# ------------------------------------------------------------------
+# Evidence Consensus Label — converts the numeric confidence_pct + vote
+# counts from build_evidence_vote() into a plain HIGH/MEDIUM/LOW/CONFLICTING
+# label, and a matching instruction for the LLM prompt. This is what the
+# reasoning trace and _get_topic_bundle already call — was previously
+# missing, causing an import crash.
+# ------------------------------------------------------------------
 def get_evidence_consensus_label(vote: Optional[Dict]) -> str:
-    """Converts the numeric evidence vote into a plain confidence label —
-    HIGH / MEDIUM / LOW / CONFLICTING — for prompt calibration and for
-    surfacing directly in the UI/reasoning trace."""
+    """Returns one of: HIGH, MEDIUM, LOW, CONFLICTING, NONE."""
     if not vote:
-        return "LOW"
+        return "NONE"
 
     positive = vote.get("positive_count", 0)
     negative = vote.get("negative_count", 0)
     confidence = vote.get("confidence_pct", 50)
+    verdict = vote.get("verdict")
 
-    if positive > 0 and negative > 0:
+    # Conflicting: real disagreement between independent sources, not just
+    # "not enough evidence either way" — both directions actually present.
+    if positive > 0 and negative > 0 and verdict == "mixed":
         return "CONFLICTING"
+
     if confidence >= 70:
         return "HIGH"
-    if confidence >= 45:
+    if confidence >= 55:
         return "MEDIUM"
     return "LOW"
 
 
-CONSENSUS_INSTRUCTIONS = {
-    "HIGH": (
-        "Evidence confidence is HIGH — multiple independent sources agree. "
-        "You may state the prediction with direct, confident language."
-    ),
-    "MEDIUM": (
-        "Evidence confidence is MEDIUM — the signal leans in one direction "
-        "but isn't unanimous. State the prediction with grounded but "
-        "slightly softer confidence."
-    ),
-    "LOW": (
-        "Evidence confidence is LOW — little or no clear signal was found. "
-        "Avoid strong claims; speak in general terms and acknowledge the "
-        "limited evidence rather than inventing certainty."
-    ),
-    "CONFLICTING": (
-        "Evidence is CONFLICTING — different sources point in different "
-        "directions. Do NOT force a single confident verdict. Explain the "
-        "supportive factor and the limiting factor separately, honestly."
-    ),
-}
-
-
-def get_consensus_instruction(label: str) -> str:
-    return CONSENSUS_INSTRUCTIONS.get(label, CONSENSUS_INSTRUCTIONS["LOW"])
+def get_consensus_instruction(consensus_label: str) -> str:
+    """The actual instruction injected into the prompt — this is what
+    changes model behavior based on evidence strength, not just displays it."""
+    instructions = {
+        "HIGH": (
+            "Evidence Confidence: HIGH. Multiple independent sources (Dasha, chart "
+            "placement, yogas) agree. You may state your reading with strong, direct "
+            "confidence."
+        ),
+        "MEDIUM": (
+            "Evidence Confidence: MEDIUM. Sources are grounded but not unanimous. "
+            "Speak with normal confidence, but avoid absolute/guaranteed language."
+        ),
+        "LOW": (
+            "Evidence Confidence: LOW. Limited supporting signal was found. Keep the "
+            "reading general and honest about the limited evidence — do not manufacture "
+            "false certainty."
+        ),
+        "CONFLICTING": (
+            "Evidence Confidence: CONFLICTING. Independent sources genuinely disagree "
+            "(some supportive, some challenging). Do NOT force a single confident verdict. "
+            "Present both sides honestly in your own natural voice — this is real nuance "
+            "in the chart, not a flaw in your reasoning."
+        ),
+        "NONE": (
+            "Evidence Confidence: Not computed for this question. Answer based on "
+            "available chart and Dasha data as normal."
+        ),
+    }
+    return instructions.get(consensus_label, instructions["NONE"])

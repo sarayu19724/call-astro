@@ -791,7 +791,21 @@ class ChatService:
                     recent_texts = self._get_recent_assistant_texts(session_id)
                     similar_to = self._is_too_similar(response_text, recent_texts)
 
-                    claim_failures = validate_claims(response_text, dasha_timeline_str, evidence_vote)
+                    # Pull real chart data for claim verification
+                    verify_planets, verify_ascendant = [], None
+                    cached_raw_for_verify = session.get("kundli_raw")
+                    if cached_raw_for_verify:
+                        try:
+                            parsed_verify = json.loads(cached_raw_for_verify)
+                            verify_planets = parsed_verify.get("planets", [])
+                            verify_ascendant = parsed_verify.get("ascendant_sign")
+                        except Exception:
+                            pass
+
+                    claim_failures = validate_claims(
+                        response_text, dasha_timeline_str, evidence_vote,
+                        planets=verify_planets, ascendant_sign=verify_ascendant
+                        )
 
                     specificity_score = compute_chart_specificity(response_text)
                     specificity_correction = build_specificity_correction(specificity_score)
@@ -993,7 +1007,20 @@ class ChatService:
 
             if is_astrology and not missing_fields:
                 try:
-                    claim_failures = validate_claims(full_text, dasha_timeline_str, evidence_vote)
+                    verify_planets, verify_ascendant = [], None
+                    cached_raw_for_verify = session.get("kundli_raw")
+                    if cached_raw_for_verify:
+                        try:
+                            parsed_verify = json.loads(cached_raw_for_verify)
+                            verify_planets = parsed_verify.get("planets", [])
+                            verify_ascendant = parsed_verify.get("ascendant_sign")
+                        except Exception:
+                            pass
+
+                    claim_failures = validate_claims(
+                        full_text, dasha_timeline_str, evidence_vote,
+                        planets=verify_planets, ascendant_sign=verify_ascendant
+                    )
                     if claim_failures:
                         logger.warning(f"Claim validation found {len(claim_failures)} issue(s) in streamed response (not corrected — log only): {claim_failures}")
 

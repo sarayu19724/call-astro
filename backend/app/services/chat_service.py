@@ -1033,9 +1033,22 @@ class ChatService:
         targeted_facts: str = "",
         response_text: str = "",
     ) -> list:
-        """Builds an auditable trace of the RAG-first pipeline, including
-        Evidence Consensus (HIGH/MEDIUM/LOW/CONFLICTING) and Chart
-        Specificity (GENERIC/SPECIFIC) in the final synthesis step."""
+        """Builds an auditable trace of the RAG-first pipeline as 8 distinct
+        steps:
+          1. Classical Framework Retrieved
+          2. Relevant Chart Factors
+          3. Personalized Evidence Retrieved
+          4. Evidence Consensus   (HIGH/MEDIUM/LOW/CONFLICTING + vote breakdown)
+          5. Dasha & Timing
+          6. Classical Evidence   (source list)
+          7. Evidence Synthesis   (short summary line)
+          8. Chart-Specificity Check (GENERIC/SPECIFIC)
+
+        Nothing here recomputes RAG, the evidence vote, or the specificity
+        score — it only reads what's already been calculated elsewhere
+        (topic bundle cache, session cache, and the response_text passed in)
+        and lays it out as separate, inspectable steps.
+        """
         if not topic and not rag_hits:
             return []
 
@@ -1050,6 +1063,9 @@ class ChatService:
 
             steps = []
 
+            # ----------------------------------------------------------
+            # STEP 1 — CLASSICAL FRAMEWORK RETRIEVED
+            # ----------------------------------------------------------
             framework_lines = []
             if houses:
                 house_labels = []
@@ -1075,6 +1091,9 @@ class ChatService:
 
             steps.append({"step": 1, "title": "Classical Framework Retrieved", "detail": framework_detail, "type": "rag"})
 
+            # ----------------------------------------------------------
+            # STEP 2 — RELEVANT CHART FACTORS
+            # ----------------------------------------------------------
             if targeted_facts:
                 chart_detail = (
                     "The user's Kundli was examined for the factors identified by the retrieved classical sources.\n\n"
@@ -1085,6 +1104,9 @@ class ChatService:
 
             steps.append({"step": 2, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
 
+            # ----------------------------------------------------------
+            # STEP 3 — PERSONALIZED EVIDENCE RETRIEVED
+            # ----------------------------------------------------------
             personalized_hits = [hit for hit in rag_hits if hit.get("stage") == "personalized"]
             if personalized_hits:
                 personalized_sources = []
@@ -1110,6 +1132,69 @@ class ChatService:
 
             steps.append({"step": 3, "title": "Personalized Evidence Retrieved", "detail": personalized_detail, "type": "personalized_rag"})
 
+            # ----------------------------------------------------------
+            # STEP 4 — EVIDENCE CONSENSUS
+            # ----------------------------------------------------------
+            consensus_label = None
+            evidence_vote = None
+            consistency = ""
+
+            try:
+                if topic:
+                    topic_cache = self._get_topic_cache(session, topic)
+                    if topic_cache:
+                        evidence_vote = topic_cache.get("evidence_vote")
+                        consistency = topic_cache.get("consistency", "")
+                        consensus_label = topic_cache.get("consensus_label")
+            except Exception as evidence_err:
+                logger.warning(f"Could not build evidence consensus trace: {evidence_err}")
+
+            consensus_lines = []
+
+            if consensus_label:
+                consensus_lines.append(f"Evidence confidence: {consensus_label}")
+            else:
+                consensus_lines.append(
+                    "Evidence confidence: Not available (this question wasn't classified under a "
+                    "specific life-area topic, so no evidence vote was computed)"
+                )
+
+            if isinstance(evidence_vote, dict):
+                votes = evidence_vote.get("votes", [])
+                supportive = 0
+                challenging = 0
+                neutral = 0
+
+                for vote in votes:
+                    value = vote.get("vote", 0)
+                    if value > 0:
+                        supportive += 1
+                    elif value < 0:
+                        challenging += 1
+                    else:
+                        neutral += 1
+
+                if votes:
+                    consensus_lines.append(f"• Supportive: {supportive}")
+                    consensus_lines.append(f"• Challenging: {challenging}")
+                    consensus_lines.append(f"• Neutral: {neutral}")
+
+                confidence = evidence_vote.get("confidence_pct")
+                if confidence is not None:
+                    consensus_lines.append(f"• Confidence score: {confidence}%")
+
+                verdict = evidence_vote.get("verdict")
+                if verdict:
+                    consensus_lines.append(f"• Verdict: {verdict}")
+
+            if consistency:
+                consensus_lines.append(f"\nSignal consistency:\n{consistency}")
+
+            steps.append({"step": 4, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
+
+            # ----------------------------------------------------------
+            # STEP 5 — DASHA & TIMING
+            # ----------------------------------------------------------
             dasha_detail = ""
             try:
                 cached_dasha = session.get("kundli_dasha")
@@ -1129,8 +1214,11 @@ class ChatService:
             if not dasha_detail:
                 dasha_detail = "Current Dasha information was not available in the cached chart data."
 
-            steps.append({"step": 4, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
+            steps.append({"step": 5, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
 
+            # ----------------------------------------------------------
+            # STEP 6 — CLASSICAL EVIDENCE
+            # ----------------------------------------------------------
             reference_lines = []
             seen_references = set()
             for hit in rag_hits:
@@ -1153,69 +1241,38 @@ class ChatService:
                 reference_lines.append(f"• {reference}")
 
             evidence_detail = "\n".join(reference_lines) if reference_lines else "No classical references were available."
-            steps.append({"step": 5, "title": "Classical Evidence", "detail": evidence_detail, "type": "evidence"})
+            steps.append({"step": 6, "title": "Classical Evidence", "detail": evidence_detail, "type": "evidence"})
 
-            synthesis_lines: List[str] = []
-
-            consensus_label = None
-            try:
-                if topic:
-                    topic_cache = self._get_topic_cache(session, topic)
-                    if topic_cache:
-                        evidence_vote = topic_cache.get("evidence_vote")
-                        consistency = topic_cache.get("consistency", "")
-                        consensus_label = topic_cache.get("consensus_label")
-
-                        if isinstance(evidence_vote, dict):
-                            for v in evidence_vote.get("votes", []):
-                                direction = (
-                                    "Supportive" if v.get("vote", 0) > 0
-                                    else ("Challenging" if v.get("vote", 0) < 0 else "Neutral")
-                                )
-                                synthesis_lines.append(f"{v.get('source', 'Unknown')}: {direction}")
-                            confidence = evidence_vote.get("confidence_pct")
-                            verdict = evidence_vote.get("verdict")
-                            if confidence is not None:
-                                synthesis_lines.append(f"Confidence score: {confidence}%")
-                            if verdict:
-                                synthesis_lines.append(f"Verdict: {verdict}")
-                        elif evidence_vote:
-                            synthesis_lines.append(str(evidence_vote))
-
-                        if consistency:
-                            synthesis_lines.append(f"Signal consistency:\n{consistency}")
-            except Exception as evidence_err:
-                logger.warning(f"Could not build evidence synthesis trace: {evidence_err}")
-
-            consensus_line = (
-                f"Evidence consensus: {consensus_label}"
-                if consensus_label
-                else "Evidence consensus: Not available (this question wasn't classified under a specific life-area topic, so no evidence vote was computed)"
+            # ----------------------------------------------------------
+            # STEP 7 — EVIDENCE SYNTHESIS
+            # ----------------------------------------------------------
+            synthesis_detail = (
+                "The final interpretation combines the retrieved classical evidence "
+                "with the relevant Kundli and Dasha information."
             )
-            synthesis_lines.insert(0, consensus_line)
+            steps.append({"step": 7, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
+
+            # ----------------------------------------------------------
+            # STEP 8 — CHART-SPECIFICITY CHECK
+            # ----------------------------------------------------------
+            specificity_lines = []
 
             if response_text:
                 try:
                     score = compute_chart_specificity(response_text)
                     verdict = "GENERIC" if score.get("is_generic") else "SPECIFIC"
-                    synthesis_lines.append(
-                        f"Chart Specificity: {verdict} "
-                        f"({score['entity_count']} chart-specific references across "
-                        f"{score['word_count']} words, ratio {score['specificity_ratio']:.1%})"
-                    )
+                    specificity_lines.append(f"Status: {verdict}")
+                    specificity_lines.append(f"Chart-specific references: {score['entity_count']}")
+                    specificity_lines.append(f"Word count: {score['word_count']}")
+                    specificity_lines.append(f"Specificity ratio: {score['specificity_ratio']:.1%}")
+                    specificity_lines.append(f"Generic filler matches: {score['filler_count']}")
                 except Exception as spec_err:
                     logger.warning(f"Could not compute chart specificity for trace: {spec_err}")
-                    synthesis_lines.append("Chart Specificity: Not available (scoring failed)")
+                    specificity_lines.append("Status: Not available")
             else:
-                synthesis_lines.append("Chart Specificity: Not available (no response text supplied)")
+                specificity_lines.append("Status: Not available — no response text supplied")
 
-            if len(synthesis_lines) <= 2:
-                synthesis_lines.append(
-                    "The final interpretation combines the retrieved classical evidence "
-                    "with the relevant Kundli and Dasha information."
-                )
-
-            steps.append({"step": 6, "title": "Evidence Synthesis", "detail": "\n".join(synthesis_lines), "type": "synthesis"})
+            steps.append({"step": 8, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
 
             logger.info(f"[RAGFirst] Reasoning trace built: {len(steps)} steps")
             return steps

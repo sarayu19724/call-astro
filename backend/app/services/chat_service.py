@@ -686,16 +686,7 @@ class ChatService:
             "houses planets lords yogas nakshatra dasha meaning explanation", None
         )
 
-        try:
-            prompt = EXPLAIN_CHART_PROMPT.format(
-                name=session.get("name") or "Friend", language=language,
-                full_chart_data=full_chart_data or "No chart data available.",
-                context=context_str or "No book context."
-            )
-            return llm_service.generate(prompt=prompt, temperature=0.5)
-        except Exception as gen_err:
-            logger.error(f"Chart explanation generation failed: {gen_err}")
-            return "Mujhe samajhne mein kuch pareshani ho gayi."
+        
 
     # ------------------------------------------------------------------
     # NON-STREAMING — POST /api/chat
@@ -869,7 +860,7 @@ class ChatService:
 
             if is_astrology and not missing_fields:
                 try:
-                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts)
+                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, response_text)
                     db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
                 except Exception as trace_err:
                     logger.error(f"Reasoning trace caching failed: {trace_err}")
@@ -971,11 +962,7 @@ class ChatService:
                     "houses planets lords yogas nakshatra dasha meaning explanation", None
                 )
 
-                prompt = EXPLAIN_CHART_PROMPT.format(
-                    name=session.get("name") or "Friend", language=language,
-                    full_chart_data=full_chart_data or "No chart data available.",
-                    context=context_str or "No book context."
-                )
+               
 
                 full_text = ""
                 try:
@@ -1084,7 +1071,7 @@ class ChatService:
 
             if is_astrology and not missing_fields:
                 try:
-                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts)
+                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, full_text)
                     db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
                 except Exception as trace_err:
                     logger.error(f"Reasoning trace caching failed: {trace_err}")
@@ -1104,9 +1091,22 @@ class ChatService:
             yield {"type": "done", "session_id": session_id, "message": fallback,
                    "dob": None, "birth_time": None, "birth_place": None, "language": "Hinglish"}
 
-    def _build_reasoning_trace(self, session: Dict, topic: Optional[str],
-                                rag_hits: Optional[List[Dict[str, Any]]] = None, targeted_facts: str = "") -> list:
-        # Builds an auditable trace of the RAG-first pipeline
+    def _build_reasoning_trace(
+        self,
+        session: Dict,
+        topic: Optional[str],
+        rag_hits: Optional[List[Dict[str, Any]]] = None,
+        targeted_facts: str = "",
+        response_text: str = "",
+    ) -> list:
+        """Builds an auditable trace of the RAG-first pipeline.
+
+        `response_text` is new — the actual generated response (or full
+        streamed text), needed so Chart Specificity can be computed here.
+        It's otherwise only ever computed transiently during generation
+        (to decide whether to regenerate) and discarded, with nothing left
+        for this trace to read back afterward.
+        """
         if not topic and not rag_hits:
             return []
 
@@ -1226,7 +1226,16 @@ class ChatService:
             evidence_detail = "\n".join(reference_lines) if reference_lines else "No classical references were available."
             steps.append({"step": 5, "title": "Classical Evidence", "detail": evidence_detail, "type": "evidence"})
 
-            synthesis_lines = []
+            # --- Step 6: Evidence Synthesis ---
+            # Two always-present, clearly labeled lines:
+            #   "Evidence Consensus: ..." — topic-dependent (needs a
+            #     classified topic + a computed evidence_vote); says so
+            #     honestly when unavailable instead of a vague fallback.
+            #   "Chart Specificity: ..." — topic-independent, computed
+            #     fresh here from the actual response text every time.
+            synthesis_lines: List[str] = []
+
+            consensus_label = None
             try:
                 if topic:
                     topic_cache = self._get_topic_cache(session, topic)
@@ -1237,30 +1246,46 @@ class ChatService:
 
                         if isinstance(evidence_vote, dict):
                             for v in evidence_vote.get("votes", []):
-                                direction = "Supportive" if v["vote"] > 0 else ("Challenging" if v["vote"] < 0 else "Neutral")
-                                synthesis_lines.append(f"{v['source']}: {direction}")
+                                direction = (
+                                    "Supportive" if v.get("vote", 0) > 0
+                                    else ("Challenging" if v.get("vote", 0) < 0 else "Neutral")
+                                )
+                                synthesis_lines.append(f"{v.get('source', 'Unknown')}: {direction}")
                             confidence = evidence_vote.get("confidence_pct")
                             verdict = evidence_vote.get("verdict")
                             if confidence is not None:
-                                synthesis_lines.append(f"Overall confidence: {confidence}%")
+                                synthesis_lines.append(f"Confidence score: {confidence}%")
                             if verdict:
-                                synthesis_lines.append(f"Overall verdict: {verdict}")
+                                synthesis_lines.append(f"Verdict: {verdict}")
                         elif evidence_vote:
                             synthesis_lines.append(str(evidence_vote))
 
-                        if consensus_label:
-                            synthesis_lines.append(f"Evidence consensus: {consensus_label}")
-
                         if consistency:
-                            synthesis_lines.append(f"\nSignal consistency:\n{consistency}")
+                            synthesis_lines.append(f"Signal consistency:\n{consistency}")
             except Exception as evidence_err:
                 logger.warning(f"Could not build evidence synthesis trace: {evidence_err}")
 
-            if not synthesis_lines:
-                synthesis_lines.append(
-                    "The final interpretation combines the retrieved classical evidence "
-                    "with the relevant Kundli and Dasha information."
-                )
+            consensus_line = (
+                f"Evidence Consensus: {consensus_label}"
+                if consensus_label
+                else "Evidence Consensus: Not available (this question wasn't classified under a specific life-area topic, so no evidence vote was computed)"
+            )
+            synthesis_lines.insert(0, consensus_line)
+
+            if response_text:
+                try:
+                    score = compute_chart_specificity(response_text)
+                    verdict = "GENERIC" if score.get("is_generic") else "SPECIFIC"
+                    synthesis_lines.append(
+                        f"Chart Specificity: {verdict} "
+                        f"({score['entity_count']} chart-specific references across "
+                        f"{score['word_count']} words, ratio {score['specificity_ratio']:.1%})"
+                    )
+                except Exception as spec_err:
+                    logger.warning(f"Could not compute chart specificity for trace: {spec_err}")
+                    synthesis_lines.append("Chart Specificity: Not available (scoring failed)")
+            else:
+                synthesis_lines.append("Chart Specificity: Not available (no response text supplied)")
 
             steps.append({"step": 6, "title": "Evidence Synthesis", "detail": "\n".join(synthesis_lines), "type": "synthesis"})
 
@@ -1306,5 +1331,5 @@ class ChatService:
             logger.error(f"Full chart explanation build failed: {e}")
             return ""
 
-
 chat_service = ChatService()
+

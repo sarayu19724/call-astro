@@ -9,7 +9,7 @@ from app.services.geocoding_service import geocoding_service
 from app.services.kundli_service import kundli_service
 from app.rag.vector_store import vector_store
 from app.rag.embeddings import EmbeddingsProvider
-from app.prompts.templates import ASTROLOGER_PROMPT, MISSING_INFO_PROMPT
+from app.prompts.templates import ASTROLOGER_PROMPT, MISSING_INFO_PROMPT, EXPLAIN_CHART_PROMPT
 from app.config.settings import settings
 from app.utils.logger import logger
 from app.services.intent_service import classify_intent, get_response_contract
@@ -24,7 +24,7 @@ from app.services.topic_service import (
 )
 from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
-from app.services.chat_explainer_service import is_explain_chart_request
+from app.services.chat_explainer_service import is_explain_chart_request, build_full_chart_data
 
 
 class ChatService:
@@ -55,7 +55,6 @@ class ChatService:
                 return time_str
 
     def _fetch_and_cache_kundli(self, session_id: str, session: Dict) -> str:
-        # Fetches Kundli + real Dasha once, pre-computes yoga_text, everything downstream reads from cache
         try:
             coords = geocoding_service.geocode(session.get("birth_place"))
             if not coords:
@@ -108,7 +107,6 @@ class ChatService:
         return "No chart data available."
 
     def _get_rag_context(self, message_text: str, topic: Optional[str] = None):
-        # Generic fallback RAG. Returns (context_str, rag_hits).
         try:
             from app.services.topic_service import TOPIC_RELEVANT_BOOKS
 
@@ -155,7 +153,6 @@ class ChatService:
             return "No reference available.", []
 
     def _build_framework_query(self, message_text: str, topic: Optional[str] = None) -> str:
-        # Ask the knowledge base what classical factors should be examined
         parts = [
             message_text.strip(),
             "classical astrology principles rules indications relevant factors"
@@ -167,7 +164,6 @@ class ChatService:
         return " ".join(p for p in parts if p).strip()
 
     def _extract_referenced_factors(self, rag_hits: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
-        # Extract only entities explicitly mentioned by retrieved evidence
         houses: Set[str] = set()
         planets: Set[str] = set()
         charts: Set[str] = set()
@@ -205,7 +201,6 @@ class ChatService:
         return {"houses": houses, "planets": planets, "charts": charts, "concepts": concepts}
 
     def _build_targeted_kundli_facts(self, referenced: Dict[str, Set[str]], session: Dict) -> str:
-        # Surface only chart facts corresponding to the retrieved framework
         cached_raw = session.get("kundli_raw")
         cached_dasha = session.get("kundli_dasha")
         if not cached_raw:
@@ -275,7 +270,6 @@ class ChatService:
         return "\n".join(lines)
 
     def _build_personalized_rag_query(self, message_text: str, topic: Optional[str], targeted_facts: str) -> str:
-        # Create a second-stage RAG query using actual chart facts
         parts = [message_text.strip(), "classical astrology interpretation"]
         if topic:
             parts.append(f"topic: {topic}")
@@ -285,7 +279,6 @@ class ChatService:
         return " ".join(p for p in parts if p).strip()
 
     def _get_rag_first_context(self, message_text: str, topic: Optional[str], session: Dict):
-        # Two-stage RAG: Stage 1 retrieves framework -> factors, Stage 2 retrieves personalized evidence
         try:
             from app.services.topic_service import TOPIC_RELEVANT_BOOKS
 
@@ -381,7 +374,6 @@ class ChatService:
             return "No reference available.", [], ""
 
     def _is_followup_retrieval_question(self, message_text: str, history: List[Dict[str, str]]) -> bool:
-        # Detect short evidence-seeking follow-ups such as 'why?'
         if not history:
             return False
 
@@ -401,7 +393,6 @@ class ChatService:
         return ""
 
     def _get_followup_rag_context(self, message_text: str, topic: Optional[str], history: List[Dict[str, str]]):
-        # Retrieve evidence specifically supporting the previous answer
         previous_answer = self._get_previous_assistant_answer(history)
         if not previous_answer:
             return "", []
@@ -473,7 +464,6 @@ class ChatService:
             logger.error(f"Failed to save topic cache for '{topic}': {e}")
 
     def _get_topic_bundle(self, session_id: str, session: Dict, topic: Optional[str], language: str) -> Dict[str, Any]:
-        # Returns cached bundle if already computed this session, else computes once and caches
         empty = {"emphasis": "", "divisional": "", "consistency": "", "missing_evidence": "", "timeline": "", "evidence_vote": None, "consensus_label": "LOW"}
         if not topic:
             return empty
@@ -675,8 +665,8 @@ class ChatService:
             logger.error(f"Follow-up suggestion generation failed: {followup_err}")
             return []
 
-    def _try_explain_chart(self, session_id: str, session: Dict, message_text: str, language: str) -> Optional[str]:
-        # Shared full-chart-explanation handler for non-streaming path
+    def _try_explain_chart(self, session_id: str, session: Dict, message_text: str, language: str) -> str:
+        """Shared full-chart-explanation handler for the non-streaming path."""
         cached_kundli = session.get("kundli_data")
         if not cached_kundli:
             self._fetch_and_cache_kundli(session_id, session)
@@ -686,7 +676,17 @@ class ChatService:
             "houses planets lords yogas nakshatra dasha meaning explanation", None
         )
 
-        
+        try:
+            prompt = EXPLAIN_CHART_PROMPT.format(
+                name=session.get("name") or "Friend",
+                language=language,
+                full_chart_data=full_chart_data or "No chart data available.",
+                context=context_str or "No book context."
+            )
+            return llm_service.generate(prompt=prompt, temperature=0.5)
+        except Exception as gen_err:
+            logger.error(f"Chart explanation generation failed: {gen_err}")
+            return "Mujhe samajhne mein kuch pareshani ho gayi."
 
     # ------------------------------------------------------------------
     # NON-STREAMING — POST /api/chat
@@ -751,8 +751,6 @@ class ChatService:
                         "birth_place": session.get("birth_place"), "language": language
                     }
 
-            # Explain-chart requests handled here regardless of whether the
-            # profile was already complete or just completed this turn (bug fix).
             if is_astrology and not missing_fields and is_explain_chart_request(message_text):
                 logger.info("Explain-chart request detected — full chart mode")
                 response_text = self._try_explain_chart(session_id, session, message_text, language)
@@ -777,7 +775,6 @@ class ChatService:
                 cached_kundli = session.get("kundli_data")
                 kundli_str = cached_kundli if cached_kundli else self._fetch_and_cache_kundli(session_id, session)
 
-            # RAG-first: the knowledge base determines which chart factors matter before those facts are supplied to the LLM
             if is_astrology and not missing_fields:
                 if self._is_followup_retrieval_question(message_text, history):
                     context_str, rag_hits = self._get_followup_rag_context(message_text, topic, history)
@@ -949,8 +946,6 @@ class ChatService:
                            "birth_place": session.get("birth_place"), "language": language}
                     return
 
-            # Explain-chart requests handled here regardless of whether the
-            # profile was already complete or just completed this turn (bug fix).
             if is_astrology and not missing_fields and is_explain_chart_request(message_text):
                 logger.info("Explain-chart request detected — full chart mode (streaming)")
                 cached_kundli = session.get("kundli_data")
@@ -962,7 +957,12 @@ class ChatService:
                     "houses planets lords yogas nakshatra dasha meaning explanation", None
                 )
 
-               
+                prompt = EXPLAIN_CHART_PROMPT.format(
+                    name=session.get("name") or "Friend",
+                    language=language,
+                    full_chart_data=full_chart_data or "No chart data available.",
+                    context=context_str or "No book context."
+                )
 
                 full_text = ""
                 try:
@@ -1055,8 +1055,6 @@ class ChatService:
 
             db.add_message(session_id, "assistant", full_text)
 
-            # Claim validation + specificity check are LOG-ONLY here — tokens
-            # are already streamed, so there's nothing left to regenerate cleanly.
             if is_astrology and not missing_fields:
                 try:
                     claim_failures = validate_claims(full_text, dasha_timeline_str, evidence_vote)
@@ -1099,14 +1097,9 @@ class ChatService:
         targeted_facts: str = "",
         response_text: str = "",
     ) -> list:
-        """Builds an auditable trace of the RAG-first pipeline.
-
-        `response_text` is new — the actual generated response (or full
-        streamed text), needed so Chart Specificity can be computed here.
-        It's otherwise only ever computed transiently during generation
-        (to decide whether to regenerate) and discarded, with nothing left
-        for this trace to read back afterward.
-        """
+        """Builds an auditable trace of the RAG-first pipeline, including
+        Evidence Consensus (HIGH/MEDIUM/LOW/CONFLICTING) and Chart
+        Specificity (GENERIC/SPECIFIC) in the final synthesis step."""
         if not topic and not rag_hits:
             return []
 
@@ -1226,13 +1219,6 @@ class ChatService:
             evidence_detail = "\n".join(reference_lines) if reference_lines else "No classical references were available."
             steps.append({"step": 5, "title": "Classical Evidence", "detail": evidence_detail, "type": "evidence"})
 
-            # --- Step 6: Evidence Synthesis ---
-            # Two always-present, clearly labeled lines:
-            #   "Evidence Consensus: ..." — topic-dependent (needs a
-            #     classified topic + a computed evidence_vote); says so
-            #     honestly when unavailable instead of a vague fallback.
-            #   "Chart Specificity: ..." — topic-independent, computed
-            #     fresh here from the actual response text every time.
             synthesis_lines: List[str] = []
 
             consensus_label = None
@@ -1266,9 +1252,9 @@ class ChatService:
                 logger.warning(f"Could not build evidence synthesis trace: {evidence_err}")
 
             consensus_line = (
-                f"Evidence Consensus: {consensus_label}"
+                f"Evidence consensus: {consensus_label}"
                 if consensus_label
-                else "Evidence Consensus: Not available (this question wasn't classified under a specific life-area topic, so no evidence vote was computed)"
+                else "Evidence consensus: Not available (this question wasn't classified under a specific life-area topic, so no evidence vote was computed)"
             )
             synthesis_lines.insert(0, consensus_line)
 
@@ -1286,6 +1272,12 @@ class ChatService:
                     synthesis_lines.append("Chart Specificity: Not available (scoring failed)")
             else:
                 synthesis_lines.append("Chart Specificity: Not available (no response text supplied)")
+
+            if len(synthesis_lines) <= 2:
+                synthesis_lines.append(
+                    "The final interpretation combines the retrieved classical evidence "
+                    "with the relevant Kundli and Dasha information."
+                )
 
             steps.append({"step": 6, "title": "Evidence Synthesis", "detail": "\n".join(synthesis_lines), "type": "synthesis"})
 
@@ -1325,11 +1317,10 @@ class ChatService:
             dasha_info = json.loads(cached_dasha) if cached_dasha else None
             yoga_text = session.get("yoga_text") or ""
 
-            from app.services.chat_explainer_service import build_full_chart_data
             return build_full_chart_data(planets, ascendant_sign, dasha_info, None, yoga_text)
         except Exception as e:
             logger.error(f"Full chart explanation build failed: {e}")
             return ""
 
-chat_service = ChatService()
 
+chat_service = ChatService()

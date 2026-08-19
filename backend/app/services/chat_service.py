@@ -26,6 +26,52 @@ from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
 
 
+# ============================================================
+# Rule-condition verification constants
+#
+# RAG retrieves classical RULES ("Saturn in 7th house harms marriage"),
+# but retrieving a rule's text says nothing about whether its condition
+# is actually TRUE for this user's chart. These patterns let us parse a
+# retrieved chunk's condition mechanically and check it against the
+# real computed chart, instead of leaving the LLM to infer that a
+# retrieved rule must apply just because it was retrieved.
+# ============================================================
+_RULE_PLANET_NAMES = [
+    "Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus",
+    "Saturn", "Rahu", "Ketu"
+]
+_RULE_ZODIAC_SIGNS = [
+    "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+    "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"
+]
+
+_PLANET_ALT = "|".join(_RULE_PLANET_NAMES)
+_SIGN_ALT = "|".join(_RULE_ZODIAC_SIGNS)
+
+# "Saturn ... in the 7th house" / "Saturn placed in 7th house"
+RULE_PLANET_HOUSE_A = re.compile(
+    rf"\b({_PLANET_ALT})\b[^.]{{0,30}}?\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+house\b",
+    re.IGNORECASE
+)
+# "7th house has Saturn" / "in the 7th house, Saturn ..."
+RULE_PLANET_HOUSE_B = re.compile(
+    rf"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+house\b[^.]{{0,30}}?\b({_PLANET_ALT})\b",
+    re.IGNORECASE
+)
+# "Saturn in Libra" / "Saturn placed in Libra"
+RULE_PLANET_SIGN = re.compile(
+    rf"\b({_PLANET_ALT})\b[^.]{{0,25}}?\b({_SIGN_ALT})\b",
+    re.IGNORECASE
+)
+# "7th lord in the 12th house" / "lord of the 7th house placed in 12th house"
+RULE_LORD_HOUSE = re.compile(
+    r"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+(?:house\s+)?lord\b[^.]{0,30}?"
+    r"\b(?:in|placed in|posited in|situated in)\b[^.]{0,15}?"
+    r"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+house\b",
+    re.IGNORECASE
+)
+
+
 class ChatService:
     def __init__(self):
         self.embeddings_provider = EmbeddingsProvider()
@@ -338,6 +384,224 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
         return "\n".join(lines)
 
+    def _extract_rule_conditions(self, text: str) -> List[Dict[str, Any]]:
+        """Parses a chunk of classical text and pulls out concrete,
+        checkable conditions it asserts — 'Planet in Nth house',
+        'Planet in Sign', 'Nth house lord in Mth house'. These are the
+        conditions a rule REQUIRES to be true before its stated effect
+        can be applied to a real chart."""
+        conditions: List[Dict[str, Any]] = []
+        seen_keys = set()
+
+        for pattern, order in (
+            (RULE_PLANET_HOUSE_A, ("planet", "house")),
+            (RULE_PLANET_HOUSE_B, ("house", "planet")),
+        ):
+            for m in pattern.finditer(text):
+                if order == ("planet", "house"):
+                    planet_raw, house_raw = m.group(1), m.group(2)
+                else:
+                    house_raw, planet_raw = m.group(1), m.group(2)
+
+                planet = planet_raw.strip().capitalize()
+                house = int(house_raw)
+                key = ("planet_house", planet, house)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                conditions.append({
+                    "type": "planet_house", "planet": planet, "house": house,
+                })
+
+        for m in RULE_PLANET_SIGN.finditer(text):
+            planet = m.group(1).strip().capitalize()
+            sign = m.group(2).strip().capitalize()
+            key = ("planet_sign", planet, sign)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            conditions.append({"type": "planet_sign", "planet": planet, "sign": sign})
+
+        for m in RULE_LORD_HOUSE.finditer(text):
+            lord_of_house = int(m.group(1))
+            placed_in_house = int(m.group(2))
+            key = ("lord_house", lord_of_house, placed_in_house)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            conditions.append({
+                "type": "lord_house",
+                "lord_of_house": lord_of_house,
+                "placed_in_house": placed_in_house,
+            })
+
+        return conditions
+
+    def _check_rule_condition(
+        self,
+        condition: Dict[str, Any],
+        planets: List[dict],
+        ascendant_sign: Optional[str],
+    ) -> Dict[str, Any]:
+        """Checks one extracted condition against the REAL computed
+        chart. Returns satisfied=None when there isn't enough data to
+        verify either way — silence beats a false positive/negative."""
+        from app.services.topic_service import get_house_for_sign
+        from app.services.kundli_service import get_house_lord
+
+        result: Dict[str, Any] = {"satisfied": None, "actual": None}
+
+        if condition["type"] == "planet_sign":
+            actual_sign = next(
+                (p.get("sign_name") for p in planets if p.get("name") == condition["planet"]),
+                None,
+            )
+            if not actual_sign:
+                return result
+            result["satisfied"] = actual_sign.lower() == condition["sign"].lower()
+            result["actual"] = actual_sign
+
+        elif condition["type"] == "planet_house":
+            if not ascendant_sign:
+                return result
+            planet_data = next((p for p in planets if p.get("name") == condition["planet"]), None)
+            if not planet_data:
+                return result
+            actual_house = get_house_for_sign(planet_data.get("sign_name", ""), ascendant_sign)
+            if not actual_house:
+                return result
+            result["satisfied"] = actual_house == condition["house"]
+            result["actual"] = actual_house
+            if not result["satisfied"]:
+                result["actual_occupants_of_claimed_house"] = [
+                    p.get("name") for p in planets
+                    if p.get("name")
+                    and get_house_for_sign(p.get("sign_name", ""), ascendant_sign) == condition["house"]
+                ]
+
+        elif condition["type"] == "lord_house":
+            if not ascendant_sign:
+                return result
+            lord = get_house_lord(condition["lord_of_house"], ascendant_sign)
+            if not lord:
+                return result
+            planet_data = next((p for p in planets if p.get("name") == lord), None)
+            if not planet_data:
+                return result
+            actual_house = get_house_for_sign(planet_data.get("sign_name", ""), ascendant_sign)
+            if not actual_house:
+                return result
+            result["satisfied"] = actual_house == condition["placed_in_house"]
+            result["actual"] = actual_house
+            result["lord_planet"] = lord
+
+        return result
+
+    def _build_rule_verification_report(self, rag_hits: List[Dict[str, Any]], session: Dict) -> str:
+        """The core fix: walks every retrieved chunk, extracts its
+        checkable condition(s), and verifies each against the real
+        chart — then reports SATISFIED/NOT SATISFIED explicitly so the
+        LLM is never left to infer 'this rule was retrieved, so it must
+        apply.' Retrieval relevance score is NOT proof a rule's
+        condition is met — this report is the only thing that is."""
+        cached_raw = session.get("kundli_raw")
+        if not cached_raw or not rag_hits:
+            return ""
+
+        try:
+            parsed = json.loads(cached_raw)
+            planets = parsed.get("planets", []) or []
+            ascendant_sign = parsed.get("ascendant_sign")
+        except Exception:
+            return ""
+
+        if not planets:
+            return ""
+
+        satisfied_lines: List[str] = []
+        unsatisfied_lines: List[str] = []
+        seen_conditions = set()
+
+        for hit in rag_hits:
+            text = hit.get("text", "") or ""
+            source = hit.get("source", "Unknown")
+            for cond in self._extract_rule_conditions(text):
+                if cond["type"] == "planet_house":
+                    dedupe_key = ("planet_house", cond["planet"], cond["house"])
+                elif cond["type"] == "planet_sign":
+                    dedupe_key = ("planet_sign", cond["planet"], cond["sign"])
+                else:
+                    dedupe_key = ("lord_house", cond["lord_of_house"], cond["placed_in_house"])
+
+                if dedupe_key in seen_conditions:
+                    continue
+                seen_conditions.add(dedupe_key)
+
+                check = self._check_rule_condition(cond, planets, ascendant_sign)
+                if check["satisfied"] is None:
+                    continue  # couldn't verify — say nothing rather than guess
+
+                if cond["type"] == "planet_house":
+                    label = f"{cond['planet']} in {cond['house']}th house"
+                    if check["satisfied"]:
+                        satisfied_lines.append(
+                            f"\u2713 SATISFIED: \"{label}\" (from {source}) — confirmed, "
+                            f"{cond['planet']} is actually in house {cond['house']}."
+                        )
+                    else:
+                        occupants = check.get("actual_occupants_of_claimed_house") or []
+                        occ_str = ", ".join(occupants) if occupants else "no major planet"
+                        unsatisfied_lines.append(
+                            f"\u2717 NOT SATISFIED: \"{label}\" (from {source}) — {cond['planet']} is "
+                            f"actually in house {check['actual']}, not house {cond['house']}. House "
+                            f"{cond['house']} is actually occupied by {occ_str}. Do NOT apply this "
+                            f"rule's effect to this user's {cond['house']}th house."
+                        )
+
+                elif cond["type"] == "planet_sign":
+                    label = f"{cond['planet']} in {cond['sign']}"
+                    if check["satisfied"]:
+                        satisfied_lines.append(f"\u2713 SATISFIED: \"{label}\" (from {source}) — confirmed.")
+                    else:
+                        unsatisfied_lines.append(
+                            f"\u2717 NOT SATISFIED: \"{label}\" (from {source}) — {cond['planet']} is "
+                            f"actually in {check['actual']}, not {cond['sign']}. Do NOT apply this rule."
+                        )
+
+                elif cond["type"] == "lord_house":
+                    label = f"{cond['lord_of_house']}th lord in {cond['placed_in_house']}th house"
+                    lord_name = check.get("lord_planet", "the lord")
+                    if check["satisfied"]:
+                        satisfied_lines.append(
+                            f"\u2713 SATISFIED: \"{label}\" (from {source}) — confirmed, {lord_name} "
+                            f"({cond['lord_of_house']}th lord) is actually in house {cond['placed_in_house']}."
+                        )
+                    else:
+                        unsatisfied_lines.append(
+                            f"\u2717 NOT SATISFIED: \"{label}\" (from {source}) — {lord_name} "
+                            f"({cond['lord_of_house']}th lord) is actually in house {check['actual']}, "
+                            f"not house {cond['placed_in_house']}. Do NOT apply this rule."
+                        )
+
+        if not satisfied_lines and not unsatisfied_lines:
+            return ""
+
+        report = [
+            "RULE-CONDITION VERIFICATION (auto-checked against this user's actual chart — "
+            "this is the ONLY authority on whether a retrieved classical rule applies to this "
+            "specific person; a chunk's retrieval-relevance score is NOT proof its condition is met):"
+        ]
+        report.extend(satisfied_lines)
+        report.extend(unsatisfied_lines)
+        report.append(
+            "\nINSTRUCTION: Only narrate a classical rule's stated effect when its condition above "
+            "is marked SATISFIED. For any condition marked NOT SATISFIED, do not describe that "
+            "placement as true for this user — either restate the rule using the ACTUAL placement "
+            "shown, or omit the claim entirely if no rule for the actual placement is available in "
+            "the retrieved context. Never blend a rule's effect with a placement it doesn't verify."
+        )
+        return "\n".join(report)
+
     def _build_personalized_rag_query(self, message_text: str, topic: Optional[str], targeted_facts: str, life_area: str = "") -> str:
         parts = [message_text.strip(), "classical astrology interpretation"]
         if life_area and life_area != "general":
@@ -527,6 +791,16 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             all_hits = framework_rag_hits + comparison_hits + personalized_rag_hits
 
+            # Rule-condition verification: check every retrieved rule's
+            # condition (planet-in-house, planet-in-sign, lord-in-house)
+            # against the real chart, and hand the LLM an explicit
+            # SATISFIED / NOT SATISFIED report. This is what actually
+            # stops "Saturn in 7th house" text from being narrated as
+            # true when the user's Saturn is really elsewhere.
+            rule_verification = self._build_rule_verification_report(all_hits, session)
+            if rule_verification:
+                targeted_facts = f"{targeted_facts}\n\n{rule_verification}" if targeted_facts else rule_verification
+
             context_parts = []
             if framework_chunks:
                 context_parts.append("\n".join(framework_chunks))
@@ -538,7 +812,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             logger.info(
                 f"[RAGFirst] framework={len(framework_rag_hits)}, "
-                f"comparison={len(comparison_hits)}, personalized={len(personalized_rag_hits)}"
+                f"comparison={len(comparison_hits)}, personalized={len(personalized_rag_hits)}, "
+                f"rule_verification={'yes' if rule_verification else 'no'}"
             )
 
             return context, all_hits, targeted_facts

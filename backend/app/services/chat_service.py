@@ -373,46 +373,52 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             framework_hits = [h for h in framework_hits if h["score"] >= settings.MIN_RAG_RELEVANCE]
 
+            # FIX: previously, an empty framework_hits caused an early
+            # return that skipped comparison AND personalized retrieval
+            # entirely — a single weak first-stage score blacked out the
+            # whole evidence pipeline. Now we log and continue with an
+            # empty framework stage instead of aborting everything.
+            framework_rag_hits: List[Dict[str, Any]] = []
+            framework_chunks: List[str] = []
+            seen_keys: set = set()
+            referenced: Dict[str, Set[str]] = {"houses": set(), "planets": set(), "charts": set(), "concepts": set()}
+            targeted_facts = ""
+
             if not framework_hits:
-                logger.info("[RAGFirst] no sufficiently relevant framework chunks")
-                return "No reference available.", [], ""
+                logger.info("[RAGFirst] no sufficiently relevant framework chunks — continuing with comparison/personalized retrieval anyway")
+            else:
+                for i, hit in enumerate(framework_hits):
+                    source = hit["metadata"].get("source", "Unknown")
+                    page = hit["metadata"].get("page")
+                    seen_keys.add((source, page))
+                    page_label = f", Page: {page}" if page is not None else ""
 
-            framework_rag_hits = []
-            framework_chunks = []
-            seen_keys = set()
+                    framework_chunks.append(
+                        f"--- Classical Principle {i+1} [Source: {source}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
+                    )
+                    framework_rag_hits.append({
+                        "source": source, "page": page, "score": hit["score"],
+                        "text": hit["text"], "stage": "framework",
+                    })
 
-            for i, hit in enumerate(framework_hits):
-                source = hit["metadata"].get("source", "Unknown")
-                page = hit["metadata"].get("page")
-                seen_keys.add((source, page))
-                page_label = f", Page: {page}" if page is not None else ""
+                referenced = self._extract_referenced_factors(framework_rag_hits)
+                targeted_facts = self._build_targeted_kundli_facts(referenced, session)
 
-                framework_chunks.append(
-                    f"--- Classical Principle {i+1} [Source: {source}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
+                logger.info(
+                    f"[RAGFirst] framework factors houses={referenced['houses']} "
+                    f"planets={referenced['planets']} charts={referenced['charts']} concepts={referenced['concepts']}"
                 )
-                framework_rag_hits.append({
-                    "source": source, "page": page, "score": hit["score"],
-                    "text": hit["text"], "stage": "framework",
-                })
 
-            referenced = self._extract_referenced_factors(framework_rag_hits)
-            targeted_facts = self._build_targeted_kundli_facts(referenced, session)
-
-            logger.info(
-                f"[RAGFirst] framework factors houses={referenced['houses']} "
-                f"planets={referenced['planets']} charts={referenced['charts']} concepts={referenced['concepts']}"
-            )
-
-            # NOTE: Deterministic Chart Fact Graph + Activation Scoring was
-            # removed here on request. targeted_facts is _build_targeted_
-            # kundli_facts' output, now optionally extended below with a
-            # comparative-question block when the LLM detected one.
+            # If no houses/planets came from framework text, still surface
+            # at least the Dasha line via an empty-referenced call — this
+            # keeps the Kundli-derived timing info available even when RAG
+            # found nothing usable this turn.
+            if not targeted_facts:
+                targeted_facts = self._build_targeted_kundli_facts(referenced, session)
 
             # --- Comparative branch retrieval (e.g. "job or business",
-            # "abroad or stay in India") — retrieves classical rules
-            # SEPARATELY per option, matches each against the actual chart,
-            # and instructs the model to evaluate rule-by-rule for both
-            # sides instead of picking one option immediately. ---
+            # "abroad or stay in India") — independent of framework
+            # success, so a weak framework score never blocks this. ---
             comparison_hits: List[Dict[str, Any]] = []
             if len(comparison) >= 2:
                 comparison_facts_blocks = []
@@ -472,6 +478,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
                 logger.info(f"[Comparison] branches={comparison} additional_hits={len(comparison_hits)}")
 
+            # --- Personalized retrieval — also independent of framework
+            # success. Uses the raw message_text/life_area even if
+            # targeted_facts is empty, so this stage still has a real
+            # chance to find something. ---
             personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts, life_area)
             personalized_vector = self.embeddings_provider.get_embedding(personalized_query)
 
@@ -517,12 +527,14 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             all_hits = framework_rag_hits + comparison_hits + personalized_rag_hits
 
-            context_parts = ["\n".join(framework_chunks)]
+            context_parts = []
+            if framework_chunks:
+                context_parts.append("\n".join(framework_chunks))
             if comparison_chunks:
                 context_parts.append("\n".join(comparison_chunks))
             if personalized_chunks:
                 context_parts.append("\n".join(personalized_chunks))
-            context = "\n".join(p for p in context_parts if p)
+            context = "\n".join(p for p in context_parts if p) or "No reference available."
 
             logger.info(
                 f"[RAGFirst] framework={len(framework_rag_hits)}, "
@@ -1009,11 +1021,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if is_astrology and not missing_fields:
                 try:
                     trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, response_text, query_understanding)
-                    logger.info(f"[TRACE_V12_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
                     db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
-                    logger.info(f"[TRACE_V12_ACTIVE] Save confirmed for session {session_id}")
                 except Exception as trace_err:
-                    logger.error(f"[TRACE_V12_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
+                    logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
                 self._update_topic_memory(session_id, session, topic, response_text)
 
             suggestions = []
@@ -1216,11 +1226,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if is_astrology and not missing_fields:
                 try:
                     trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, full_text, query_understanding)
-                    logger.info(f"[TRACE_V12_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
                     db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
-                    logger.info(f"[TRACE_V12_ACTIVE] Save confirmed for session {session_id}")
                 except Exception as trace_err:
-                    logger.error(f"[TRACE_V12_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
+                    logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
                 self._update_topic_memory(session_id, session, topic, full_text)
 
             suggestions = get_instant_suggestions(topic, language)
@@ -1263,7 +1271,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             concepts = sorted(referenced.get("concepts", set()))
 
             steps = []
-            logger.info("[TRACE_V12_ACTIVE] _build_reasoning_trace entered — 9-step version with structured intent + comparative retrieval")
 
             # STEP 1 — QUERY UNDERSTANDING (LLM)
             qu = query_understanding or {}
@@ -1301,13 +1308,16 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if concepts:
                 framework_lines.append(f"Concepts: {', '.join(concepts)}")
 
+            framework_hit_count = len([h for h in rag_hits if h.get("stage") == "framework"])
             if framework_lines:
                 framework_detail = (
                     "RAG retrieved classical sources and identified the following factors as relevant:\n"
                     + "\n".join(f"• {line}" for line in framework_lines)
                 )
+            elif framework_hit_count == 0:
+                framework_detail = "No classical sources scored above the relevance threshold for this question's core framework query."
             else:
-                framework_detail = "RAG retrieved classical sources, but no specific chart factors were confidently identified."
+                framework_detail = "RAG retrieved classical sources, but no specific house/planet/concept factors were confidently identified in the text."
 
             steps.append({"step": 2, "title": "Classical Framework Retrieved", "detail": framework_detail, "type": "rag"})
 
@@ -1412,6 +1422,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 if verdict:
                     consensus_lines.append(f"• Verdict: {verdict}")
 
+            # FIX: flag when this confidence is chart/Dasha/Yoga-only, since
+            # rag_hits (classical text evidence) is empty for this specific
+            # turn — prevents "HIGH confidence" reading as if it were backed
+            # by retrieved book passages when it wasn't.
+            if not rag_hits:
+                consensus_lines.append(
+                    "\nNote: No classical text evidence was retrieved for this specific question. "
+                    "The confidence above reflects chart placement, Dasha timing, and Yoga signals only — "
+                    "not retrieved book passages."
+                )
+
             if consistency:
                 consensus_lines.append(f"\nSignal consistency:\n{consistency}")
 
@@ -1493,11 +1514,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps.append({"step": 9, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
 
-            logger.info(f"[TRACE_V12_ACTIVE] Reasoning trace built: {len(steps)} steps — titles: {[s['title'] for s in steps]}")
+            logger.info(f"[TRACE] Reasoning trace built: {len(steps)} steps — titles: {[s['title'] for s in steps]}")
             return steps
 
         except Exception as e:
-            logger.error(f"[TRACE_V12_ACTIVE] RAG-first reasoning trace build FAILED entirely: {e}", exc_info=True)
+            logger.error(f"RAG-first reasoning trace build FAILED entirely: {e}", exc_info=True)
             return []
 
     def _get_full_kundli_response(self, session_id: str, session: Dict) -> Optional[Dict]:

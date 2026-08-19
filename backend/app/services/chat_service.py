@@ -25,22 +25,6 @@ from app.services.topic_service import (
 from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
 
-_PLANET_ALTS = r"(Sun|Moon|Mars|Mercury|Jupiter|Venus|Saturn|Rahu|Ketu)"
-_HOUSE_ORDINAL = r"(1st|2nd|3rd|4th|5th|6th|7th|8th|9th|10th|11th|12th)"
-
-RULE_CONDITION_PATTERN_FORWARD = re.compile(
-    rf"\b{_PLANET_ALTS}\b[^.]{{0,40}}?\b(?:in|placed in|posited in|occupying|located in|situated in)\s+(?:the\s+)?{_HOUSE_ORDINAL}\s+house\b",
-    re.IGNORECASE,
-)
-RULE_CONDITION_PATTERN_REVERSE = re.compile(
-    rf"\b{_HOUSE_ORDINAL}\s+house\b[^.]{{0,40}}?\b{_PLANET_ALTS}\b",
-    re.IGNORECASE,
-)
-_RULE_ORDINAL_TO_NUM = {
-    "1st": 1, "2nd": 2, "3rd": 3, "4th": 4, "5th": 5, "6th": 6,
-    "7th": 7, "8th": 8, "9th": 9, "10th": 10, "11th": 11, "12th": 12,
-}
-
 
 class ChatService:
     def __init__(self):
@@ -238,7 +222,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
     def _build_framework_query(self, message_text: str, topic: Optional[str] = None, life_area: str = "") -> str:
         parts = [
             message_text.strip(),
-            "classical astrology principles rules indications relevant factors"
+            "classical astrology principles rules indications relevant factors houses lords planets"
         ]
         if life_area and life_area != "general":
             parts.append(life_area.replace("_", " "))
@@ -249,6 +233,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         return " ".join(p for p in parts if p).strip()
 
     def _extract_referenced_factors(self, rag_hits: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+        """Reads what the RETRIEVED classical text says matters — which
+        houses, planets, divisional charts, and concepts (like 'lord',
+        'dasha') are relevant to this question. This is the FIRST stage:
+        it tells us WHERE to look in the chart, not what's there."""
         houses: Set[str] = set()
         planets: Set[str] = set()
         charts: Set[str] = set()
@@ -352,37 +340,37 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         if charts:
             lines.append("Divisional charts referenced by classical evidence: " + ", ".join(sorted(charts)))
 
+        return "\n".join(lines)
 
-    def _match_rule_conditions_to_chart(self, rag_hits: List[Dict[str, Any]], session: Dict) -> str:
-        """Scans retrieved chunk text for explicit 'planet in Nth house'
-        claims and checks each against the ACTUAL chart. Returns a block
-        listing which claims are SATISFIED (real placement matches) and
-        which are NOT SATISFIED (real placement differs) — with an
-        instruction that only satisfied rules should be applied. This
-        prevents a rule mentioning 'Saturn in 7th house' from being
-        described as present in a chart where Saturn is actually
-        elsewhere; the real chart data always overrides retrieved text."""
-        if not rag_hits:
-            return ""
-
+    def _get_grounded_chart_facts(self, referenced: Dict[str, Set[str]], session: Dict) -> List[Dict[str, Any]]:
+        """SECOND stage: RAG told us WHICH houses/lords matter for this
+        question (referenced). Now we look up what's ACTUALLY present in
+        THIS chart for each — the house's LORD and where that lord actually
+        sits, plus any planet occupying the house, plus any planet RAG
+        named directly. This produces a list of real, grounded facts
+        (e.g. "Saturn is actually in the 7th house") that step three will
+        search for directly — no arbitrary text is retrieved first and
+        checked after; we go straight to what's real."""
         cached_raw = session.get("kundli_raw")
         if not cached_raw:
-            return ""
-
+            return []
         try:
             parsed = json.loads(cached_raw)
             planets = parsed.get("planets", []) or []
             ascendant_sign = parsed.get("ascendant_sign")
         except Exception as e:
-            logger.error(f"Failed to parse cached chart data for rule matching: {e}")
-            return ""
-
+            logger.error(f"Failed to parse cached chart data for grounded facts: {e}")
+            return []
         if not ascendant_sign or not planets:
-            return ""
+            return []
 
         from app.services.topic_service import get_house_for_sign
+        from app.services.kundli_service import get_house_lord
 
-        actual_house: Dict[str, int] = {}
+        houses_wanted = referenced.get("houses", set())
+        planets_wanted = referenced.get("planets", set())
+
+        planet_house_map: Dict[str, int] = {}
         for p in planets:
             name = p.get("name")
             sign = p.get("sign_name", "")
@@ -390,58 +378,154 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 continue
             h = get_house_for_sign(sign, ascendant_sign)
             if h:
-                actual_house[name] = h
+                planet_house_map[name] = h
 
-        if not actual_house:
-            return ""
+        grounded: List[Dict[str, Any]] = []
+        seen = set()
 
-        claims: Set[tuple] = set()
-        for hit in rag_hits:
-            text = hit.get("text", "") or ""
-            for m in RULE_CONDITION_PATTERN_FORWARD.finditer(text):
-                planet_raw, house_raw = m.group(1), m.group(2)
-                num = _RULE_ORDINAL_TO_NUM.get(house_raw.lower())
-                if num:
-                    claims.add((planet_raw.capitalize(), num))
-            for m in RULE_CONDITION_PATTERN_REVERSE.finditer(text):
-                house_raw, planet_raw = m.group(1), m.group(2)
-                num = _RULE_ORDINAL_TO_NUM.get(house_raw.lower())
-                if num:
-                    claims.add((planet_raw.capitalize(), num))
+        def _add(planet: str, house: int, role: str):
+            key = (planet, house)
+            if key in seen:
+                return
+            seen.add(key)
+            grounded.append({"planet": planet, "house": house, "role": role})
 
-        if not claims:
-            return ""
-
-        satisfied: List[str] = []
-        unsatisfied: List[str] = []
-        for planet, claimed_house in sorted(claims, key=lambda x: (x[1], x[0])):
-            real_house = actual_house.get(planet)
-            if real_house is None:
+        # For each house RAG flagged as relevant: find its LORD and where
+        # that lord actually sits, plus who actually occupies the house.
+        for house_str in houses_wanted:
+            try:
+                house_num = int(house_str)
+            except (TypeError, ValueError):
                 continue
-            if real_house == claimed_house:
-                satisfied.append(f"✓ SATISFIED: {planet} in {claimed_house}th house — confirmed by this chart.")
-            else:
-                unsatisfied.append(
-                    f"✗ NOT SATISFIED: {planet} in {claimed_house}th house — this chart actually has "
-                    f"{planet} in the {real_house}th house. Do NOT apply this specific rule to this chart."
+            lord = get_house_lord(house_num, ascendant_sign)
+            if lord:
+                lord_actual_house = planet_house_map.get(lord)
+                if lord_actual_house:
+                    _add(lord, lord_actual_house, f"{house_num}th house lord")
+            for planet_name, occupied_house in planet_house_map.items():
+                if occupied_house == house_num:
+                    _add(planet_name, house_num, f"occupant of {house_num}th house")
+
+        # For each planet RAG flagged directly, use its real placement.
+        for planet_name in planets_wanted:
+            if planet_name == "Ascendant":
+                continue
+            actual_house = planet_house_map.get(planet_name)
+            if actual_house:
+                _add(planet_name, actual_house, "significator named by retrieved text")
+
+        logger.info(f"[GroundedFacts] real chart facts matching RAG-flagged houses/planets: {grounded}")
+        return grounded
+
+    def _get_chart_grounded_evidence(self, grounded_facts: List[Dict[str, Any]], life_area: str,
+                                       dasha_info: Optional[dict], seen_keys: set):
+        """THIRD stage: for each REAL grounded fact (e.g. actual Saturn in
+        actual 7th house), retrieve classical text about THAT exact
+        placement's effect on this life area — single-hop. THEN, as a
+        multi-hop pass, combine each grounded fact with the CURRENT Dasha
+        lord(s) and search for their combined effect (e.g. 'Saturn in 7th
+        house Venus Mahadasha effect on marriage') — this is what lets the
+        reading say something like 'Saturn's 7th-house placement plays out
+        differently right now because you're in Venus Mahadasha' instead
+        of treating the placement and the timing as unrelated facts."""
+        if not grounded_facts:
+            return "", []
+
+        chunks: List[str] = []
+        hits: List[Dict[str, Any]] = []
+
+        maha_lord = None
+        antar_lord = None
+        if dasha_info:
+            maha = dasha_info.get("current_mahadasha", {}) or {}
+            antar = dasha_info.get("current_antardasha", {}) or {}
+            maha_lord = maha.get("lord") or maha.get("name") or maha.get("planet")
+            antar_lord = antar.get("lord") or antar.get("name") or antar.get("planet")
+
+        for fact in grounded_facts:
+            planet, house, role = fact["planet"], fact["house"], fact["role"]
+            fact_label = f"{planet} in {house}th house ({role})"
+
+            # --- Single-hop: the real placement's effect on its own ---
+            single_query = f"{planet} in {house}th house effects meaning classical astrology"
+            if life_area and life_area != "general":
+                single_query += f" {life_area}"
+
+            try:
+                vector = self.embeddings_provider.get_embedding(single_query)
+                results = vector_store.hybrid_search(
+                    query=single_query, query_vector=vector,
+                    top_k=3, alpha=settings.HYBRID_ALPHA
                 )
+            except Exception as e:
+                logger.error(f"[GroundedEvidence] single-hop retrieval failed for {fact_label}: {e}")
+                results = []
 
-        if not satisfied and not unsatisfied:
-            return ""
+            for hit in results:
+                if hit["score"] < settings.MIN_RAG_RELEVANCE:
+                    continue
+                source = hit["metadata"].get("source", "Unknown")
+                page = hit["metadata"].get("page")
+                key = (source, page)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
 
-        logger.info(f"[RuleMatching] satisfied={len(satisfied)} not_satisfied={len(unsatisfied)}")
+                page_label = f", Page: {page}" if page is not None else ""
+                chunks.append(
+                    f"--- Grounded Evidence ({fact_label}) [Source: {source}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
+                )
+                hits.append({
+                    "source": source, "page": page, "score": hit["score"],
+                    "text": hit["text"], "stage": "grounded", "fact": fact_label,
+                })
 
-        lines = ["Rule-Condition Matching (classical rules found in retrieved text, checked against this exact chart):"]
-        lines.extend(satisfied)
-        lines.extend(unsatisfied)
-        lines.append(
-            "IMPORTANT: Only incorporate SATISFIED rules above into your reading. For any NOT SATISFIED "
-            "rule, do not describe that placement/condition as present in this chart — the actual chart "
-            "data always overrides a rule's stated planet/house condition."
-        )
-        return "\n".join(lines)
+            # --- Multi-hop: combine the real placement with the CURRENT
+            # Dasha lord(s) — a second, separate retrieval that asks how
+            # the placement plays out under the timing that's active now.
+            for dasha_lord, dasha_role in ((maha_lord, "Mahadasha"), (antar_lord, "Antardasha")):
+                if not dasha_lord or dasha_lord == planet:
+                    continue
+                combo_query = (
+                    f"{planet} in {house}th house combined with {dasha_lord} {dasha_role} "
+                    f"effect timing classical astrology"
+                )
+                if life_area and life_area != "general":
+                    combo_query += f" {life_area}"
 
-    
+                try:
+                    combo_vector = self.embeddings_provider.get_embedding(combo_query)
+                    combo_results = vector_store.hybrid_search(
+                        query=combo_query, query_vector=combo_vector,
+                        top_k=2, alpha=settings.HYBRID_ALPHA
+                    )
+                except Exception as e:
+                    logger.error(f"[GroundedEvidence] multi-hop retrieval failed for {fact_label} + {dasha_lord} {dasha_role}: {e}")
+                    continue
+
+                combo_label = f"{fact_label} + {dasha_lord} {dasha_role}"
+                for hit in combo_results:
+                    if hit["score"] < settings.MIN_RAG_RELEVANCE:
+                        continue
+                    source = hit["metadata"].get("source", "Unknown")
+                    page = hit["metadata"].get("page")
+                    key = (source, page)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    page_label = f", Page: {page}" if page is not None else ""
+                    chunks.append(
+                        f"--- Multi-Hop Evidence ({combo_label}) [Source: {source}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
+                    )
+                    hits.append({
+                        "source": source, "page": page, "score": hit["score"],
+                        "text": hit["text"], "stage": "grounded_multihop", "fact": combo_label,
+                    })
+
+        logger.info(f"[GroundedEvidence] retrieved {len(hits)} chunk(s) across {len(grounded_facts)} real chart placement(s)")
+        return "\n".join(chunks), hits
+
     def _build_personalized_rag_query(self, message_text: str, topic: Optional[str], targeted_facts: str, life_area: str = "") -> str:
         parts = [message_text.strip(), "classical astrology interpretation"]
         if life_area and life_area != "general":
@@ -477,11 +561,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             framework_hits = [h for h in framework_hits if h["score"] >= settings.MIN_RAG_RELEVANCE]
 
-            # FIX: previously, an empty framework_hits caused an early
-            # return that skipped comparison AND personalized retrieval
-            # entirely — a single weak first-stage score blacked out the
-            # whole evidence pipeline. Now we log and continue with an
-            # empty framework stage instead of aborting everything.
+            # A weak/empty framework stage should never black out the rest
+            # of the pipeline — continue with empty referenced factors so
+            # comparison/personalized/grounded retrieval still get a chance.
             framework_rag_hits: List[Dict[str, Any]] = []
             framework_chunks: List[str] = []
             seen_keys: set = set()
@@ -489,7 +571,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             targeted_facts = ""
 
             if not framework_hits:
-                logger.info("[RAGFirst] no sufficiently relevant framework chunks — continuing with comparison/personalized retrieval anyway")
+                logger.info("[RAGFirst] no sufficiently relevant framework chunks — continuing with grounded/comparison/personalized retrieval anyway")
             else:
                 for i, hit in enumerate(framework_hits):
                     source = hit["metadata"].get("source", "Unknown")
@@ -513,12 +595,25 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     f"planets={referenced['planets']} charts={referenced['charts']} concepts={referenced['concepts']}"
                 )
 
-            # If no houses/planets came from framework text, still surface
-            # at least the Dasha line via an empty-referenced call — this
-            # keeps the Kundli-derived timing info available even when RAG
-            # found nothing usable this turn.
             if not targeted_facts:
                 targeted_facts = self._build_targeted_kundli_facts(referenced, session)
+
+            # --- Chart-grounded evidence: RAG told us which houses/planets
+            # matter (referenced) → look up what's ACTUALLY there (lords +
+            # occupants) → search for that real placement's effect, and its
+            # combined effect with the current Dasha (multi-hop). ---
+            cached_dasha_raw = session.get("kundli_dasha")
+            dasha_info_for_grounding = None
+            if cached_dasha_raw:
+                try:
+                    dasha_info_for_grounding = json.loads(cached_dasha_raw)
+                except Exception:
+                    dasha_info_for_grounding = None
+
+            grounded_facts = self._get_grounded_chart_facts(referenced, session)
+            grounded_chunks_str, grounded_hits = self._get_chart_grounded_evidence(
+                grounded_facts, life_area, dasha_info_for_grounding, seen_keys
+            )
 
             # --- Comparative branch retrieval (e.g. "job or business",
             # "abroad or stay in India") — independent of framework
@@ -629,15 +724,13 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     f"--- Comparison Evidence ({hit['branch']}) [Source: {hit['source']}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
                 )
 
-            all_hits = framework_rag_hits + comparison_hits + personalized_rag_hits
-
-            rule_matching_block = self._match_rule_conditions_to_chart(all_hits, session)
-            if rule_matching_block:
-                targeted_facts = f"{targeted_facts}\n\n{rule_matching_block}" if targeted_facts else rule_matching_block
+            all_hits = framework_rag_hits + grounded_hits + comparison_hits + personalized_rag_hits
 
             context_parts = []
             if framework_chunks:
                 context_parts.append("\n".join(framework_chunks))
+            if grounded_chunks_str:
+                context_parts.append(grounded_chunks_str)
             if comparison_chunks:
                 context_parts.append("\n".join(comparison_chunks))
             if personalized_chunks:
@@ -645,7 +738,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             context = "\n".join(p for p in context_parts if p) or "No reference available."
 
             logger.info(
-                f"[RAGFirst] framework={len(framework_rag_hits)}, "
+                f"[RAGFirst] framework={len(framework_rag_hits)}, grounded={len(grounded_hits)}, "
                 f"comparison={len(comparison_hits)}, personalized={len(personalized_rag_hits)}"
             )
 
@@ -1363,9 +1456,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         query_understanding: Optional[Dict[str, Any]] = None,
     ) -> list:
         """9-step trace: Query Understanding (LLM, incl. comparison/timing),
-        Classical Framework, Chart Factors, Personalized+Comparative
-        Evidence, Evidence Consensus, Dasha & Timing, Classical Evidence,
-        Evidence Synthesis, Chart-Specificity Check."""
+        Classical Framework, Chart Factors, Chart-Grounded+Personalized+
+        Comparative Evidence, Evidence Consensus, Dasha & Timing, Classical
+        Evidence, Evidence Synthesis, Chart-Specificity Check."""
         if not topic and not rag_hits and not (query_understanding and query_understanding.get("restated_intent")):
             return []
 
@@ -1419,8 +1512,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             framework_hit_count = len([h for h in rag_hits if h.get("stage") == "framework"])
             if framework_lines:
                 framework_detail = (
-                    "RAG retrieved classical sources and identified the following factors as relevant:\n"
-                    + "\n".join(f"• {line}" for line in framework_lines)
+                    "RAG retrieved classical sources and identified the following houses/planets as relevant "
+                    "to check in this chart:\n" + "\n".join(f"• {line}" for line in framework_lines)
                 )
             elif framework_hit_count == 0:
                 framework_detail = "No classical sources scored above the relevance threshold for this question's core framework query."
@@ -1429,10 +1522,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps.append({"step": 2, "title": "Classical Framework Retrieved", "detail": framework_detail, "type": "rag"})
 
-            # STEP 3 — RELEVANT CHART FACTORS
+            # STEP 3 — RELEVANT CHART FACTORS (what's ACTUALLY present)
             if targeted_facts:
                 chart_detail = (
-                    "The user's Kundli was examined for the factors identified by the retrieved classical sources.\n\n"
+                    "The user's Kundli was examined for the houses/lords the retrieved classical sources "
+                    "flagged as relevant — this shows what is ACTUALLY present in this chart:\n\n"
                     + targeted_facts
                 )
             else:
@@ -1440,11 +1534,45 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps.append({"step": 3, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
 
-            # STEP 4 — PERSONALIZED + COMPARATIVE EVIDENCE RETRIEVED
+            # STEP 4 — CHART-GROUNDED + PERSONALIZED + COMPARATIVE EVIDENCE
+            grounded_hits_trace = [hit for hit in rag_hits if hit.get("stage") == "grounded"]
+            grounded_multihop_trace = [hit for hit in rag_hits if hit.get("stage") == "grounded_multihop"]
             personalized_hits = [hit for hit in rag_hits if hit.get("stage") == "personalized"]
             comparison_hits_trace = [hit for hit in rag_hits if hit.get("stage") == "comparison"]
 
             evidence_lines = []
+            if grounded_hits_trace:
+                by_fact: Dict[str, List[str]] = {}
+                seen_g = set()
+                for hit in grounded_hits_trace:
+                    fact = hit.get("fact", "unknown")
+                    key = (fact, hit.get("source"), hit.get("page"))
+                    if key in seen_g:
+                        continue
+                    seen_g.add(key)
+                    ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
+                    by_fact.setdefault(fact, []).append(f"  • {ref}")
+                evidence_lines.append("Chart-grounded retrieval (real placement → its effect, searched directly):")
+                for fact, refs in by_fact.items():
+                    evidence_lines.append(f"{fact}:")
+                    evidence_lines.extend(refs)
+
+            if grounded_multihop_trace:
+                by_combo: Dict[str, List[str]] = {}
+                seen_gm = set()
+                for hit in grounded_multihop_trace:
+                    combo = hit.get("fact", "unknown")
+                    key = (combo, hit.get("source"), hit.get("page"))
+                    if key in seen_gm:
+                        continue
+                    seen_gm.add(key)
+                    ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
+                    by_combo.setdefault(combo, []).append(f"  • {ref}")
+                evidence_lines.append("\nMulti-hop retrieval (real placement combined with current Dasha lord):")
+                for combo, refs in by_combo.items():
+                    evidence_lines.append(f"{combo}:")
+                    evidence_lines.extend(refs)
+
             if personalized_hits:
                 seen_p = set()
                 p_sources = []
@@ -1455,7 +1583,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     seen_p.add(key)
                     ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
                     p_sources.append(f"• {ref}")
-                evidence_lines.append("Personalized retrieval (using chart configuration):")
+                evidence_lines.append("\nPersonalized retrieval (using chart configuration):")
                 evidence_lines.extend(p_sources)
 
             if comparison_hits_trace:
@@ -1474,8 +1602,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     evidence_lines.append(f"{branch}:")
                     evidence_lines.extend(refs)
 
-            evidence_detail_step4 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or comparative evidence was retrieved."
-            steps.append({"step": 4, "title": "Personalized + Comparative Evidence Retrieved", "detail": evidence_detail_step4, "type": "personalized_rag"})
+            evidence_detail_step4 = "\n".join(evidence_lines) if evidence_lines else "No additional grounded, personalized, or comparative evidence was retrieved."
+            steps.append({"step": 4, "title": "Chart-Grounded + Personalized Evidence Retrieved", "detail": evidence_detail_step4, "type": "personalized_rag"})
 
             # STEP 5 — EVIDENCE CONSENSUS
             consensus_label = None
@@ -1530,10 +1658,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 if verdict:
                     consensus_lines.append(f"• Verdict: {verdict}")
 
-            # FIX: flag when this confidence is chart/Dasha/Yoga-only, since
-            # rag_hits (classical text evidence) is empty for this specific
-            # turn — prevents "HIGH confidence" reading as if it were backed
-            # by retrieved book passages when it wasn't.
             if not rag_hits:
                 consensus_lines.append(
                     "\nNote: No classical text evidence was retrieved for this specific question. "
@@ -1590,6 +1714,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     reference += f" [{stage}]"
                 if hit.get("branch"):
                     reference += f" (option: {hit['branch']})"
+                if hit.get("fact"):
+                    reference += f" (fact: {hit['fact']})"
                 reference_lines.append(f"• {reference}")
 
             evidence_detail_step7 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
@@ -1597,8 +1723,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             # STEP 8 — EVIDENCE SYNTHESIS
             synthesis_detail = (
-                "The final interpretation combines the retrieved classical evidence, comparative "
-                "branch analysis (if applicable), and the relevant Kundli and Dasha information."
+                "The final interpretation combines the chart-grounded evidence (real placements matched "
+                "directly to their classical effects, including their interaction with the current Dasha), "
+                "comparative branch analysis (if applicable), and the relevant Kundli and Dasha information."
             )
             steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 

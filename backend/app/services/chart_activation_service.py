@@ -2,11 +2,16 @@
 Chart Fact Graph + Activation Scoring.
 
 Deterministic (no LLM, no RAG) ranking of which planets are most
-astrologically significant for a given topic, based on real chart data.
-Named chart_activation_service.py to avoid colliding with the existing
-chart_fact_service.py (direct chart-fact Q&A — unrelated, unused, left as-is).
+astrologically significant for a given question, based on real chart data.
+
+Scoring now runs primarily off framework_factors (houses/planets/concepts
+actually extracted from RETRIEVED classical text — see
+chat_service._extract_referenced_factors), not a hardcoded topic->house
+lookup. TOPIC_CHART_FACTORS is still consulted as a fallback/supplement
+when the topic classifier matched something and RAG found few/no factors,
+so the system degrades gracefully rather than going silent.
 """
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from app.services.topic_service import get_house_for_sign, TOPIC_CHART_FACTORS
 from app.services.kundli_service import get_house_lord
 from app.services.aspect_service import get_planets_aspecting_house
@@ -28,16 +33,58 @@ SCORE_OWN_SIGN = 2
 SCORE_RETROGRADE = 1
 
 
-def compute_activation_scores(topic: str, planets: List[dict], ascendant_sign: str,
-                                dasha_info: Optional[dict]) -> List[Dict]:
-    config = TOPIC_CHART_FACTORS.get(topic)
-    if not config or not planets or not ascendant_sign:
+def _merge_factors(topic: Optional[str], framework_factors: Optional[Dict]) -> Dict[str, Set]:
+    """Combines RAG-retrieved houses/planets/concepts with the topic's
+    hardcoded config (if any) as a fallback. RAG-derived factors take
+    priority; TOPIC_CHART_FACTORS only fills gaps when RAG found little."""
+    houses: Set[int] = set()
+    significators: Set[str] = set()
+
+    if framework_factors:
+        for h in framework_factors.get("houses", set()):
+            try:
+                houses.add(int(h))
+            except (TypeError, ValueError):
+                pass
+        significators |= set(framework_factors.get("planets", set()))
+        significators.discard("Ascendant")
+
+    # Fallback augmentation — only kicks in when RAG surfaced nothing usable,
+    # so a topic classified by keyword match still gets *some* grounding.
+    if topic and not houses and not significators:
+        config = TOPIC_CHART_FACTORS.get(topic)
+        if config:
+            if config.get("house"):
+                houses.add(config["house"])
+            significators |= set(config.get("planets", []))
+
+    return {"houses": houses, "significators": significators}
+
+
+def compute_activation_scores(
+    planets: List[dict],
+    ascendant_sign: str,
+    dasha_info: Optional[dict],
+    framework_factors: Optional[Dict] = None,
+    topic: Optional[str] = None,
+) -> List[Dict]:
+    """Scores each chart planet's relevance using houses/planets/concepts
+    ACTUALLY RETRIEVED from classical text (framework_factors), falling
+    back to TOPIC_CHART_FACTORS only if framework_factors is empty."""
+    if not planets or not ascendant_sign:
         return []
 
-    key_house = config.get("house")
-    significators = set(config.get("planets", []))
-    house_lord = get_house_lord(key_house, ascendant_sign) if key_house else None
-    aspecting_planets = set(get_planets_aspecting_house(key_house, planets, ascendant_sign)) if key_house else set()
+    merged = _merge_factors(topic, framework_factors)
+    key_houses: Set[int] = merged["houses"]
+    significators: Set[str] = merged["significators"]
+
+    if not key_houses and not significators:
+        return []
+
+    house_lords = {h: get_house_lord(h, ascendant_sign) for h in key_houses}
+    aspecting_by_house = {
+        h: set(get_planets_aspecting_house(h, planets, ascendant_sign)) for h in key_houses
+    }
 
     maha_lord = None
     antar_lord = None
@@ -53,24 +100,27 @@ def compute_activation_scores(topic: str, planets: List[dict], ascendant_sign: s
         if not name:
             continue
         sign = p.get("sign_name", "")
+        planet_house = get_house_for_sign(sign, ascendant_sign) if ascendant_sign else None
         score = 0
         reasons = []
 
-        if house_lord and name == house_lord:
-            score += SCORE_HOUSE_LORD
-            reasons.append(f"{key_house}th house lord")
+        for h, lord in house_lords.items():
+            if lord and name == lord:
+                score += SCORE_HOUSE_LORD
+                reasons.append(f"{h}th house lord")
 
         if name in significators:
             score += SCORE_SIGNIFICATOR
-            reasons.append(f"significator for {topic}")
+            reasons.append("significator per retrieved classical text")
 
-        if key_house and get_house_for_sign(sign, ascendant_sign) == key_house:
+        if planet_house in key_houses:
             score += SCORE_OCCUPANT
-            reasons.append(f"occupies {key_house}th house")
+            reasons.append(f"occupies {planet_house}th house")
 
-        if name in aspecting_planets:
-            score += SCORE_ASPECTING
-            reasons.append(f"aspects {key_house}th house")
+        for h, aspecting_set in aspecting_by_house.items():
+            if name in aspecting_set:
+                score += SCORE_ASPECTING
+                reasons.append(f"aspects {h}th house")
 
         if maha_lord and name == maha_lord:
             score += SCORE_MAHADASHA
@@ -95,18 +145,25 @@ def compute_activation_scores(topic: str, planets: List[dict], ascendant_sign: s
     return results
 
 
-def get_top_activated_planets(topic: str, planets: List[dict], ascendant_sign: str,
-                                dasha_info: Optional[dict], top_n: int = 3) -> List[Dict]:
-    scored = compute_activation_scores(topic, planets, ascendant_sign, dasha_info)
+def get_top_activated_planets(
+    planets: List[dict],
+    ascendant_sign: str,
+    dasha_info: Optional[dict],
+    framework_factors: Optional[Dict] = None,
+    topic: Optional[str] = None,
+    top_n: int = 3,
+) -> List[Dict]:
+    scored = compute_activation_scores(planets, ascendant_sign, dasha_info, framework_factors, topic)
     return scored[:top_n]
 
 
-def format_activation_summary_for_prompt(topic: str, ranked: List[Dict]) -> str:
+def format_activation_summary_for_prompt(ranked: List[Dict]) -> str:
     if not ranked:
         return ""
     lines = [
-        f"Factor Activation Ranking for {topic} (deterministic scoring — higher score means "
-        f"more classically significant for THIS specific question, not general strength):"
+        "Factor Activation Ranking (deterministic scoring against houses/planets actually "
+        "referenced by the retrieved classical text for THIS question — higher score means "
+        "more classically significant here, not general chart strength):"
     ]
     for i, r in enumerate(ranked, 1):
         reason_str = ", ".join(r["reasons"])

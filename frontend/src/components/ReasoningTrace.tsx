@@ -16,6 +16,7 @@ import {
   Gauge,
   FileCheck2,
   ListOrdered,
+  MessageCircleQuestion,
 } from 'lucide-react';
 
 interface TraceStep {
@@ -23,6 +24,7 @@ interface TraceStep {
   title: string;
   detail: string;
   type?:
+    | 'query_understanding'
     | 'rag'
     | 'chart'
     | 'activation'
@@ -72,10 +74,12 @@ const STRINGS: Record<
   },
 };
 
-// Backend's 9-step trace (see chat_service.py _build_reasoning_trace):
-// 1 rag, 2 chart, 3 activation, 4 personalized_rag, 5 consensus,
-// 6 dasha, 7 evidence, 8 synthesis, 9 specificity.
+// Backend's 10-step trace (see chat_service.py _build_reasoning_trace):
+// 1 query_understanding (LLM), 2 rag, 3 chart, 4 activation,
+// 5 personalized_rag, 6 consensus, 7 dasha, 8 evidence, 9 synthesis,
+// 10 specificity.
 const STEP_ICONS = {
+  query_understanding: MessageCircleQuestion,
   rag: BookOpen,
   chart: CircleUserRound,
   activation: ListOrdered,
@@ -88,7 +92,7 @@ const STEP_ICONS = {
   general: Sparkles,
 };
 
-// Step 5 ("Evidence Consensus") detail text contains a line like
+// Step 6 ("Evidence Consensus") detail text contains a line like
 // "Evidence confidence: HIGH" (see consensus_lines in chat_service.py).
 // NOTE: backend says "Evidence confidence:", not "Evidence consensus:" —
 // the regex below matches the backend's actual wording.
@@ -104,7 +108,7 @@ function extractConsensusLabel(detail: string): string | null {
   return match ? match[1].toUpperCase() : null;
 }
 
-// Step 9 ("Chart-Specificity Check") detail text contains a line like
+// Step 10 ("Chart-Specificity Check") detail text contains a line like
 // "Status: SPECIFIC" or "Status: GENERIC" (see specificity_lines in
 // chat_service.py).
 const SPECIFICITY_STYLES: Record<string, string> = {

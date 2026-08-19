@@ -154,6 +154,47 @@ class ChatService:
             logger.error(f"RAG failed: {rag_err}")
             return "No reference available.", []
 
+    def _understand_query_intent(self, message_text: str, history_text: str) -> Dict[str, str]:
+        """LLM-based query understanding — runs BEFORE RAG. Normalizes
+        whatever language/phrasing the user used ('profession', 'naukri
+        vs business', 'pesha', etc.) into a short life-area label and a
+        one-line restatement of intent, WITHOUT deciding any astrology
+        rules itself. This output is shown verbatim in the reasoning
+        trace so the person can see what the system understood before
+        any retrieval happened."""
+        prompt = f"""You are a query-understanding layer for a Vedic astrology assistant.
+Do NOT answer the astrology question and do NOT name any houses, planets, or astrological rules.
+Only restate what the user is asking about, in plain language, and give a short life-area label.
+
+Conversation history (for context only):
+{history_text or "None"}
+
+User's current message:
+"{message_text}"
+
+Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
+{{"life_area": "one short label, e.g. career, marriage, finance, health, education, general",
+  "restated_intent": "one plain sentence restating what the user wants to know, in English"}}
+"""
+        try:
+            raw = llm_service.generate(prompt=prompt, json_format=True, temperature=0.0)
+            cleaned = raw.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.startswith("```"):
+                cleaned = cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            parsed = json.loads(cleaned.strip())
+            life_area = str(parsed.get("life_area", "")).strip() or "general"
+            restated = str(parsed.get("restated_intent", "")).strip()
+            if not restated:
+                raise ValueError("empty restated_intent")
+            return {"life_area": life_area, "restated_intent": restated}
+        except Exception as e:
+            logger.warning(f"Query-understanding LLM call failed, falling back to keyword topic: {e}")
+            return {"life_area": "", "restated_intent": ""}
+
     def _build_framework_query(self, message_text: str, topic: Optional[str] = None) -> str:
         parts = [
             message_text.strip(),
@@ -280,16 +321,17 @@ class ChatService:
             parts.append(targeted_facts)
         return " ".join(p for p in parts if p).strip()
 
-    def _get_multihop_evidence(self, topic: str, ranked_factors: List[Dict], seen_keys: set):
+    def _get_multihop_evidence(self, topic: Optional[str], ranked_factors: List[Dict], seen_keys: set):
         """Multi-hop RAG: separate retrieval per top-activated planet."""
         chunks = []
         hits = []
         if not ranked_factors:
             return "", []
 
+        topic_label = topic or "this question"
         for factor in ranked_factors:
             planet = factor["planet"]
-            query = f"{planet} in {topic} astrology — house placement, strength, classical effects"
+            query = f"{planet} in {topic_label} astrology — house placement, strength, classical effects"
             try:
                 query_vector = self.embeddings_provider.get_embedding(query)
                 results = vector_store.hybrid_search(
@@ -373,22 +415,27 @@ class ChatService:
             )
 
             # --- Deterministic Chart Fact Graph + Activation Scoring ---
+            # Scores against houses/planets ACTUALLY RETRIEVED (referenced),
+            # falling back to TOPIC_CHART_FACTORS only if RAG found nothing.
             ranked_factors = []
             cached_raw = session.get("kundli_raw")
             cached_dasha = session.get("kundli_dasha")
-            if topic and cached_raw:
+            if cached_raw:
                 try:
                     parsed = json.loads(cached_raw)
                     chart_planets = parsed.get("planets", []) or []
                     chart_ascendant = parsed.get("ascendant_sign")
                     chart_dasha = json.loads(cached_dasha) if cached_dasha else None
-                    ranked_factors = get_top_activated_planets(topic, chart_planets, chart_ascendant, chart_dasha, top_n=3)
+                    ranked_factors = get_top_activated_planets(
+                        chart_planets, chart_ascendant, chart_dasha,
+                        framework_factors=referenced, topic=topic, top_n=3
+                    )
                     if ranked_factors:
-                        activation_summary = format_activation_summary_for_prompt(topic, ranked_factors)
+                        activation_summary = format_activation_summary_for_prompt(ranked_factors)
                         targeted_facts = f"{targeted_facts}\n\n{activation_summary}" if targeted_facts else activation_summary
                         logger.info(f"[ActivationScore] top factors: {[(r['planet'], r['score']) for r in ranked_factors]}")
                 except Exception as e:
-                    logger.error(f"Activation scoring failed: {e}")
+                    logger.error(f"Activation scoring failed: {e}", exc_info=True)
 
             personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts)
             personalized_vector = self.embeddings_provider.get_embedding(personalized_query)
@@ -426,7 +473,7 @@ class ChatService:
                     "text": hit["text"], "stage": "personalized",
                 })
 
-            multihop_chunks_str, multihop_hits = self._get_multihop_evidence(topic, ranked_factors, seen_keys) if (topic and ranked_factors) else ("", [])
+            multihop_chunks_str, multihop_hits = self._get_multihop_evidence(topic, ranked_factors, seen_keys) if ranked_factors else ("", [])
 
             all_hits = framework_rag_hits + personalized_rag_hits + multihop_hits
 
@@ -807,6 +854,11 @@ class ChatService:
             intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
             response_contract = get_response_contract(intent)
 
+            query_understanding = {"life_area": "", "restated_intent": ""}
+            if is_astrology and not missing_fields:
+                query_understanding = self._understand_query_intent(message_text, history_text)
+                logger.info(f"[QueryUnderstanding] life_area='{query_understanding['life_area']}' restated='{query_understanding['restated_intent']}'")
+
             context_str = ""
             rag_hits: List[Dict[str, Any]] = []
             targeted_facts = ""
@@ -911,12 +963,14 @@ class ChatService:
 
             if is_astrology and not missing_fields:
                 try:
-                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, response_text)
-                    logger.info(f"[TRACE_V9_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
+                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, response_text, query_understanding)
+                    logger.info(f"[TRACE_V10_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
                     db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
-                    logger.info(f"[TRACE_V9_ACTIVE] Save confirmed for session {session_id}")
+                    logger.info(f"[TRACE_V10_ACTIVE] Save confirmed for session {session_id}")
                 except Exception as trace_err:
-                    logger.error(f"[TRACE_V9_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
+                    logger.error(f"[TRACE_V10_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
+                self._update_topic_memory(session_id, session, topic, response_text)
+
             suggestions = []
             if response_text and len(response_text) > 20:
                 suggestions = self._safe_generate_followups(response_text, language)
@@ -1003,6 +1057,11 @@ class ChatService:
             topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
             intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
             response_contract = get_response_contract(intent)
+
+            query_understanding = {"life_area": "", "restated_intent": ""}
+            if is_astrology and not missing_fields:
+                query_understanding = self._understand_query_intent(message_text, history_text)
+                logger.info(f"[QueryUnderstanding] life_area='{query_understanding['life_area']}' restated='{query_understanding['restated_intent']}'")
 
             context_str = ""
             rag_hits: List[Dict[str, Any]] = []
@@ -1101,12 +1160,13 @@ class ChatService:
 
             if is_astrology and not missing_fields:
                 try:
-                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, response_text)
-                    logger.info(f"[TRACE_V9_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
+                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, full_text, query_understanding)
+                    logger.info(f"[TRACE_V10_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
                     db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
-                    logger.info(f"[TRACE_V9_ACTIVE] Save confirmed for session {session_id}")
+                    logger.info(f"[TRACE_V10_ACTIVE] Save confirmed for session {session_id}")
                 except Exception as trace_err:
-                    logger.error(f"[TRACE_V9_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
+                    logger.error(f"[TRACE_V10_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
+                self._update_topic_memory(session_id, session, topic, full_text)
 
             suggestions = get_instant_suggestions(topic, language)
 
@@ -1129,11 +1189,13 @@ class ChatService:
         rag_hits: Optional[List[Dict[str, Any]]] = None,
         targeted_facts: str = "",
         response_text: str = "",
+        query_understanding: Optional[Dict[str, str]] = None,
     ) -> list:
-        """9-step trace: Classical Framework, Chart Factors, Factor Activation
-        Ranking, Personalized+Multi-Hop Evidence, Evidence Consensus, Dasha &
-        Timing, Classical Evidence, Evidence Synthesis, Chart-Specificity Check."""
-        if not topic and not rag_hits:
+        """10-step trace: Query Understanding (LLM), Classical Framework,
+        Chart Factors, Factor Activation Ranking, Personalized+Multi-Hop
+        Evidence, Evidence Consensus, Dasha & Timing, Classical Evidence,
+        Evidence Synthesis, Chart-Specificity Check."""
+        if not topic and not rag_hits and not (query_understanding and query_understanding.get("restated_intent")):
             return []
 
         try:
@@ -1146,8 +1208,24 @@ class ChatService:
             concepts = sorted(referenced.get("concepts", set()))
 
             steps = []
-            logger.info("[TRACE_V9_ACTIVE] _build_reasoning_trace entered — this log line only exists in the 9-step version")
-            # STEP 1 — CLASSICAL FRAMEWORK RETRIEVED
+            logger.info("[TRACE_V10_ACTIVE] _build_reasoning_trace entered — 10-step version with LLM query understanding")
+
+            # STEP 1 — QUERY UNDERSTANDING (LLM)
+            qu = query_understanding or {}
+            life_area = qu.get("life_area", "")
+            restated = qu.get("restated_intent", "")
+            if restated:
+                qu_detail = f"What the system understood you're asking:\n\"{restated}\""
+                if life_area:
+                    qu_detail += f"\n\nLife area: {life_area}"
+            else:
+                qu_detail = (
+                    "Query understanding was not available for this response — "
+                    f"falling back to keyword-based topic classification (topic: {topic or 'none'})."
+                )
+            steps.append({"step": 1, "title": "Query Understanding", "detail": qu_detail, "type": "query_understanding"})
+
+            # STEP 2 — CLASSICAL FRAMEWORK RETRIEVED
             framework_lines = []
             if houses:
                 house_labels = []
@@ -1171,9 +1249,9 @@ class ChatService:
             else:
                 framework_detail = "RAG retrieved classical sources, but no specific chart factors were confidently identified."
 
-            steps.append({"step": 1, "title": "Classical Framework Retrieved", "detail": framework_detail, "type": "rag"})
+            steps.append({"step": 2, "title": "Classical Framework Retrieved", "detail": framework_detail, "type": "rag"})
 
-            # STEP 2 — RELEVANT CHART FACTORS
+            # STEP 3 — RELEVANT CHART FACTORS
             if targeted_facts:
                 chart_detail = (
                     "The user's Kundli was examined for the factors identified by the retrieved classical sources.\n\n"
@@ -1182,48 +1260,51 @@ class ChatService:
             else:
                 chart_detail = "No targeted chart facts were identified from the retrieved classical framework."
 
-            steps.append({"step": 2, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
+            steps.append({"step": 3, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
 
-                        # STEP 3 — FACTOR ACTIVATION RANKING (deterministic)
-            activation_detail = "Not applicable — no topic classified for this question."
-            if topic:
-                try:
-                    cached_raw = session.get("kundli_raw")
-                    cached_dasha = session.get("kundli_dasha")
-                    if cached_raw:
-                        parsed = json.loads(cached_raw)
-                        chart_planets = parsed.get("planets", []) or []
-                        chart_ascendant = parsed.get("ascendant_sign")
-                        chart_dasha = json.loads(cached_dasha) if cached_dasha else None
+            # STEP 4 — FACTOR ACTIVATION RANKING (deterministic)
+            activation_detail = "Not applicable — no chart factors were identified to score."
+            try:
+                cached_raw = session.get("kundli_raw")
+                cached_dasha = session.get("kundli_dasha")
+                if cached_raw:
+                    parsed = json.loads(cached_raw)
+                    chart_planets = parsed.get("planets", []) or []
+                    chart_ascendant = parsed.get("ascendant_sign")
+                    chart_dasha = json.loads(cached_dasha) if cached_dasha else None
 
-                        all_scores = compute_activation_scores(topic, chart_planets, chart_ascendant, chart_dasha)
-                        logger.info(f"[TRACE_V9_ACTIVE] compute_activation_scores returned {len(all_scores)} scored planet(s) for topic '{topic}'")
+                    all_scores = compute_activation_scores(
+                        chart_planets, chart_ascendant, chart_dasha,
+                        framework_factors=referenced, topic=topic
+                    )
+                    logger.info(f"[TRACE_V10_ACTIVE] compute_activation_scores returned {len(all_scores)} scored planet(s)")
 
-                        if all_scores:
-                            top_ranked = all_scores[:3]
-                            lines = [
-                                f"{i}. {r['planet']} — score {r['score']} ({', '.join(r['reasons'])})"
-                                for i, r in enumerate(top_ranked, 1)
-                            ]
-                            activation_detail = (
-                                "Deterministic scoring (house lordship, significator status, occupancy, "
-                                "aspects, Dasha activation, own-sign) — not derived from RAG text:\n"
-                                + "\n".join(lines)
-                            )
-                            if len(all_scores) > 3:
-                                remaining = ", ".join(f"{r['planet']} ({r['score']})" for r in all_scores[3:])
-                                activation_detail += f"\n\nAlso scored: {remaining}"
-                        else:
-                            activation_detail = "No planets scored above zero for this topic."
+                    if all_scores:
+                        top_ranked = all_scores[:3]
+                        lines = [
+                            f"{i}. {r['planet']} — score {r['score']} ({', '.join(r['reasons'])})"
+                            for i, r in enumerate(top_ranked, 1)
+                        ]
+                        activation_detail = (
+                            "Deterministic scoring against houses/planets actually retrieved from classical "
+                            "text (house lordship, significator status, occupancy, aspects, Dasha activation, "
+                            "own-sign) — not derived from RAG text itself:\n"
+                            + "\n".join(lines)
+                        )
+                        if len(all_scores) > 3:
+                            remaining = ", ".join(f"{r['planet']} ({r['score']})" for r in all_scores[3:])
+                            activation_detail += f"\n\nAlso scored: {remaining}"
                     else:
-                        activation_detail = "No cached chart data available for activation scoring."
-                except Exception as act_err:
-                    logger.error(f"[TRACE_V9_ACTIVE] Activation ranking build FAILED: {act_err}", exc_info=True)
-                    activation_detail = f"Activation ranking not available (error: {act_err})"
+                        activation_detail = "No planets scored above zero for the factors identified in this question."
+                else:
+                    activation_detail = "No cached chart data available for activation scoring."
+            except Exception as act_err:
+                logger.error(f"[TRACE_V10_ACTIVE] Activation ranking build FAILED: {act_err}", exc_info=True)
+                activation_detail = f"Activation ranking not available (error: {act_err})"
 
-            steps.append({"step": 3, "title": "Factor Activation Ranking", "detail": activation_detail, "type": "activation"})
+            steps.append({"step": 4, "title": "Factor Activation Ranking", "detail": activation_detail, "type": "activation"})
 
-            # STEP 4 — PERSONALIZED + MULTI-HOP EVIDENCE RETRIEVED
+            # STEP 5 — PERSONALIZED + MULTI-HOP EVIDENCE RETRIEVED
             personalized_hits = [hit for hit in rag_hits if hit.get("stage") == "personalized"]
             multihop_hits = [hit for hit in rag_hits if hit.get("stage") == "multihop"]
 
@@ -1254,10 +1335,10 @@ class ChatService:
                 evidence_lines.append("\nMulti-hop retrieval (separate query per top-activated factor):")
                 evidence_lines.extend(m_sources)
 
-            evidence_detail = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or multi-hop evidence was retrieved."
-            steps.append({"step": 4, "title": "Personalized + Multi-Hop Evidence Retrieved", "detail": evidence_detail, "type": "personalized_rag"})
+            evidence_detail_step5 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or multi-hop evidence was retrieved."
+            steps.append({"step": 5, "title": "Personalized + Multi-Hop Evidence Retrieved", "detail": evidence_detail_step5, "type": "personalized_rag"})
 
-            # STEP 5 — EVIDENCE CONSENSUS
+            # STEP 6 — EVIDENCE CONSENSUS
             consensus_label = None
             evidence_vote = None
             consistency = ""
@@ -1313,9 +1394,9 @@ class ChatService:
             if consistency:
                 consensus_lines.append(f"\nSignal consistency:\n{consistency}")
 
-            steps.append({"step": 5, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
+            steps.append({"step": 6, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
 
-            # STEP 6 — DASHA & TIMING
+            # STEP 7 — DASHA & TIMING
             dasha_detail = ""
             try:
                 cached_dasha = session.get("kundli_dasha")
@@ -1335,9 +1416,9 @@ class ChatService:
             if not dasha_detail:
                 dasha_detail = "Current Dasha information was not available in the cached chart data."
 
-            steps.append({"step": 6, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
+            steps.append({"step": 7, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
 
-            # STEP 7 — CLASSICAL EVIDENCE
+            # STEP 8 — CLASSICAL EVIDENCE
             reference_lines = []
             seen_references = set()
             for hit in rag_hits:
@@ -1359,17 +1440,17 @@ class ChatService:
                     reference += f" [{stage}]"
                 reference_lines.append(f"• {reference}")
 
-            evidence_detail = "\n".join(reference_lines) if reference_lines else "No classical references were available."
-            steps.append({"step": 7, "title": "Classical Evidence", "detail": evidence_detail, "type": "evidence"})
+            evidence_detail_step8 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
+            steps.append({"step": 8, "title": "Classical Evidence", "detail": evidence_detail_step8, "type": "evidence"})
 
-            # STEP 8 — EVIDENCE SYNTHESIS
+            # STEP 9 — EVIDENCE SYNTHESIS
             synthesis_detail = (
                 "The final interpretation combines the retrieved classical evidence, deterministic factor "
                 "activation ranking, and the relevant Kundli and Dasha information."
             )
-            steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
+            steps.append({"step": 9, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 
-            # STEP 9 — CHART-SPECIFICITY CHECK
+            # STEP 10 — CHART-SPECIFICITY CHECK
             specificity_lines = []
 
             if response_text:
@@ -1387,13 +1468,13 @@ class ChatService:
             else:
                 specificity_lines.append("Status: Not available — no response text supplied")
 
-            steps.append({"step": 9, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
+            steps.append({"step": 10, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
 
-            logger.info(f"[RAGFirst] Reasoning trace built: {len(steps)} steps")
+            logger.info(f"[TRACE_V10_ACTIVE] Reasoning trace built: {len(steps)} steps — titles: {[s['title'] for s in steps]}")
             return steps
 
         except Exception as e:
-            logger.error(f"RAG-first reasoning trace build failed: {e}")
+            logger.error(f"[TRACE_V10_ACTIVE] RAG-first reasoning trace build FAILED entirely: {e}", exc_info=True)
             return []
 
     def _get_full_kundli_response(self, session_id: str, session: Dict) -> Optional[Dict]:

@@ -26,7 +26,6 @@ from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
 
 
-
 class ChatService:
     def __init__(self):
         self.embeddings_provider = EmbeddingsProvider()
@@ -151,6 +150,7 @@ class ChatService:
         except Exception as rag_err:
             logger.error(f"RAG failed: {rag_err}")
             return "No reference available.", []
+
     def _understand_query_intent(self, message_text: str, history_text: str) -> Dict[str, Any]:
         """LLM-based query understanding — runs BEFORE RAG. Normalizes
         whatever language/phrasing the user used ('profession', 'naukri
@@ -158,8 +158,8 @@ class ChatService:
         - life_area: short label driving retrieval bias (works even for
           life areas not in TOPIC_CHART_FACTORS, e.g. 'foreign_travel')
         - restated_intent: one-line plain-English restatement
-        - comparison: 0-2 options if the question is comparative
-          ("job or business" -> ["job", "business"])
+        - comparison: 0-3 options if the question is comparative
+          ("job or business or higher studies" -> ["job", "business", "higher studies"])
         - requires_timing: whether Dasha/timing is relevant
         Does NOT decide any astrology rules itself — RAG still determines
         which houses/planets/rules apply. Shown verbatim in the trace."""
@@ -173,9 +173,11 @@ Conversation history (for context only):
 User's current message:
 "{message_text}"
 
-If the user is comparing two options (e.g. "job or business", "abroad or stay in India",
-"government job or private job"), list those options in "comparison" as short plain-English
-labels (max 2 items). If it's not a comparison question, use an empty list.
+If the user is comparing two or more options (e.g. "job or business", "abroad or stay in India",
+"job or business or higher studies", "government job or private job"), list EVERY option
+mentioned in "comparison" as short plain-English labels (max 3 items). If it's not a comparison
+question, use an empty list. Watch for "or" / "ya" / "अथवा" connecting multiple options — even
+in Hindi/Hinglish phrasing.
 
 Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 {{"life_area": "one short label, e.g. career, marriage, finance, health, education, foreign_travel, general",
@@ -202,7 +204,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             raw_comparison = parsed.get("comparison", [])
             comparison = (
-                [str(c).strip() for c in raw_comparison if str(c).strip()][:2]
+                [str(c).strip() for c in raw_comparison if str(c).strip()][:3]
                 if isinstance(raw_comparison, list) else []
             )
             requires_timing = bool(parsed.get("requires_timing", False))
@@ -216,6 +218,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         except Exception as e:
             logger.warning(f"Query-understanding LLM call failed, falling back to keyword topic: {e}")
             return default
+
     def _build_framework_query(self, message_text: str, topic: Optional[str] = None, life_area: str = "") -> str:
         parts = [
             message_text.strip(),
@@ -228,7 +231,44 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if bias:
                 parts.append(bias)
         return " ".join(p for p in parts if p).strip()
-    
+
+    def _extract_referenced_factors(self, rag_hits: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+        houses: Set[str] = set()
+        planets: Set[str] = set()
+        charts: Set[str] = set()
+        concepts: Set[str] = set()
+
+        planet_names = [
+            "Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus",
+            "Saturn", "Rahu", "Ketu", "Ascendant"
+        ]
+        house_pattern = re.compile(r"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+house\b", re.IGNORECASE)
+        chart_pattern = re.compile(r"\bD(?:1|7|9|10|24)\b", re.IGNORECASE)
+
+        for hit in rag_hits:
+            text = hit.get("text", "") or ""
+            lower = text.lower()
+
+            for planet in planet_names:
+                if planet.lower() in lower:
+                    planets.add(planet)
+
+            for match in house_pattern.finditer(text):
+                houses.add(match.group(1))
+
+            for match in chart_pattern.finditer(text):
+                charts.add(match.group(0).upper())
+
+            for phrase in (
+                "7th lord", "10th lord", "6th lord", "8th lord",
+                "9th lord", "11th lord", "2nd lord", "12th lord",
+                "lagna lord", "mahadasha", "antardasha", "dasha", "transit"
+            ):
+                if phrase in lower:
+                    concepts.add(phrase)
+
+        return {"houses": houses, "planets": planets, "charts": charts, "concepts": concepts}
+
     def _build_targeted_kundli_facts(self, referenced: Dict[str, Set[str]], session: Dict) -> str:
         cached_raw = session.get("kundli_raw")
         cached_dasha = session.get("kundli_dasha")
@@ -297,6 +337,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             lines.append("Divisional charts referenced by classical evidence: " + ", ".join(sorted(charts)))
 
         return "\n".join(lines)
+
     def _build_personalized_rag_query(self, message_text: str, topic: Optional[str], targeted_facts: str, life_area: str = "") -> str:
         parts = [message_text.strip(), "classical astrology interpretation"]
         if life_area and life_area != "general":
@@ -307,57 +348,15 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             parts.append("chart configuration:")
             parts.append(targeted_facts)
         return " ".join(p for p in parts if p).strip()
-    
-    def _get_multihop_evidence(self, topic: Optional[str], ranked_factors: List[Dict], seen_keys: set):
-        """Multi-hop RAG: separate retrieval per top-activated planet."""
-        chunks = []
-        hits = []
-        if not ranked_factors:
-            return "", []
-
-        topic_label = topic or "this question"
-        for factor in ranked_factors:
-            planet = factor["planet"]
-            query = f"{planet} in {topic_label} astrology — house placement, strength, classical effects"
-            try:
-                query_vector = self.embeddings_provider.get_embedding(query)
-                results = vector_store.hybrid_search(
-                    query=query, query_vector=query_vector,
-                    top_k=3, alpha=settings.HYBRID_ALPHA
-                )
-            except Exception as e:
-                logger.error(f"[MultiHop] retrieval failed for '{planet}': {e}")
-                continue
-
-            for hit in results:
-                if hit["score"] < settings.MIN_RAG_RELEVANCE:
-                    continue
-                source = hit["metadata"].get("source", "Unknown")
-                page = hit["metadata"].get("page")
-                key = (source, page)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-
-                page_label = f", Page: {page}" if page is not None else ""
-                chunks.append(
-                    f"--- Multi-Hop Evidence ({planet}) [Source: {source}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
-                )
-                hits.append({
-                    "source": source, "page": page, "score": hit["score"],
-                    "text": hit["text"], "stage": "multihop", "factor": planet,
-                })
-
-        logger.info(f"[MultiHop] retrieved {len(hits)} additional chunks across {len(ranked_factors)} factor(s)")
-        return "\n".join(chunks), hits
 
     def _get_rag_first_context(self, message_text: str, topic: Optional[str], session: Dict, query_understanding: Optional[Dict[str, Any]] = None):
         try:
             from app.services.topic_service import TOPIC_RELEVANT_BOOKS
+
             qu = query_understanding or {}
             life_area = qu.get("life_area") or ""
             comparison = qu.get("comparison") or []
-            
+
             framework_query = self._build_framework_query(message_text, topic, life_area)
             preferred_sources = TOPIC_RELEVANT_BOOKS.get(topic) if topic else None
 
@@ -404,6 +403,16 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 f"planets={referenced['planets']} charts={referenced['charts']} concepts={referenced['concepts']}"
             )
 
+            # NOTE: Deterministic Chart Fact Graph + Activation Scoring was
+            # removed here on request. targeted_facts is _build_targeted_
+            # kundli_facts' output, now optionally extended below with a
+            # comparative-question block when the LLM detected one.
+
+            # --- Comparative branch retrieval (e.g. "job or business",
+            # "abroad or stay in India") — retrieves classical rules
+            # SEPARATELY per option, matches each against the actual chart,
+            # and instructs the model to evaluate rule-by-rule for both
+            # sides instead of picking one option immediately. ---
             comparison_hits: List[Dict[str, Any]] = []
             if len(comparison) >= 2:
                 comparison_facts_blocks = []
@@ -455,7 +464,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
                 logger.info(f"[Comparison] branches={comparison} additional_hits={len(comparison_hits)}")
 
-            personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts,life_area)
+            personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts, life_area)
             personalized_vector = self.embeddings_provider.get_embedding(personalized_query)
 
             personalized_hits = vector_store.dual_retrieve(
@@ -514,9 +523,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             return context, all_hits, targeted_facts
 
-          
         except Exception as e:
-            logger.error(f"RAG-first context build failed: {e}")
+            logger.error(f"RAG-first context build failed: {e}", exc_info=True)
             return "No reference available.", [], ""
 
     def _is_followup_retrieval_question(self, message_text: str, history: List[Dict[str, str]]) -> bool:
@@ -877,7 +885,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
             intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
             response_contract = get_response_contract(intent)
-            
+
             query_understanding: Dict[str, Any] = {"life_area": "", "restated_intent": "", "comparison": [], "requires_timing": False}
             if is_astrology and not missing_fields:
                 query_understanding = self._understand_query_intent(message_text, history_text)
@@ -887,7 +895,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     f"comparison={query_understanding.get('comparison')} "
                     f"requires_timing={query_understanding.get('requires_timing')}"
                 )
-            
 
             context_str = ""
             rag_hits: List[Dict[str, Any]] = []
@@ -901,10 +908,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if is_astrology and not missing_fields:
                 if self._is_followup_retrieval_question(message_text, history):
                     context_str, rag_hits = self._get_followup_rag_context(message_text, topic, history)
-                
+
                 if not rag_hits:
                     context_str, rag_hits, targeted_facts = self._get_rag_first_context(message_text, topic, session, query_understanding)
-                
+
                 logger.info(f"[RAGPipeline] hits={len(rag_hits)} targeted_facts={'yes' if targeted_facts else 'no'}")
 
             yoga_text = self._get_yoga_text(session) if (is_astrology and not missing_fields) else ""
@@ -994,11 +1001,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if is_astrology and not missing_fields:
                 try:
                     trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, response_text, query_understanding)
-                    logger.info(f"[TRACE_V10_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
+                    logger.info(f"[TRACE_V12_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
                     db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
-                    logger.info(f"[TRACE_V10_ACTIVE] Save confirmed for session {session_id}")
+                    logger.info(f"[TRACE_V12_ACTIVE] Save confirmed for session {session_id}")
                 except Exception as trace_err:
-                    logger.error(f"[TRACE_V10_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
+                    logger.error(f"[TRACE_V12_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
                 self._update_topic_memory(session_id, session, topic, response_text)
 
             suggestions = []
@@ -1087,7 +1094,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
             intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
             response_contract = get_response_contract(intent)
-            
+
             query_understanding: Dict[str, Any] = {"life_area": "", "restated_intent": "", "comparison": [], "requires_timing": False}
             if is_astrology and not missing_fields:
                 query_understanding = self._understand_query_intent(message_text, history_text)
@@ -1097,7 +1104,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     f"comparison={query_understanding.get('comparison')} "
                     f"requires_timing={query_understanding.get('requires_timing')}"
                 )
-            
+
             context_str = ""
             rag_hits: List[Dict[str, Any]] = []
             targeted_facts = ""
@@ -1110,10 +1117,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if is_astrology and not missing_fields:
                 if self._is_followup_retrieval_question(message_text, history):
                     context_str, rag_hits = self._get_followup_rag_context(message_text, topic, history)
-                
+
                 if not rag_hits:
                     context_str, rag_hits, targeted_facts = self._get_rag_first_context(message_text, topic, session, query_understanding)
-                
+
                 logger.info(f"[RAGPipeline] hits={len(rag_hits)} targeted_facts={'yes' if targeted_facts else 'no'}")
 
             yoga_text = self._get_yoga_text(session) if (is_astrology and not missing_fields) else ""
@@ -1196,11 +1203,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if is_astrology and not missing_fields:
                 try:
                     trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, full_text, query_understanding)
-                    logger.info(f"[TRACE_V10_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
+                    logger.info(f"[TRACE_V12_ACTIVE] About to save {len(trace)}-step trace to session {session_id}")
                     db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
-                    logger.info(f"[TRACE_V10_ACTIVE] Save confirmed for session {session_id}")
+                    logger.info(f"[TRACE_V12_ACTIVE] Save confirmed for session {session_id}")
                 except Exception as trace_err:
-                    logger.error(f"[TRACE_V10_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
+                    logger.error(f"[TRACE_V12_ACTIVE] Reasoning trace caching FAILED: {trace_err}", exc_info=True)
                 self._update_topic_memory(session_id, session, topic, full_text)
 
             suggestions = get_instant_suggestions(topic, language)
@@ -1224,14 +1231,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         rag_hits: Optional[List[Dict[str, Any]]] = None,
         targeted_facts: str = "",
         response_text: str = "",
-        query_understanding: Optional[Dict[str, str]] = None,
+        query_understanding: Optional[Dict[str, Any]] = None,
     ) -> list:
-        """9-step trace: Query Understanding (LLM), Classical Framework,
-        Chart Factors, Personalized+Multi-Hop Evidence, Evidence Consensus,
-        Dasha & Timing, Classical Evidence, Evidence Synthesis,
-        Chart-Specificity Check."""
-
-      
+        """9-step trace: Query Understanding (LLM, incl. comparison/timing),
+        Classical Framework, Chart Factors, Personalized+Comparative
+        Evidence, Evidence Consensus, Dasha & Timing, Classical Evidence,
+        Evidence Synthesis, Chart-Specificity Check."""
         if not topic and not rag_hits and not (query_understanding and query_understanding.get("restated_intent")):
             return []
 
@@ -1246,6 +1251,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps = []
             logger.info("[TRACE_V12_ACTIVE] _build_reasoning_trace entered — 9-step version with structured intent + comparative retrieval")
+
             # STEP 1 — QUERY UNDERSTANDING (LLM)
             qu = query_understanding or {}
             life_area = qu.get("life_area", "")
@@ -1265,7 +1271,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     f"falling back to keyword-based topic classification (topic: {topic or 'none'})."
                 )
             steps.append({"step": 1, "title": "Query Understanding", "detail": qu_detail, "type": "query_understanding"})
-           
+
             # STEP 2 — CLASSICAL FRAMEWORK RETRIEVED
             framework_lines = []
             if houses:
@@ -1302,8 +1308,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 chart_detail = "No targeted chart facts were identified from the retrieved classical framework."
 
             steps.append({"step": 3, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
-            
-                        # STEP 4 — PERSONALIZED + COMPARATIVE EVIDENCE RETRIEVED
+
+            # STEP 4 — PERSONALIZED + COMPARATIVE EVIDENCE RETRIEVED
             personalized_hits = [hit for hit in rag_hits if hit.get("stage") == "personalized"]
             comparison_hits_trace = [hit for hit in rag_hits if hit.get("stage") == "comparison"]
 
@@ -1339,7 +1345,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             evidence_detail_step4 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or comparative evidence was retrieved."
             steps.append({"step": 4, "title": "Personalized + Comparative Evidence Retrieved", "detail": evidence_detail_step4, "type": "personalized_rag"})
-            
+
             # STEP 5 — EVIDENCE CONSENSUS
             consensus_label = None
             evidence_vote = None
@@ -1438,19 +1444,19 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         reference += f" (relevance: {float(score):.2f})"
                     except (TypeError, ValueError):
                         pass
-              
                 if stage:
                     reference += f" [{stage}]"
                 if hit.get("branch"):
                     reference += f" (option: {hit['branch']})"
                 reference_lines.append(f"• {reference}")
+
             evidence_detail_step7 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
             steps.append({"step": 7, "title": "Classical Evidence", "detail": evidence_detail_step7, "type": "evidence"})
 
             # STEP 8 — EVIDENCE SYNTHESIS
             synthesis_detail = (
-                "The final interpretation combines the retrieved classical evidence, deterministic factor "
-                "activation ranking, and the relevant Kundli and Dasha information."
+                "The final interpretation combines the retrieved classical evidence, comparative "
+                "branch analysis (if applicable), and the relevant Kundli and Dasha information."
             )
             steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 
@@ -1473,11 +1479,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 specificity_lines.append("Status: Not available — no response text supplied")
 
             steps.append({"step": 9, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
+
             logger.info(f"[TRACE_V12_ACTIVE] Reasoning trace built: {len(steps)} steps — titles: {[s['title'] for s in steps]}")
             return steps
 
         except Exception as e:
-            logger.error(f"[TRACE_V11_ACTIVE] RAG-first reasoning trace build FAILED entirely: {e}", exc_info=True)
+            logger.error(f"[TRACE_V12_ACTIVE] RAG-first reasoning trace build FAILED entirely: {e}", exc_info=True)
             return []
 
     def _get_full_kundli_response(self, session_id: str, session: Dict) -> Optional[Dict]:

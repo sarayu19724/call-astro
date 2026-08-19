@@ -152,17 +152,10 @@ class ChatService:
             return "No reference available.", []
 
     def _understand_query_intent(self, message_text: str, history_text: str) -> Dict[str, Any]:
-        """LLM-based query understanding — runs BEFORE RAG. Normalizes
-        whatever language/phrasing the user used ('profession', 'naukri
-        vs business', 'pesha', etc.) into a structured intent:
-        - life_area: short label driving retrieval bias (works even for
-          life areas not in TOPIC_CHART_FACTORS, e.g. 'foreign_travel')
-        - restated_intent: one-line plain-English restatement
-        - comparison: 0-3 options if the question is comparative
-          ("job or business or higher studies" -> ["job", "business", "higher studies"])
-        - requires_timing: whether Dasha/timing is relevant
-        Does NOT decide any astrology rules itself — RAG still determines
-        which houses/planets/rules apply. Shown verbatim in the trace."""
+        """LLM-based query understanding — runs BEFORE topic classification
+        and BEFORE RAG. This is now the PRIMARY source for topic ('life_area')
+        — see _resolve_topic(). classify_topic() (keyword-based) only runs
+        as a fallback when this call fails or returns an unrecognized area."""
         prompt = f"""You are a query-understanding layer for a Vedic astrology assistant.
 Do NOT answer the astrology question and do NOT name any houses, planets, or astrological rules.
 Only restate what the user is asking about in plain language, and classify its structure.
@@ -218,6 +211,27 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         except Exception as e:
             logger.warning(f"Query-understanding LLM call failed, falling back to keyword topic: {e}")
             return default
+
+    def _resolve_topic(self, message_text: str, query_understanding: Dict[str, Any]) -> Optional[str]:
+        """PRIMARY topic resolution: uses the LLM's life_area if it matches
+        a known TOPIC_CHART_FACTORS key (career/marriage/health/finance/
+        education — the same labels the query-understanding prompt is told
+        to use). Falls back to keyword-based classify_topic() ONLY if
+        life_area is missing, 'general', or doesn't match a known key
+        (e.g. 'foreign_travel' — a real life area, just not one we have
+        deterministic house/planet mappings for yet)."""
+        life_area = (query_understanding.get("life_area") or "").strip().lower()
+
+        if life_area and life_area in TOPIC_CHART_FACTORS:
+            logger.info(f"[TopicResolution] using LLM life_area='{life_area}' as topic (primary)")
+            return life_area
+
+        fallback = classify_topic(message_text)
+        logger.info(
+            f"[TopicResolution] LLM life_area='{life_area or 'none'}' not in TOPIC_CHART_FACTORS — "
+            f"falling back to keyword classify_topic()='{fallback}'"
+        )
+        return fallback
 
     def _build_framework_query(self, message_text: str, topic: Optional[str] = None, life_area: str = "") -> str:
         parts = [
@@ -347,10 +361,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         question (referenced). Now we look up what's ACTUALLY present in
         THIS chart for each — the house's LORD and where that lord actually
         sits, plus any planet occupying the house, plus any planet RAG
-        named directly. This produces a list of real, grounded facts
-        (e.g. "Saturn is actually in the 7th house") that step three will
-        search for directly — no arbitrary text is retrieved first and
-        checked after; we go straight to what's real."""
+        named directly."""
         cached_raw = session.get("kundli_raw")
         if not cached_raw:
             return []
@@ -390,8 +401,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             seen.add(key)
             grounded.append({"planet": planet, "house": house, "role": role})
 
-        # For each house RAG flagged as relevant: find its LORD and where
-        # that lord actually sits, plus who actually occupies the house.
         for house_str in houses_wanted:
             try:
                 house_num = int(house_str)
@@ -406,7 +415,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 if occupied_house == house_num:
                     _add(planet_name, house_num, f"occupant of {house_num}th house")
 
-        # For each planet RAG flagged directly, use its real placement.
         for planet_name in planets_wanted:
             if planet_name == "Ascendant":
                 continue
@@ -419,15 +427,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
     def _get_chart_grounded_evidence(self, grounded_facts: List[Dict[str, Any]], life_area: str,
                                        dasha_info: Optional[dict], seen_keys: set):
-        """THIRD stage: for each REAL grounded fact (e.g. actual Saturn in
-        actual 7th house), retrieve classical text about THAT exact
-        placement's effect on this life area — single-hop. THEN, as a
-        multi-hop pass, combine each grounded fact with the CURRENT Dasha
-        lord(s) and search for their combined effect (e.g. 'Saturn in 7th
-        house Venus Mahadasha effect on marriage') — this is what lets the
-        reading say something like 'Saturn's 7th-house placement plays out
-        differently right now because you're in Venus Mahadasha' instead
-        of treating the placement and the timing as unrelated facts."""
+        """THIRD stage: for each REAL grounded fact, retrieve classical text
+        about THAT exact placement's effect on this life area — single-hop.
+        Then multi-hop: combine each grounded fact with the CURRENT Dasha
+        lord(s) and search for their combined effect."""
         if not grounded_facts:
             return "", []
 
@@ -446,7 +449,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             planet, house, role = fact["planet"], fact["house"], fact["role"]
             fact_label = f"{planet} in {house}th house ({role})"
 
-            # --- Single-hop: the real placement's effect on its own ---
             single_query = f"{planet} in {house}th house effects meaning classical astrology"
             if life_area and life_area != "general":
                 single_query += f" {life_area}"
@@ -480,9 +482,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     "text": hit["text"], "stage": "grounded", "fact": fact_label,
                 })
 
-            # --- Multi-hop: combine the real placement with the CURRENT
-            # Dasha lord(s) — a second, separate retrieval that asks how
-            # the placement plays out under the timing that's active now.
             for dasha_lord, dasha_role in ((maha_lord, "Mahadasha"), (antar_lord, "Antardasha")):
                 if not dasha_lord or dasha_lord == planet:
                     continue
@@ -561,9 +560,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             framework_hits = [h for h in framework_hits if h["score"] >= settings.MIN_RAG_RELEVANCE]
 
-            # A weak/empty framework stage should never black out the rest
-            # of the pipeline — continue with empty referenced factors so
-            # comparison/personalized/grounded retrieval still get a chance.
             framework_rag_hits: List[Dict[str, Any]] = []
             framework_chunks: List[str] = []
             seen_keys: set = set()
@@ -598,10 +594,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if not targeted_facts:
                 targeted_facts = self._build_targeted_kundli_facts(referenced, session)
 
-            # --- Chart-grounded evidence: RAG told us which houses/planets
-            # matter (referenced) → look up what's ACTUALLY there (lords +
-            # occupants) → search for that real placement's effect, and its
-            # combined effect with the current Dasha (multi-hop). ---
             cached_dasha_raw = session.get("kundli_dasha")
             dasha_info_for_grounding = None
             if cached_dasha_raw:
@@ -615,9 +607,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 grounded_facts, life_area, dasha_info_for_grounding, seen_keys
             )
 
-            # --- Comparative branch retrieval (e.g. "job or business",
-            # "abroad or stay in India") — independent of framework
-            # success, so a weak framework score never blocks this. ---
             comparison_hits: List[Dict[str, Any]] = []
             if len(comparison) >= 2:
                 comparison_facts_blocks = []
@@ -677,10 +666,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
                 logger.info(f"[Comparison] branches={comparison} additional_hits={len(comparison_hits)}")
 
-            # --- Personalized retrieval — also independent of framework
-            # success. Uses the raw message_text/life_area even if
-            # targeted_facts is empty, so this stage still has a real
-            # chance to find something. ---
             personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts, life_area)
             personalized_vector = self.embeddings_provider.get_embedding(personalized_query)
 
@@ -1103,10 +1088,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         "birth_place": session.get("birth_place"), "language": language
                     }
 
-            topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
-            intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
-            response_contract = get_response_contract(intent)
-
+            # Query understanding now runs FIRST — its life_area drives
+            # topic resolution (see _resolve_topic), instead of the other
+            # way around. classify_topic() is used only as a fallback.
             query_understanding: Dict[str, Any] = {"life_area": "", "restated_intent": "", "comparison": [], "requires_timing": False}
             if is_astrology and not missing_fields:
                 query_understanding = self._understand_query_intent(message_text, history_text)
@@ -1116,6 +1100,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     f"comparison={query_understanding.get('comparison')} "
                     f"requires_timing={query_understanding.get('requires_timing')}"
                 )
+
+            topic = self._resolve_topic(message_text, query_understanding) if (is_astrology and not missing_fields) else None
+            intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
+            response_contract = get_response_contract(intent)
 
             context_str = ""
             rag_hits: List[Dict[str, Any]] = []
@@ -1167,6 +1155,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     response_contract=response_contract,
                     history=history_text, query=message_text
                 )
+                astrologer_prompt += f"\n\n{self._build_temporal_context()}"
                 response_text = llm_service.generate(prompt=astrologer_prompt, temperature=0.6)
 
                 if is_astrology and not missing_fields:
@@ -1310,10 +1299,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                            "birth_place": session.get("birth_place"), "language": language}
                     return
 
-            topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
-            intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
-            response_contract = get_response_contract(intent)
-
             query_understanding: Dict[str, Any] = {"life_area": "", "restated_intent": "", "comparison": [], "requires_timing": False}
             if is_astrology and not missing_fields:
                 query_understanding = self._understand_query_intent(message_text, history_text)
@@ -1323,6 +1308,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     f"comparison={query_understanding.get('comparison')} "
                     f"requires_timing={query_understanding.get('requires_timing')}"
                 )
+
+            topic = self._resolve_topic(message_text, query_understanding) if (is_astrology and not missing_fields) else None
+            intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
+            response_contract = get_response_contract(intent)
 
             context_str = ""
             rag_hits: List[Dict[str, Any]] = []
@@ -1379,7 +1368,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             )
             if repeat_hint:
                 astrologer_prompt += f"\n\n{repeat_hint}"
-
+            astrologer_prompt += f"\n\n{self._build_temporal_context()}"
             gen_temperature = 0.75 if repeat_hint else 0.6
 
             full_text = ""
@@ -1455,10 +1444,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         response_text: str = "",
         query_understanding: Optional[Dict[str, Any]] = None,
     ) -> list:
-        """9-step trace: Query Understanding (LLM, incl. comparison/timing),
-        Classical Framework, Chart Factors, Chart-Grounded+Personalized+
-        Comparative Evidence, Evidence Consensus, Dasha & Timing, Classical
-        Evidence, Evidence Synthesis, Chart-Specificity Check."""
+        """9-step trace: Query Understanding (LLM, incl. comparison/timing —
+        now the PRIMARY topic source), Classical Framework, Chart Factors,
+        Chart-Grounded+Personalized+Comparative Evidence, Evidence
+        Consensus, Dasha & Timing, Classical Evidence, Evidence Synthesis,
+        Chart-Specificity Check."""
         if not topic and not rag_hits and not (query_understanding and query_understanding.get("restated_intent")):
             return []
 
@@ -1473,16 +1463,19 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps = []
 
-            # STEP 1 — QUERY UNDERSTANDING (LLM)
+            # STEP 1 — QUERY UNDERSTANDING (LLM) — now shows whether topic
+            # came from life_area (primary) or keyword fallback.
             qu = query_understanding or {}
             life_area = qu.get("life_area", "")
             restated = qu.get("restated_intent", "")
             comparison = qu.get("comparison") or []
             requires_timing = qu.get("requires_timing", False)
             if restated:
+                topic_source = "LLM life_area (primary)" if (life_area and life_area.strip().lower() == topic) else "keyword fallback"
                 qu_detail = f"What the system understood you're asking:\n\"{restated}\""
                 if life_area:
                     qu_detail += f"\n\nLife area: {life_area}"
+                qu_detail += f"\n\nTopic used for chart analysis: {topic or 'none'} ({topic_source})"
                 if comparison:
                     qu_detail += f"\n\nComparing: {' vs '.join(comparison)}"
                 qu_detail += f"\n\nTiming/Dasha relevant: {'Yes' if requires_timing else 'No'}"

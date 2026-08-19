@@ -26,17 +26,6 @@ from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
 
 
-# Bump this whenever the logic feeding a topic bundle changes (evidence
-# vote computation, consensus labeling, consistency checks, etc). A cached
-# bundle written under an older version is treated as a miss and silently
-# recomputed — this is what actually fixes the "Evidence confidence: Not
-# available" inconsistency: without it, a topic bundle that failed to
-# fully compute once (e.g. a transient error mid-build) stays cached
-# incomplete for the rest of the session, even after query-understanding
-# correctly resolves the same life_area/topic on every later message.
-TOPIC_BUNDLE_LOGIC_VERSION = 2
-
-
 class ChatService:
     def __init__(self):
         self.embeddings_provider = EmbeddingsProvider()
@@ -63,35 +52,6 @@ class ChatService:
                 return parsed_time.strftime("%H:%M")
             except ValueError:
                 return time_str
-
-    def _build_temporal_context(self) -> str:
-        """Injects the real current date plus an explicit rule against
-        presenting an already-passed retrieved timing period (e.g. a
-        classical rule naming 'March-April' or a Dasha sub-period that
-        already ended) as an upcoming/future prediction.
-
-        RAG retrieval and the real Dasha API dates can both be individually
-        correct and STILL produce a wrong-feeling answer if the LLM doesn't
-        know what "today" is — it has no other way to tell a period that
-        already happened apart from one still ahead. This has to be
-        enforced here, not fixed by "better retrieval".
-        """
-        today_str = datetime.now().strftime("%d %B %Y")
-        return (
-            f"CURRENT DATE: {today_str}\n\n"
-            "TEMPORAL RULE (apply to every date/period you mention):\n"
-            "- Never describe a date or period BEFORE the current date above as upcoming, "
-            "forthcoming, or something that 'will' happen — it has already occurred or passed.\n"
-            "- If retrieved classical evidence or a Dasha sub-period points to a window that has "
-            "already passed, say so explicitly (e.g. 'this window has already passed') instead of "
-            "presenting it as a future prediction.\n"
-            "- For questions using words like 'when', 'next', 'upcoming', or 'in the coming "
-            "months/years', only present periods that START AFTER the current date above as "
-            "genuine future possibilities.\n"
-            "- A past period from retrieved evidence can still be used as historical/contextual "
-            "explanation (e.g. 'the chart showed favorable signs during that window, and the "
-            "current period continues that trend'), just never framed as something yet to happen."
-        )
 
     def _fetch_and_cache_kundli(self, session_id: str, session: Dict) -> str:
         try:
@@ -259,12 +219,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         to use). Falls back to keyword-based classify_topic() ONLY if
         life_area is missing, 'general', or doesn't match a known key
         (e.g. 'foreign_travel' — a real life area, just not one we have
-        deterministic house/planet mappings for yet).
-
-        Once resolved here, this value is THE topic for the rest of the
-        request — _get_topic_bundle, _build_reasoning_trace, and evidence
-        voting all consume this same value; nothing downstream re-runs
-        classify_topic() independently."""
+        deterministic house/planet mappings for yet)."""
         life_area = (query_understanding.get("life_area") or "").strip().lower()
 
         if life_area and life_area in TOPIC_CHART_FACTORS:
@@ -292,6 +247,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         return " ".join(p for p in parts if p).strip()
 
     def _extract_referenced_factors(self, rag_hits: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+        """Reads what the RETRIEVED classical text says matters — which
+        houses, planets, divisional charts, and concepts (like 'lord',
+        'dasha') are relevant to this question. This is the FIRST stage:
+        it tells us WHERE to look in the chart, not what's there."""
         houses: Set[str] = set()
         planets: Set[str] = set()
         charts: Set[str] = set()
@@ -398,6 +357,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         return "\n".join(lines)
 
     def _get_grounded_chart_facts(self, referenced: Dict[str, Set[str]], session: Dict) -> List[Dict[str, Any]]:
+        """SECOND stage: RAG told us WHICH houses/lords matter for this
+        question (referenced). Now we look up what's ACTUALLY present in
+        THIS chart for each — the house's LORD and where that lord actually
+        sits, plus any planet occupying the house, plus any planet RAG
+        named directly."""
         cached_raw = session.get("kundli_raw")
         if not cached_raw:
             return []
@@ -463,6 +427,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
     def _get_chart_grounded_evidence(self, grounded_facts: List[Dict[str, Any]], life_area: str,
                                        dasha_info: Optional[dict], seen_keys: set):
+        """THIRD stage: for each REAL grounded fact, retrieve classical text
+        about THAT exact placement's effect on this life area — single-hop.
+        Then multi-hop: combine each grounded fact with the CURRENT Dasha
+        lord(s) and search for their combined effect."""
         if not grounded_facts:
             return "", []
 
@@ -834,30 +802,13 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             logger.error(f"Follow-up RAG failed: {e}")
             return "", []
 
-    # ------------------------------------------------------------------
-    # Per-topic cache — bundles emphasis/divisional/consistency/missing-
-    # evidence/timeline/evidence_vote/consensus_label into ONE JSON blob
-    # keyed by topic. Each entry is tagged with TOPIC_BUNDLE_LOGIC_VERSION;
-    # a read against a mismatched (or missing) version is treated as a
-    # miss and recomputed — see the constant's comment above for why this
-    # matters (stale-cache evidence-consensus bug).
-    # ------------------------------------------------------------------
     def _get_topic_cache(self, session: Dict, topic: str) -> Optional[Dict]:
         raw = session.get("topic_cache")
         if not raw:
             return None
         try:
             cache = json.loads(raw)
-            entry = cache.get(topic)
-            if not entry:
-                return None
-            if entry.get("_version") != TOPIC_BUNDLE_LOGIC_VERSION:
-                logger.info(
-                    f"Topic cache for '{topic}' is stale "
-                    f"(v{entry.get('_version')} != v{TOPIC_BUNDLE_LOGIC_VERSION}) — recomputing"
-                )
-                return None
-            return entry
+            return cache.get(topic)
         except Exception:
             return None
 
@@ -865,9 +816,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         try:
             raw = session.get("topic_cache")
             cache = json.loads(raw) if raw else {}
-            bundle_to_store = dict(bundle)
-            bundle_to_store["_version"] = TOPIC_BUNDLE_LOGIC_VERSION
-            cache[topic] = bundle_to_store
+            cache[topic] = bundle
             cache_json = json.dumps(cache, ensure_ascii=False)
             db.update_session(session_id, {"topic_cache": cache_json})
             session["topic_cache"] = cache_json
@@ -882,7 +831,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         cached = self._get_topic_cache(session, topic)
         if cached is not None:
             logger.info(f"Using cached topic bundle for '{topic}'")
-            return {k: cached.get(k, empty[k]) for k in empty}
+            if "evidence_vote" not in cached:
+                cached["evidence_vote"] = None
+            if "consensus_label" not in cached:
+                cached["consensus_label"] = get_evidence_consensus_label(cached.get("evidence_vote"))
+            return cached
 
         bundle = dict(empty)
         try:
@@ -929,7 +882,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             bundle["timeline"] = self._get_dasha_timeline(session_id, session, topic, language)
         except Exception as e:
-            logger.error(f"Topic bundle build failed for '{topic}': {e}", exc_info=True)
+            logger.error(f"Topic bundle build failed for '{topic}': {e}")
 
         self._save_topic_cache(session_id, session, topic, bundle)
         return bundle
@@ -1135,6 +1088,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         "birth_place": session.get("birth_place"), "language": language
                     }
 
+            # Query understanding now runs FIRST — its life_area drives
+            # topic resolution (see _resolve_topic), instead of the other
+            # way around. classify_topic() is used only as a fallback.
             query_understanding: Dict[str, Any] = {"life_area": "", "restated_intent": "", "comparison": [], "requires_timing": False}
             if is_astrology and not missing_fields:
                 query_understanding = self._understand_query_intent(message_text, history_text)
@@ -1200,7 +1156,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     history=history_text, query=message_text
                 )
                 astrologer_prompt += f"\n\n{self._build_temporal_context()}"
-
                 response_text = llm_service.generate(prompt=astrologer_prompt, temperature=0.6)
 
                 if is_astrology and not missing_fields:
@@ -1414,7 +1369,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if repeat_hint:
                 astrologer_prompt += f"\n\n{repeat_hint}"
             astrologer_prompt += f"\n\n{self._build_temporal_context()}"
-
             gen_temperature = 0.75 if repeat_hint else 0.6
 
             full_text = ""
@@ -1764,8 +1718,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             synthesis_detail = (
                 "The final interpretation combines the chart-grounded evidence (real placements matched "
                 "directly to their classical effects, including their interaction with the current Dasha), "
-                "comparative branch analysis (if applicable), current-date temporal filtering, and the "
-                "relevant Kundli and Dasha information."
+                "comparative branch analysis (if applicable), and the relevant Kundli and Dasha information."
             )
             steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 
@@ -1815,5 +1768,3 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
 
 chat_service = ChatService()
-
-

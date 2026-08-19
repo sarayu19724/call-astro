@@ -18,18 +18,29 @@ class LocalVectorStore:
         self.load()
 
     def load(self):
+        logger.info(f"[VectorStore] data_dir = {self.data_dir}")
+        logger.info(f"[VectorStore] chunks_path = {self.chunks_path}")
+        logger.info(f"[VectorStore] vectors_path = {self.vectors_path}")
+
         try:
             if os.path.exists(self.chunks_path) and os.path.exists(self.vectors_path):
-                with open(self.chunks_path, "r", encoding="utf-8") as f:
-                    self.chunks = json.load(f)
-                self.vectors = np.load(self.vectors_path)
-                logger.info(f"Loaded {len(self.chunks)} chunks and vectors from local cache.")
+              with open(self.chunks_path, "r", encoding="utf-8") as f:
+                self.chunks = json.load(f)
+
+              self.vectors = np.load(self.vectors_path)
+
+              logger.info(
+                f"[VectorStore] Loaded {len(self.chunks)} chunks and vectors from local cache."
+             )
             else:
-                logger.info("No vector store found. Initialising an empty store.")
-                self.chunks = []
-                self.vectors = None
+              logger.warning(
+                "[VectorStore] VECTOR STORE NOT FOUND — starting with empty store."
+            )
+              self.chunks = []
+              self.vectors = None
+
         except Exception as e:
-            logger.error(f"Error loading vector store: {e}. Starting fresh.")
+            logger.error(f"[VectorStore] Error loading vector store: {e}")
             self.chunks = []
             self.vectors = None
 

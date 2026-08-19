@@ -24,9 +24,7 @@ from app.services.topic_service import (
 )
 from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
-from app.services.chart_activation_service import (
-    compute_activation_scores, get_top_activated_planets, format_activation_summary_for_prompt
-)
+
 
 
 class ChatService:
@@ -414,28 +412,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 f"planets={referenced['planets']} charts={referenced['charts']} concepts={referenced['concepts']}"
             )
 
-            # --- Deterministic Chart Fact Graph + Activation Scoring ---
-            # Scores against houses/planets ACTUALLY RETRIEVED (referenced),
-            # falling back to TOPIC_CHART_FACTORS only if RAG found nothing.
-            ranked_factors = []
-            cached_raw = session.get("kundli_raw")
-            cached_dasha = session.get("kundli_dasha")
-            if cached_raw:
-                try:
-                    parsed = json.loads(cached_raw)
-                    chart_planets = parsed.get("planets", []) or []
-                    chart_ascendant = parsed.get("ascendant_sign")
-                    chart_dasha = json.loads(cached_dasha) if cached_dasha else None
-                    ranked_factors = get_top_activated_planets(
-                        chart_planets, chart_ascendant, chart_dasha,
-                        framework_factors=referenced, topic=topic, top_n=3
-                    )
-                    if ranked_factors:
-                        activation_summary = format_activation_summary_for_prompt(ranked_factors)
-                        targeted_facts = f"{targeted_facts}\n\n{activation_summary}" if targeted_facts else activation_summary
-                        logger.info(f"[ActivationScore] top factors: {[(r['planet'], r['score']) for r in ranked_factors]}")
-                except Exception as e:
-                    logger.error(f"Activation scoring failed: {e}", exc_info=True)
+            # NOTE: Deterministic Chart Fact Graph + Activation Scoring was
+            # removed here on request — it no longer computes a ranking or
+            # feeds an activation_summary into targeted_facts / the prompt.
+            # targeted_facts is now purely _build_targeted_kundli_facts'
+            # output (real house/planet/dasha facts pulled from retrieved
+            # classical text), with no scored/ranked overlay on top.
 
             personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts)
             personalized_vector = self.embeddings_provider.get_embedding(personalized_query)
@@ -473,20 +455,18 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     "text": hit["text"], "stage": "personalized",
                 })
 
-            multihop_chunks_str, multihop_hits = self._get_multihop_evidence(topic, ranked_factors, seen_keys) if ranked_factors else ("", [])
+            
 
-            all_hits = framework_rag_hits + personalized_rag_hits + multihop_hits
+            all_hits = framework_rag_hits + personalized_rag_hits
 
             context_parts = ["\n".join(framework_chunks)]
             if personalized_chunks:
                 context_parts.append("\n".join(personalized_chunks))
-            if multihop_chunks_str:
-                context_parts.append(multihop_chunks_str)
             context = "\n".join(p for p in context_parts if p)
 
             logger.info(
                 f"[RAGFirst] framework={len(framework_rag_hits)}, "
-                f"personalized={len(personalized_rag_hits)}, multihop={len(multihop_hits)}"
+                f"personalized={len(personalized_rag_hits)}"
             )
 
             return context, all_hits, targeted_facts
@@ -1191,10 +1171,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         response_text: str = "",
         query_understanding: Optional[Dict[str, str]] = None,
     ) -> list:
-        """10-step trace: Query Understanding (LLM), Classical Framework,
-        Chart Factors, Factor Activation Ranking, Personalized+Multi-Hop
-        Evidence, Evidence Consensus, Dasha & Timing, Classical Evidence,
-        Evidence Synthesis, Chart-Specificity Check."""
+        """9-step trace: Query Understanding (LLM), Classical Framework,
+        Chart Factors, Personalized+Multi-Hop Evidence, Evidence Consensus,
+        Dasha & Timing, Classical Evidence, Evidence Synthesis,
+        Chart-Specificity Check."""
+
+      
         if not topic and not rag_hits and not (query_understanding and query_understanding.get("restated_intent")):
             return []
 
@@ -1208,7 +1190,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             concepts = sorted(referenced.get("concepts", set()))
 
             steps = []
-            logger.info("[TRACE_V10_ACTIVE] _build_reasoning_trace entered — 10-step version with LLM query understanding")
+            logger.info("[TRACE_V11_ACTIVE] _build_reasoning_trace entered — 9-step version (activation ranking removed)")
 
             # STEP 1 — QUERY UNDERSTANDING (LLM)
             qu = query_understanding or {}
@@ -1262,49 +1244,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps.append({"step": 3, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
 
-            # STEP 4 — FACTOR ACTIVATION RANKING (deterministic)
-            activation_detail = "Not applicable — no chart factors were identified to score."
-            try:
-                cached_raw = session.get("kundli_raw")
-                cached_dasha = session.get("kundli_dasha")
-                if cached_raw:
-                    parsed = json.loads(cached_raw)
-                    chart_planets = parsed.get("planets", []) or []
-                    chart_ascendant = parsed.get("ascendant_sign")
-                    chart_dasha = json.loads(cached_dasha) if cached_dasha else None
-
-                    all_scores = compute_activation_scores(
-                        chart_planets, chart_ascendant, chart_dasha,
-                        framework_factors=referenced, topic=topic
-                    )
-                    logger.info(f"[TRACE_V10_ACTIVE] compute_activation_scores returned {len(all_scores)} scored planet(s)")
-
-                    if all_scores:
-                        top_ranked = all_scores[:3]
-                        lines = [
-                            f"{i}. {r['planet']} — score {r['score']} ({', '.join(r['reasons'])})"
-                            for i, r in enumerate(top_ranked, 1)
-                        ]
-                        activation_detail = (
-                            "Deterministic scoring against houses/planets actually retrieved from classical "
-                            "text (house lordship, significator status, occupancy, aspects, Dasha activation, "
-                            "own-sign) — not derived from RAG text itself:\n"
-                            + "\n".join(lines)
-                        )
-                        if len(all_scores) > 3:
-                            remaining = ", ".join(f"{r['planet']} ({r['score']})" for r in all_scores[3:])
-                            activation_detail += f"\n\nAlso scored: {remaining}"
-                    else:
-                        activation_detail = "No planets scored above zero for the factors identified in this question."
-                else:
-                    activation_detail = "No cached chart data available for activation scoring."
-            except Exception as act_err:
-                logger.error(f"[TRACE_V10_ACTIVE] Activation ranking build FAILED: {act_err}", exc_info=True)
-                activation_detail = f"Activation ranking not available (error: {act_err})"
-
-            steps.append({"step": 4, "title": "Factor Activation Ranking", "detail": activation_detail, "type": "activation"})
-
-            # STEP 5 — PERSONALIZED + MULTI-HOP EVIDENCE RETRIEVED
+            # STEP 4 — PERSONALIZED + MULTI-HOP EVIDENCE RETRIEVED
             personalized_hits = [hit for hit in rag_hits if hit.get("stage") == "personalized"]
             multihop_hits = [hit for hit in rag_hits if hit.get("stage") == "multihop"]
 
@@ -1335,10 +1275,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 evidence_lines.append("\nMulti-hop retrieval (separate query per top-activated factor):")
                 evidence_lines.extend(m_sources)
 
-            evidence_detail_step5 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or multi-hop evidence was retrieved."
-            steps.append({"step": 5, "title": "Personalized + Multi-Hop Evidence Retrieved", "detail": evidence_detail_step5, "type": "personalized_rag"})
+            evidence_detail_step4 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or multi-hop evidence was retrieved."
+            steps.append({"step": 4, "title": "Personalized + Multi-Hop Evidence Retrieved", "detail": evidence_detail_step4, "type": "personalized_rag"})
 
-            # STEP 6 — EVIDENCE CONSENSUS
+            # STEP 5 — EVIDENCE CONSENSUS
             consensus_label = None
             evidence_vote = None
             consistency = ""
@@ -1394,9 +1334,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if consistency:
                 consensus_lines.append(f"\nSignal consistency:\n{consistency}")
 
-            steps.append({"step": 6, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
+            steps.append({"step": 5, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
 
-            # STEP 7 — DASHA & TIMING
+            # STEP 6 — DASHA & TIMING
             dasha_detail = ""
             try:
                 cached_dasha = session.get("kundli_dasha")
@@ -1416,9 +1356,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if not dasha_detail:
                 dasha_detail = "Current Dasha information was not available in the cached chart data."
 
-            steps.append({"step": 7, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
+            steps.append({"step": 6, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
 
-            # STEP 8 — CLASSICAL EVIDENCE
+            # STEP 7 — CLASSICAL EVIDENCE
             reference_lines = []
             seen_references = set()
             for hit in rag_hits:
@@ -1440,17 +1380,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     reference += f" [{stage}]"
                 reference_lines.append(f"• {reference}")
 
-            evidence_detail_step8 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
-            steps.append({"step": 8, "title": "Classical Evidence", "detail": evidence_detail_step8, "type": "evidence"})
+            evidence_detail_step7 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
+            steps.append({"step": 7, "title": "Classical Evidence", "detail": evidence_detail_step7, "type": "evidence"})
 
-            # STEP 9 — EVIDENCE SYNTHESIS
+            # STEP 8 — EVIDENCE SYNTHESIS
             synthesis_detail = (
                 "The final interpretation combines the retrieved classical evidence, deterministic factor "
                 "activation ranking, and the relevant Kundli and Dasha information."
             )
-            steps.append({"step": 9, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
+            steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 
-            # STEP 10 — CHART-SPECIFICITY CHECK
+            # STEP 9 — CHART-SPECIFICITY CHECK
             specificity_lines = []
 
             if response_text:
@@ -1468,13 +1408,13 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             else:
                 specificity_lines.append("Status: Not available — no response text supplied")
 
-            steps.append({"step": 10, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
+            steps.append({"step": 9, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
 
-            logger.info(f"[TRACE_V10_ACTIVE] Reasoning trace built: {len(steps)} steps — titles: {[s['title'] for s in steps]}")
+            logger.info(f"[TRACE_V11_ACTIVE] Reasoning trace built: {len(steps)} steps — titles: {[s['title'] for s in steps]}")
             return steps
 
         except Exception as e:
-            logger.error(f"[TRACE_V10_ACTIVE] RAG-first reasoning trace build FAILED entirely: {e}", exc_info=True)
+            logger.error(f"[TRACE_V11_ACTIVE] RAG-first reasoning trace build FAILED entirely: {e}", exc_info=True)
             return []
 
     def _get_full_kundli_response(self, session_id: str, session: Dict) -> Optional[Dict]:

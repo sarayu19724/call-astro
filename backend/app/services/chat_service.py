@@ -13,7 +13,7 @@ from app.prompts.templates import ASTROLOGER_PROMPT, MISSING_INFO_PROMPT
 from app.config.settings import settings
 from app.utils.logger import logger
 from app.services.intent_service import classify_intent, get_response_contract
-from app.services.claim_validator import validate_claims, build_claim_correction_instructions
+from app.services.claim_validator import validate_claims, build_claim_correction_instructions, build_streamed_correction_note
 from app.services.specificity_service import compute_chart_specificity, build_specificity_correction
 from app.services.topic_service import (
     classify_topic, build_topic_emphasis, get_search_bias,
@@ -428,6 +428,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         logger.error(f"[Comparison] retrieval failed for branch '{branch}': {e}")
                         continue
 
+                    logger.info(f"[Comparison] branch='{branch}' raw_results={len(branch_results)} scores={[round(r['score'],3) for r in branch_results]}")
+
                     branch_rag_hits = []
                     for hit in branch_results:
                         if hit["score"] < settings.MIN_RAG_RELEVANCE:
@@ -436,6 +438,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         page = hit["metadata"].get("page")
                         key = (source, page)
                         if key in seen_keys:
+                            logger.info(f"[Comparison] branch='{branch}' skipped duplicate chunk from {source}")
                             continue
                         seen_keys.add(key)
                         comparison_hits.append({
@@ -446,12 +449,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                             "source": source, "page": page, "score": hit["score"], "text": hit["text"],
                         })
 
+                    logger.info(f"[Comparison] branch='{branch}' passed_threshold={len(branch_rag_hits)}")
+
                     if branch_rag_hits:
                         branch_referenced = self._extract_referenced_factors(branch_rag_hits)
+                        logger.info(f"[Comparison] branch='{branch}' referenced_factors={branch_referenced}")
                         branch_facts = self._build_targeted_kundli_facts(branch_referenced, session)
+                        logger.info(f"[Comparison] branch='{branch}' facts_generated={'yes' if branch_facts else 'NO — empty'}")
                         if branch_facts:
                             comparison_facts_blocks.append(f"--- Chart facts relevant to '{branch}' ---\n{branch_facts}")
-
+                    else:
+                        logger.warning(f"[Comparison] branch='{branch}' produced ZERO hits above relevance threshold — no facts block for this branch")
                 if comparison_facts_blocks:
                     comparison_instruction = (
                         f"\n\nCOMPARATIVE QUESTION DETECTED: the user is weighing {' vs '.join(comparison)}. "
@@ -1175,6 +1183,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             db.add_message(session_id, "assistant", full_text)
 
+            correction_note = ""
             if is_astrology and not missing_fields:
                 try:
                     verify_planets, verify_ascendant = [], None
@@ -1192,14 +1201,18 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         planets=verify_planets, ascendant_sign=verify_ascendant
                     )
                     if claim_failures:
-                        logger.warning(f"Claim validation found {len(claim_failures)} issue(s) in streamed response (not corrected — log only): {claim_failures}")
+                        logger.warning(f"Claim validation found {len(claim_failures)} issue(s) in streamed response: {claim_failures}")
+                        correction_note = build_streamed_correction_note(claim_failures, language)
+                        if correction_note:
+                            full_text += correction_note
+                            yield {"type": "chunk", "text": correction_note}
+                            logger.info("Appended correction note to streamed response for chart-fact mismatch")
 
                     specificity_score = compute_chart_specificity(full_text)
                     if specificity_score["is_generic"]:
                         logger.warning(f"[Specificity] streamed response flagged as generic: ratio={specificity_score['specificity_ratio']} (not corrected — log only)")
                 except Exception as validate_err:
                     logger.error(f"Claim validation failed: {validate_err}")
-
             if is_astrology and not missing_fields:
                 try:
                     trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, full_text, query_understanding)

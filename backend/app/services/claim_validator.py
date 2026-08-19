@@ -169,3 +169,31 @@ def build_claim_correction_instructions(failures: List[str]) -> str:
     for i, f in enumerate(failures, 1):
         lines.append(f"{i}. {f}")
     return "\n".join(lines)
+
+def build_streamed_correction_note(failures: List[str], language: str = "Hinglish") -> str:
+    """For STREAMED responses where regeneration isn't possible — appends a
+    brief, honest correction note after the fact rather than leaving a
+    detected factual error uncorrected in the user's view. Only used when
+    validate_claims() finds a real chart-fact mismatch."""
+    if not failures:
+        return ""
+
+    labels = {
+        "English": "\n\n📝 Correction: ",
+        "Hindi": "\n\n📝 सुधार: ",
+        "Hinglish": "\n\n📝 Correction: ",
+    }
+    prefix = labels.get(language, labels["Hinglish"])
+
+    # Only surface the corrected FACT, not the full internal validator
+    # message (which is written as an LLM instruction, not user-facing text)
+    correction_lines = []
+    for f in failures:
+        # Extract just the "actual chart shows X" portion when present
+        if "the actual chart" in f.lower() or "actual chart data shows" in f.lower():
+            correction_lines.append(f.split(".")[0] + ".")
+
+    if not correction_lines:
+        return ""
+
+    return prefix + " ".join(correction_lines)

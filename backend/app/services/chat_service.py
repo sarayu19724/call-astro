@@ -151,18 +151,21 @@ class ChatService:
         except Exception as rag_err:
             logger.error(f"RAG failed: {rag_err}")
             return "No reference available.", []
-
-    def _understand_query_intent(self, message_text: str, history_text: str) -> Dict[str, str]:
+    def _understand_query_intent(self, message_text: str, history_text: str) -> Dict[str, Any]:
         """LLM-based query understanding — runs BEFORE RAG. Normalizes
         whatever language/phrasing the user used ('profession', 'naukri
-        vs business', 'pesha', etc.) into a short life-area label and a
-        one-line restatement of intent, WITHOUT deciding any astrology
-        rules itself. This output is shown verbatim in the reasoning
-        trace so the person can see what the system understood before
-        any retrieval happened."""
+        vs business', 'pesha', etc.) into a structured intent:
+        - life_area: short label driving retrieval bias (works even for
+          life areas not in TOPIC_CHART_FACTORS, e.g. 'foreign_travel')
+        - restated_intent: one-line plain-English restatement
+        - comparison: 0-2 options if the question is comparative
+          ("job or business" -> ["job", "business"])
+        - requires_timing: whether Dasha/timing is relevant
+        Does NOT decide any astrology rules itself — RAG still determines
+        which houses/planets/rules apply. Shown verbatim in the trace."""
         prompt = f"""You are a query-understanding layer for a Vedic astrology assistant.
 Do NOT answer the astrology question and do NOT name any houses, planets, or astrological rules.
-Only restate what the user is asking about, in plain language, and give a short life-area label.
+Only restate what the user is asking about in plain language, and classify its structure.
 
 Conversation history (for context only):
 {history_text or "None"}
@@ -170,10 +173,17 @@ Conversation history (for context only):
 User's current message:
 "{message_text}"
 
+If the user is comparing two options (e.g. "job or business", "abroad or stay in India",
+"government job or private job"), list those options in "comparison" as short plain-English
+labels (max 2 items). If it's not a comparison question, use an empty list.
+
 Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
-{{"life_area": "one short label, e.g. career, marriage, finance, health, education, general",
-  "restated_intent": "one plain sentence restating what the user wants to know, in English"}}
+{{"life_area": "one short label, e.g. career, marriage, finance, health, education, foreign_travel, general",
+  "restated_intent": "one plain sentence restating what the user wants to know, in English",
+  "comparison": ["option A", "option B"],
+  "requires_timing": true}}
 """
+        default: Dict[str, Any] = {"life_area": "", "restated_intent": "", "comparison": [], "requires_timing": False}
         try:
             raw = llm_service.generate(prompt=prompt, json_format=True, temperature=0.0)
             cleaned = raw.strip()
@@ -184,63 +194,41 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if cleaned.endswith("```"):
                 cleaned = cleaned[:-3]
             parsed = json.loads(cleaned.strip())
+
             life_area = str(parsed.get("life_area", "")).strip() or "general"
             restated = str(parsed.get("restated_intent", "")).strip()
             if not restated:
                 raise ValueError("empty restated_intent")
-            return {"life_area": life_area, "restated_intent": restated}
+
+            raw_comparison = parsed.get("comparison", [])
+            comparison = (
+                [str(c).strip() for c in raw_comparison if str(c).strip()][:2]
+                if isinstance(raw_comparison, list) else []
+            )
+            requires_timing = bool(parsed.get("requires_timing", False))
+
+            return {
+                "life_area": life_area,
+                "restated_intent": restated,
+                "comparison": comparison,
+                "requires_timing": requires_timing,
+            }
         except Exception as e:
             logger.warning(f"Query-understanding LLM call failed, falling back to keyword topic: {e}")
-            return {"life_area": "", "restated_intent": ""}
-
-    def _build_framework_query(self, message_text: str, topic: Optional[str] = None) -> str:
+            return default
+    def _build_framework_query(self, message_text: str, topic: Optional[str] = None, life_area: str = "") -> str:
         parts = [
             message_text.strip(),
             "classical astrology principles rules indications relevant factors"
         ]
+        if life_area and life_area != "general":
+            parts.append(life_area.replace("_", " "))
         if topic:
             bias = get_search_bias(topic)
             if bias:
                 parts.append(bias)
         return " ".join(p for p in parts if p).strip()
-
-    def _extract_referenced_factors(self, rag_hits: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
-        houses: Set[str] = set()
-        planets: Set[str] = set()
-        charts: Set[str] = set()
-        concepts: Set[str] = set()
-
-        planet_names = [
-            "Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus",
-            "Saturn", "Rahu", "Ketu", "Ascendant"
-        ]
-        house_pattern = re.compile(r"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+house\b", re.IGNORECASE)
-        chart_pattern = re.compile(r"\bD(?:1|7|9|10|24)\b", re.IGNORECASE)
-
-        for hit in rag_hits:
-            text = hit.get("text", "") or ""
-            lower = text.lower()
-
-            for planet in planet_names:
-                if planet.lower() in lower:
-                    planets.add(planet)
-
-            for match in house_pattern.finditer(text):
-                houses.add(match.group(1))
-
-            for match in chart_pattern.finditer(text):
-                charts.add(match.group(0).upper())
-
-            for phrase in (
-                "7th lord", "10th lord", "6th lord", "8th lord",
-                "9th lord", "11th lord", "2nd lord", "12th lord",
-                "lagna lord", "mahadasha", "antardasha", "dasha", "transit"
-            ):
-                if phrase in lower:
-                    concepts.add(phrase)
-
-        return {"houses": houses, "planets": planets, "charts": charts, "concepts": concepts}
-
+    
     def _build_targeted_kundli_facts(self, referenced: Dict[str, Set[str]], session: Dict) -> str:
         cached_raw = session.get("kundli_raw")
         cached_dasha = session.get("kundli_dasha")
@@ -309,16 +297,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             lines.append("Divisional charts referenced by classical evidence: " + ", ".join(sorted(charts)))
 
         return "\n".join(lines)
-
-    def _build_personalized_rag_query(self, message_text: str, topic: Optional[str], targeted_facts: str) -> str:
+    def _build_personalized_rag_query(self, message_text: str, topic: Optional[str], targeted_facts: str, life_area: str = "") -> str:
         parts = [message_text.strip(), "classical astrology interpretation"]
+        if life_area and life_area != "general":
+            parts.append(f"life area: {life_area}")
         if topic:
             parts.append(f"topic: {topic}")
         if targeted_facts:
             parts.append("chart configuration:")
             parts.append(targeted_facts)
         return " ".join(p for p in parts if p).strip()
-
+    
     def _get_multihop_evidence(self, topic: Optional[str], ranked_factors: List[Dict], seen_keys: set):
         """Multi-hop RAG: separate retrieval per top-activated planet."""
         chunks = []
@@ -362,11 +351,14 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         logger.info(f"[MultiHop] retrieved {len(hits)} additional chunks across {len(ranked_factors)} factor(s)")
         return "\n".join(chunks), hits
 
-    def _get_rag_first_context(self, message_text: str, topic: Optional[str], session: Dict):
+    def _get_rag_first_context(self, message_text: str, topic: Optional[str], session: Dict, query_understanding: Optional[Dict[str, Any]] = None):
         try:
             from app.services.topic_service import TOPIC_RELEVANT_BOOKS
-
-            framework_query = self._build_framework_query(message_text, topic)
+            qu = query_understanding or {}
+            life_area = qu.get("life_area") or ""
+            comparison = qu.get("comparison") or []
+            
+            framework_query = self._build_framework_query(message_text, topic, life_area)
             preferred_sources = TOPIC_RELEVANT_BOOKS.get(topic) if topic else None
 
             framework_hits = vector_store.dual_retrieve(
@@ -412,14 +404,58 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 f"planets={referenced['planets']} charts={referenced['charts']} concepts={referenced['concepts']}"
             )
 
-            # NOTE: Deterministic Chart Fact Graph + Activation Scoring was
-            # removed here on request — it no longer computes a ranking or
-            # feeds an activation_summary into targeted_facts / the prompt.
-            # targeted_facts is now purely _build_targeted_kundli_facts'
-            # output (real house/planet/dasha facts pulled from retrieved
-            # classical text), with no scored/ranked overlay on top.
+            comparison_hits: List[Dict[str, Any]] = []
+            if len(comparison) >= 2:
+                comparison_facts_blocks = []
+                for branch in comparison:
+                    branch_query = f"{branch} {life_area} astrology classical rules houses planets significance".strip()
+                    try:
+                        branch_vector = self.embeddings_provider.get_embedding(branch_query)
+                        branch_results = vector_store.hybrid_search(
+                            query=branch_query, query_vector=branch_vector,
+                            top_k=4, alpha=settings.HYBRID_ALPHA
+                        )
+                    except Exception as e:
+                        logger.error(f"[Comparison] retrieval failed for branch '{branch}': {e}")
+                        continue
 
-            personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts)
+                    branch_rag_hits = []
+                    for hit in branch_results:
+                        if hit["score"] < settings.MIN_RAG_RELEVANCE:
+                            continue
+                        source = hit["metadata"].get("source", "Unknown")
+                        page = hit["metadata"].get("page")
+                        key = (source, page)
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                        comparison_hits.append({
+                            "source": source, "page": page, "score": hit["score"],
+                            "text": hit["text"], "stage": "comparison", "branch": branch,
+                        })
+                        branch_rag_hits.append({
+                            "source": source, "page": page, "score": hit["score"], "text": hit["text"],
+                        })
+
+                    if branch_rag_hits:
+                        branch_referenced = self._extract_referenced_factors(branch_rag_hits)
+                        branch_facts = self._build_targeted_kundli_facts(branch_referenced, session)
+                        if branch_facts:
+                            comparison_facts_blocks.append(f"--- Chart facts relevant to '{branch}' ---\n{branch_facts}")
+
+                if comparison_facts_blocks:
+                    comparison_instruction = (
+                        f"\n\nCOMPARATIVE QUESTION DETECTED: the user is weighing {' vs '.join(comparison)}. "
+                        f"For EACH option below, go through the retrieved classical rules and state whether "
+                        f"this chart satisfies, partially satisfies, or does not satisfy each rule. Then give "
+                        f"an overall lean (which option the chart currently supports more strongly) — do not "
+                        f"just pick one option without showing the comparison.\n\n" + "\n\n".join(comparison_facts_blocks)
+                    )
+                    targeted_facts = f"{targeted_facts}\n{comparison_instruction}" if targeted_facts else comparison_instruction
+
+                logger.info(f"[Comparison] branches={comparison} additional_hits={len(comparison_hits)}")
+
+            personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts,life_area)
             personalized_vector = self.embeddings_provider.get_embedding(personalized_query)
 
             personalized_hits = vector_store.dual_retrieve(
@@ -455,22 +491,30 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     "text": hit["text"], "stage": "personalized",
                 })
 
-            
+            comparison_chunks = []
+            for hit in comparison_hits:
+                page_label = f", Page: {hit['page']}" if hit.get("page") is not None else ""
+                comparison_chunks.append(
+                    f"--- Comparison Evidence ({hit['branch']}) [Source: {hit['source']}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
+                )
 
-            all_hits = framework_rag_hits + personalized_rag_hits
+            all_hits = framework_rag_hits + comparison_hits + personalized_rag_hits
 
             context_parts = ["\n".join(framework_chunks)]
+            if comparison_chunks:
+                context_parts.append("\n".join(comparison_chunks))
             if personalized_chunks:
                 context_parts.append("\n".join(personalized_chunks))
             context = "\n".join(p for p in context_parts if p)
 
             logger.info(
                 f"[RAGFirst] framework={len(framework_rag_hits)}, "
-                f"personalized={len(personalized_rag_hits)}"
+                f"comparison={len(comparison_hits)}, personalized={len(personalized_rag_hits)}"
             )
 
             return context, all_hits, targeted_facts
 
+          
         except Exception as e:
             logger.error(f"RAG-first context build failed: {e}")
             return "No reference available.", [], ""
@@ -833,11 +877,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
             intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
             response_contract = get_response_contract(intent)
-
-            query_understanding = {"life_area": "", "restated_intent": ""}
+            
+            query_understanding: Dict[str, Any] = {"life_area": "", "restated_intent": "", "comparison": [], "requires_timing": False}
             if is_astrology and not missing_fields:
                 query_understanding = self._understand_query_intent(message_text, history_text)
-                logger.info(f"[QueryUnderstanding] life_area='{query_understanding['life_area']}' restated='{query_understanding['restated_intent']}'")
+                logger.info(
+                    f"[QueryUnderstanding] life_area='{query_understanding['life_area']}' "
+                    f"restated='{query_understanding['restated_intent']}' "
+                    f"comparison={query_understanding.get('comparison')} "
+                    f"requires_timing={query_understanding.get('requires_timing')}"
+                )
+            
 
             context_str = ""
             rag_hits: List[Dict[str, Any]] = []
@@ -851,10 +901,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if is_astrology and not missing_fields:
                 if self._is_followup_retrieval_question(message_text, history):
                     context_str, rag_hits = self._get_followup_rag_context(message_text, topic, history)
-
+                
                 if not rag_hits:
-                    context_str, rag_hits, targeted_facts = self._get_rag_first_context(message_text, topic, session)
-
+                    context_str, rag_hits, targeted_facts = self._get_rag_first_context(message_text, topic, session, query_understanding)
+                
                 logger.info(f"[RAGPipeline] hits={len(rag_hits)} targeted_facts={'yes' if targeted_facts else 'no'}")
 
             yoga_text = self._get_yoga_text(session) if (is_astrology and not missing_fields) else ""
@@ -1037,12 +1087,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
             intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
             response_contract = get_response_contract(intent)
-
-            query_understanding = {"life_area": "", "restated_intent": ""}
+            
+            query_understanding: Dict[str, Any] = {"life_area": "", "restated_intent": "", "comparison": [], "requires_timing": False}
             if is_astrology and not missing_fields:
                 query_understanding = self._understand_query_intent(message_text, history_text)
-                logger.info(f"[QueryUnderstanding] life_area='{query_understanding['life_area']}' restated='{query_understanding['restated_intent']}'")
-
+                logger.info(
+                    f"[QueryUnderstanding] life_area='{query_understanding['life_area']}' "
+                    f"restated='{query_understanding['restated_intent']}' "
+                    f"comparison={query_understanding.get('comparison')} "
+                    f"requires_timing={query_understanding.get('requires_timing')}"
+                )
+            
             context_str = ""
             rag_hits: List[Dict[str, Any]] = []
             targeted_facts = ""
@@ -1055,10 +1110,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if is_astrology and not missing_fields:
                 if self._is_followup_retrieval_question(message_text, history):
                     context_str, rag_hits = self._get_followup_rag_context(message_text, topic, history)
-
+                
                 if not rag_hits:
-                    context_str, rag_hits, targeted_facts = self._get_rag_first_context(message_text, topic, session)
-
+                    context_str, rag_hits, targeted_facts = self._get_rag_first_context(message_text, topic, session, query_understanding)
+                
                 logger.info(f"[RAGPipeline] hits={len(rag_hits)} targeted_facts={'yes' if targeted_facts else 'no'}")
 
             yoga_text = self._get_yoga_text(session) if (is_astrology and not missing_fields) else ""
@@ -1190,23 +1245,27 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             concepts = sorted(referenced.get("concepts", set()))
 
             steps = []
-            logger.info("[TRACE_V11_ACTIVE] _build_reasoning_trace entered — 9-step version (activation ranking removed)")
-
+            logger.info("[TRACE_V12_ACTIVE] _build_reasoning_trace entered — 9-step version with structured intent + comparative retrieval")
             # STEP 1 — QUERY UNDERSTANDING (LLM)
             qu = query_understanding or {}
             life_area = qu.get("life_area", "")
             restated = qu.get("restated_intent", "")
+            comparison = qu.get("comparison") or []
+            requires_timing = qu.get("requires_timing", False)
             if restated:
                 qu_detail = f"What the system understood you're asking:\n\"{restated}\""
                 if life_area:
                     qu_detail += f"\n\nLife area: {life_area}"
+                if comparison:
+                    qu_detail += f"\n\nComparing: {' vs '.join(comparison)}"
+                qu_detail += f"\n\nTiming/Dasha relevant: {'Yes' if requires_timing else 'No'}"
             else:
                 qu_detail = (
                     "Query understanding was not available for this response — "
                     f"falling back to keyword-based topic classification (topic: {topic or 'none'})."
                 )
             steps.append({"step": 1, "title": "Query Understanding", "detail": qu_detail, "type": "query_understanding"})
-
+           
             # STEP 2 — CLASSICAL FRAMEWORK RETRIEVED
             framework_lines = []
             if houses:
@@ -1243,10 +1302,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 chart_detail = "No targeted chart facts were identified from the retrieved classical framework."
 
             steps.append({"step": 3, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
-
-            # STEP 4 — PERSONALIZED + MULTI-HOP EVIDENCE RETRIEVED
+            
+                        # STEP 4 — PERSONALIZED + COMPARATIVE EVIDENCE RETRIEVED
             personalized_hits = [hit for hit in rag_hits if hit.get("stage") == "personalized"]
-            multihop_hits = [hit for hit in rag_hits if hit.get("stage") == "multihop"]
+            comparison_hits_trace = [hit for hit in rag_hits if hit.get("stage") == "comparison"]
 
             evidence_lines = []
             if personalized_hits:
@@ -1262,22 +1321,25 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 evidence_lines.append("Personalized retrieval (using chart configuration):")
                 evidence_lines.extend(p_sources)
 
-            if multihop_hits:
-                seen_m = set()
-                m_sources = []
-                for hit in multihop_hits:
-                    key = (hit.get("source"), hit.get("page"), hit.get("factor"))
-                    if key in seen_m:
+            if comparison_hits_trace:
+                by_branch: Dict[str, List[str]] = {}
+                seen_c = set()
+                for hit in comparison_hits_trace:
+                    branch = hit.get("branch", "unknown")
+                    key = (branch, hit.get("source"), hit.get("page"))
+                    if key in seen_c:
                         continue
-                    seen_m.add(key)
+                    seen_c.add(key)
                     ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
-                    m_sources.append(f"• {ref} [hop: {hit.get('factor')}]")
-                evidence_lines.append("\nMulti-hop retrieval (separate query per top-activated factor):")
-                evidence_lines.extend(m_sources)
+                    by_branch.setdefault(branch, []).append(f"  • {ref}")
+                evidence_lines.append("\nComparative retrieval (separate query per option being compared):")
+                for branch, refs in by_branch.items():
+                    evidence_lines.append(f"{branch}:")
+                    evidence_lines.extend(refs)
 
-            evidence_detail_step4 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or multi-hop evidence was retrieved."
-            steps.append({"step": 4, "title": "Personalized + Multi-Hop Evidence Retrieved", "detail": evidence_detail_step4, "type": "personalized_rag"})
-
+            evidence_detail_step4 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or comparative evidence was retrieved."
+            steps.append({"step": 4, "title": "Personalized + Comparative Evidence Retrieved", "detail": evidence_detail_step4, "type": "personalized_rag"})
+            
             # STEP 5 — EVIDENCE CONSENSUS
             consensus_label = None
             evidence_vote = None
@@ -1376,10 +1438,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         reference += f" (relevance: {float(score):.2f})"
                     except (TypeError, ValueError):
                         pass
+              
                 if stage:
                     reference += f" [{stage}]"
+                if hit.get("branch"):
+                    reference += f" (option: {hit['branch']})"
                 reference_lines.append(f"• {reference}")
-
             evidence_detail_step7 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
             steps.append({"step": 7, "title": "Classical Evidence", "detail": evidence_detail_step7, "type": "evidence"})
 
@@ -1409,8 +1473,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 specificity_lines.append("Status: Not available — no response text supplied")
 
             steps.append({"step": 9, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
-
-            logger.info(f"[TRACE_V11_ACTIVE] Reasoning trace built: {len(steps)} steps — titles: {[s['title'] for s in steps]}")
+            logger.info(f"[TRACE_V12_ACTIVE] Reasoning trace built: {len(steps)} steps — titles: {[s['title'] for s in steps]}")
             return steps
 
         except Exception as e:

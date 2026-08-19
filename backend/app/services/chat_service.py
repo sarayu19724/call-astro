@@ -25,6 +25,22 @@ from app.services.topic_service import (
 from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
 
+_PLANET_ALTS = r"(Sun|Moon|Mars|Mercury|Jupiter|Venus|Saturn|Rahu|Ketu)"
+_HOUSE_ORDINAL = r"(1st|2nd|3rd|4th|5th|6th|7th|8th|9th|10th|11th|12th)"
+
+RULE_CONDITION_PATTERN_FORWARD = re.compile(
+    rf"\b{_PLANET_ALTS}\b[^.]{{0,40}}?\b(?:in|placed in|posited in|occupying|located in|situated in)\s+(?:the\s+)?{_HOUSE_ORDINAL}\s+house\b",
+    re.IGNORECASE,
+)
+RULE_CONDITION_PATTERN_REVERSE = re.compile(
+    rf"\b{_HOUSE_ORDINAL}\s+house\b[^.]{{0,40}}?\b{_PLANET_ALTS}\b",
+    re.IGNORECASE,
+)
+_RULE_ORDINAL_TO_NUM = {
+    "1st": 1, "2nd": 2, "3rd": 3, "4th": 4, "5th": 5, "6th": 6,
+    "7th": 7, "8th": 8, "9th": 9, "10th": 10, "11th": 11, "12th": 12,
+}
+
 
 class ChatService:
     def __init__(self):
@@ -336,8 +352,96 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         if charts:
             lines.append("Divisional charts referenced by classical evidence: " + ", ".join(sorted(charts)))
 
+
+    def _match_rule_conditions_to_chart(self, rag_hits: List[Dict[str, Any]], session: Dict) -> str:
+        """Scans retrieved chunk text for explicit 'planet in Nth house'
+        claims and checks each against the ACTUAL chart. Returns a block
+        listing which claims are SATISFIED (real placement matches) and
+        which are NOT SATISFIED (real placement differs) — with an
+        instruction that only satisfied rules should be applied. This
+        prevents a rule mentioning 'Saturn in 7th house' from being
+        described as present in a chart where Saturn is actually
+        elsewhere; the real chart data always overrides retrieved text."""
+        if not rag_hits:
+            return ""
+
+        cached_raw = session.get("kundli_raw")
+        if not cached_raw:
+            return ""
+
+        try:
+            parsed = json.loads(cached_raw)
+            planets = parsed.get("planets", []) or []
+            ascendant_sign = parsed.get("ascendant_sign")
+        except Exception as e:
+            logger.error(f"Failed to parse cached chart data for rule matching: {e}")
+            return ""
+
+        if not ascendant_sign or not planets:
+            return ""
+
+        from app.services.topic_service import get_house_for_sign
+
+        actual_house: Dict[str, int] = {}
+        for p in planets:
+            name = p.get("name")
+            sign = p.get("sign_name", "")
+            if not name:
+                continue
+            h = get_house_for_sign(sign, ascendant_sign)
+            if h:
+                actual_house[name] = h
+
+        if not actual_house:
+            return ""
+
+        claims: Set[tuple] = set()
+        for hit in rag_hits:
+            text = hit.get("text", "") or ""
+            for m in RULE_CONDITION_PATTERN_FORWARD.finditer(text):
+                planet_raw, house_raw = m.group(1), m.group(2)
+                num = _RULE_ORDINAL_TO_NUM.get(house_raw.lower())
+                if num:
+                    claims.add((planet_raw.capitalize(), num))
+            for m in RULE_CONDITION_PATTERN_REVERSE.finditer(text):
+                house_raw, planet_raw = m.group(1), m.group(2)
+                num = _RULE_ORDINAL_TO_NUM.get(house_raw.lower())
+                if num:
+                    claims.add((planet_raw.capitalize(), num))
+
+        if not claims:
+            return ""
+
+        satisfied: List[str] = []
+        unsatisfied: List[str] = []
+        for planet, claimed_house in sorted(claims, key=lambda x: (x[1], x[0])):
+            real_house = actual_house.get(planet)
+            if real_house is None:
+                continue
+            if real_house == claimed_house:
+                satisfied.append(f"✓ SATISFIED: {planet} in {claimed_house}th house — confirmed by this chart.")
+            else:
+                unsatisfied.append(
+                    f"✗ NOT SATISFIED: {planet} in {claimed_house}th house — this chart actually has "
+                    f"{planet} in the {real_house}th house. Do NOT apply this specific rule to this chart."
+                )
+
+        if not satisfied and not unsatisfied:
+            return ""
+
+        logger.info(f"[RuleMatching] satisfied={len(satisfied)} not_satisfied={len(unsatisfied)}")
+
+        lines = ["Rule-Condition Matching (classical rules found in retrieved text, checked against this exact chart):"]
+        lines.extend(satisfied)
+        lines.extend(unsatisfied)
+        lines.append(
+            "IMPORTANT: Only incorporate SATISFIED rules above into your reading. For any NOT SATISFIED "
+            "rule, do not describe that placement/condition as present in this chart — the actual chart "
+            "data always overrides a rule's stated planet/house condition."
+        )
         return "\n".join(lines)
 
+    
     def _build_personalized_rag_query(self, message_text: str, topic: Optional[str], targeted_facts: str, life_area: str = "") -> str:
         parts = [message_text.strip(), "classical astrology interpretation"]
         if life_area and life_area != "general":
@@ -526,6 +630,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 )
 
             all_hits = framework_rag_hits + comparison_hits + personalized_rag_hits
+
+            rule_matching_block = self._match_rule_conditions_to_chart(all_hits, session)
+            if rule_matching_block:
+                targeted_facts = f"{targeted_facts}\n\n{rule_matching_block}" if targeted_facts else rule_matching_block
 
             context_parts = []
             if framework_chunks:

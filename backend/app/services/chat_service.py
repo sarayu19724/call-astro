@@ -26,6 +26,20 @@ from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
 
 
+# Bump whenever the logic feeding a topic bundle changes (evidence vote
+# computation, consensus labeling, consistency checks). A cached bundle
+# written under an older version is a miss and gets recomputed — this is
+# what prevents a topic bundle that failed to fully compute once (e.g. a
+# transient error mid-build) from staying cached incomplete for the rest
+# of the session.
+TOPIC_BUNDLE_LOGIC_VERSION = 2
+
+MONTH_NAME_TO_NUM = {
+    'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
+    'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12,
+}
+
+
 class ChatService:
     def __init__(self):
         self.embeddings_provider = EmbeddingsProvider()
@@ -52,6 +66,147 @@ class ChatService:
                 return parsed_time.strftime("%H:%M")
             except ValueError:
                 return time_str
+
+    # ------------------------------------------------------------------
+    # ISSUE-FIX: Temporal grounding (current date + rule against
+    # presenting a past period as upcoming).
+    # ------------------------------------------------------------------
+    def _build_temporal_context(self) -> str:
+        today_str = datetime.now().strftime("%d %B %Y")
+        return (
+            f"CURRENT DATE: {today_str}\n\n"
+            "TEMPORAL RULE (apply to every date/period you mention):\n"
+            "- Never describe a date or period BEFORE the current date above as upcoming, "
+            "forthcoming, or something that 'will' happen — it has already occurred or passed.\n"
+            "- If retrieved classical evidence or a Dasha sub-period points to a window that has "
+            "already passed, say so explicitly (e.g. 'this window has already passed') instead of "
+            "presenting it as a future prediction.\n"
+            "- For questions using words like 'when', 'next', 'upcoming', or 'in the coming "
+            "months/years', only present periods that START AFTER the current date above as "
+            "genuine future possibilities.\n"
+            "- A past period from retrieved evidence can still be used as historical/contextual "
+            "explanation (e.g. 'the chart showed favorable signs during that window, and the "
+            "current period continues that trend'), just never framed as something yet to happen."
+        )
+
+    # ------------------------------------------------------------------
+    # ISSUE A FIX: deterministic past-date detector. Separate from
+    # claim_validator.py (not available to edit here) — scans the actual
+    # generated text for a year, or month+year, that has already passed
+    # relative to the real current date, and flags it for correction.
+    # This is intentionally strict/simple (regex-based) rather than
+    # trying to parse every possible date phrasing — false negatives
+    # (a missed past-date mention) are acceptable, false positives
+    # (flagging a correctly-future date) are not, so it only fires on
+    # clear year/month-year matches.
+    # ------------------------------------------------------------------
+    def _check_past_date_claims(self, response_text: str) -> Optional[str]:
+        if not response_text:
+            return None
+        now = datetime.now()
+        year_pattern = re.compile(r'\b(20\d{2})\b')
+        issues: List[str] = []
+        seen_spans = set()
+
+        for match in year_pattern.finditer(response_text):
+            year = int(match.group(1))
+            span_key = match.start()
+            if span_key in seen_spans:
+                continue
+            seen_spans.add(span_key)
+
+            context_start = max(0, match.start() - 40)
+            context = response_text[context_start:match.end()]
+            context_lower = context.lower()
+
+            found_month = None
+            for name, num in MONTH_NAME_TO_NUM.items():
+                if name in context_lower:
+                    found_month = num
+                    break
+
+            is_past = False
+            if found_month is not None:
+                if (year, found_month) < (now.year, now.month):
+                    is_past = True
+            else:
+                if year < now.year:
+                    is_past = True
+
+            if is_past:
+                snippet = context.strip()
+                issues.append(f"\"{snippet}\" — this refers to a period that has already passed")
+
+        if not issues:
+            return None
+
+        return (
+            f"TEMPORAL VIOLATION DETECTED (current date: {now.strftime('%d %B %Y')}) — the response "
+            f"referenced at least one date/period that has already passed as if it were still upcoming:\n"
+            + "\n".join(f"- {i}" for i in issues)
+            + "\nRewrite the response: explicitly mark any already-passed period as past (e.g. 'this "
+            "window has already passed'), and only present periods starting after the current date "
+            "as genuine future predictions."
+        )
+
+    # ------------------------------------------------------------------
+    # ISSUE B FIX: hard constraint block listing the REAL verified chart
+    # placements, so the LLM can't blend a classical RAG example's
+    # hypothetical placement ("if Mercury is in the 10th house...") with
+    # the user's actual chart.
+    # ------------------------------------------------------------------
+    def _build_verified_chart_block(self, session: Dict) -> str:
+        cached_raw = session.get("kundli_raw")
+        if not cached_raw:
+            return ""
+        try:
+            parsed = json.loads(cached_raw)
+            planets = parsed.get("planets", []) or []
+            ascendant_sign = parsed.get("ascendant_sign")
+        except Exception:
+            return ""
+        if not ascendant_sign or not planets:
+            return ""
+
+        from app.services.topic_service import get_house_for_sign
+
+        lines = [f"Ascendant (Lagna): {ascendant_sign}"]
+        for p in planets:
+            name = p.get("name")
+            sign = p.get("sign_name", "")
+            if not name or not sign:
+                continue
+            house = get_house_for_sign(sign, ascendant_sign)
+            retro = " (retrograde)" if str(p.get("isRetro", "")).lower() == "true" else ""
+            house_str = f", house {house}" if house else ""
+            lines.append(f"{name}: {sign}{house_str}{retro}")
+
+        return (
+            "ACTUAL VERIFIED CHART PLACEMENTS (this is the user's real chart — the ONLY source of "
+            "truth for where each planet actually is):\n" + "\n".join(lines) +
+            "\n\nHARD RULE: retrieved classical text may describe a rule using a DIFFERENT house "
+            "placement for a planet as a general/illustrative example (e.g. 'if Mercury is in the "
+            "10th house...'). If that placement doesn't match the VERIFIED list above, it is NOT a "
+            "description of this user's actual chart — never state a planet's house placement that "
+            "contradicts the verified list above."
+        )
+
+    def _chunk_text_for_streaming(self, text: str, words_per_chunk: int = 6):
+        """Splits already-generated (and already-validated) text into
+        small word groups so the client still gets a progressive typing
+        effect, even though the underlying generation is no longer
+        streamed token-by-token. See process_chat_message_stream — this
+        exists specifically so a validated/corrected response can still
+        feel like it's streaming."""
+        words = text.split(' ')
+        buf: List[str] = []
+        for w in words:
+            buf.append(w)
+            if len(buf) >= words_per_chunk:
+                yield ' '.join(buf) + ' '
+                buf = []
+        if buf:
+            yield ' '.join(buf)
 
     def _fetch_and_cache_kundli(self, session_id: str, session: Dict) -> str:
         try:
@@ -152,17 +307,12 @@ class ChatService:
             return "No reference available.", []
 
     def _understand_query_intent(self, message_text: str, history_text: str) -> Dict[str, Any]:
-        """LLM-based query understanding — runs BEFORE RAG. Normalizes
-        whatever language/phrasing the user used ('profession', 'naukri
-        vs business', 'pesha', etc.) into a structured intent:
-        - life_area: short label driving retrieval bias (works even for
-          life areas not in TOPIC_CHART_FACTORS, e.g. 'foreign_travel')
-        - restated_intent: one-line plain-English restatement
-        - comparison: 0-3 options if the question is comparative
-          ("job or business or higher studies" -> ["job", "business", "higher studies"])
-        - requires_timing: whether Dasha/timing is relevant
-        Does NOT decide any astrology rules itself — RAG still determines
-        which houses/planets/rules apply. Shown verbatim in the trace."""
+        """LLM-based query understanding — runs BEFORE topic resolution
+        and BEFORE RAG. This is now the PRIMARY source for topic
+        ('life_area') — see _resolve_topic(). classify_topic() (keyword-
+        based) only runs as a fallback when this call fails or returns an
+        unrecognized area. Once resolved, `topic` is used consistently
+        everywhere downstream — nothing re-runs classify_topic()."""
         prompt = f"""You are a query-understanding layer for a Vedic astrology assistant.
 Do NOT answer the astrology question and do NOT name any houses, planets, or astrological rules.
 Only restate what the user is asking about in plain language, and classify its structure.
@@ -218,6 +368,27 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         except Exception as e:
             logger.warning(f"Query-understanding LLM call failed, falling back to keyword topic: {e}")
             return default
+
+    def _resolve_topic(self, message_text: str, query_understanding: Dict[str, Any]) -> Optional[str]:
+        """ISSUE D FIX — PRIMARY topic resolution: uses the LLM's life_area
+        if it matches a known TOPIC_CHART_FACTORS key. classify_topic()
+        (keyword-based) is used ONLY as a fallback when life_area is
+        missing, 'general', or doesn't match a known key. This is the
+        single resolution point — _get_topic_bundle, _build_reasoning_trace,
+        and evidence voting all consume the SAME resulting value; nothing
+        downstream calls classify_topic() again independently."""
+        life_area = (query_understanding.get("life_area") or "").strip().lower()
+
+        if life_area and life_area in TOPIC_CHART_FACTORS:
+            logger.info(f"[TopicResolution] using LLM life_area='{life_area}' as topic (primary)")
+            return life_area
+
+        fallback = classify_topic(message_text)
+        logger.info(
+            f"[TopicResolution] LLM life_area='{life_area or 'none'}' not in TOPIC_CHART_FACTORS — "
+            f"falling back to keyword classify_topic()='{fallback}'"
+        )
+        return fallback
 
     def _build_framework_query(self, message_text: str, topic: Optional[str] = None, life_area: str = "") -> str:
         parts = [
@@ -373,11 +544,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             framework_hits = [h for h in framework_hits if h["score"] >= settings.MIN_RAG_RELEVANCE]
 
-            # FIX: previously, an empty framework_hits caused an early
-            # return that skipped comparison AND personalized retrieval
-            # entirely — a single weak first-stage score blacked out the
-            # whole evidence pipeline. Now we log and continue with an
-            # empty framework stage instead of aborting everything.
             framework_rag_hits: List[Dict[str, Any]] = []
             framework_chunks: List[str] = []
             seen_keys: set = set()
@@ -409,16 +575,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     f"planets={referenced['planets']} charts={referenced['charts']} concepts={referenced['concepts']}"
                 )
 
-            # If no houses/planets came from framework text, still surface
-            # at least the Dasha line via an empty-referenced call — this
-            # keeps the Kundli-derived timing info available even when RAG
-            # found nothing usable this turn.
             if not targeted_facts:
                 targeted_facts = self._build_targeted_kundli_facts(referenced, session)
 
-            # --- Comparative branch retrieval (e.g. "job or business",
-            # "abroad or stay in India") — independent of framework
-            # success, so a weak framework score never blocks this. ---
             comparison_hits: List[Dict[str, Any]] = []
             if len(comparison) >= 2:
                 comparison_facts_blocks = []
@@ -434,8 +593,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         logger.error(f"[Comparison] retrieval failed for branch '{branch}': {e}")
                         continue
 
-                    logger.info(f"[Comparison] branch='{branch}' raw_results={len(branch_results)} scores={[round(r['score'],3) for r in branch_results]}")
-
                     branch_rag_hits = []
                     for hit in branch_results:
                         if hit["score"] < settings.MIN_RAG_RELEVANCE:
@@ -444,7 +601,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         page = hit["metadata"].get("page")
                         key = (source, page)
                         if key in seen_keys:
-                            logger.info(f"[Comparison] branch='{branch}' skipped duplicate chunk from {source}")
                             continue
                         seen_keys.add(key)
                         comparison_hits.append({
@@ -455,17 +611,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                             "source": source, "page": page, "score": hit["score"], "text": hit["text"],
                         })
 
-                    logger.info(f"[Comparison] branch='{branch}' passed_threshold={len(branch_rag_hits)}")
-
                     if branch_rag_hits:
                         branch_referenced = self._extract_referenced_factors(branch_rag_hits)
-                        logger.info(f"[Comparison] branch='{branch}' referenced_factors={branch_referenced}")
                         branch_facts = self._build_targeted_kundli_facts(branch_referenced, session)
-                        logger.info(f"[Comparison] branch='{branch}' facts_generated={'yes' if branch_facts else 'NO — empty'}")
                         if branch_facts:
                             comparison_facts_blocks.append(f"--- Chart facts relevant to '{branch}' ---\n{branch_facts}")
-                    else:
-                        logger.warning(f"[Comparison] branch='{branch}' produced ZERO hits above relevance threshold — no facts block for this branch")
                 if comparison_facts_blocks:
                     comparison_instruction = (
                         f"\n\nCOMPARATIVE QUESTION DETECTED: the user is weighing {' vs '.join(comparison)}. "
@@ -476,12 +626,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     )
                     targeted_facts = f"{targeted_facts}\n{comparison_instruction}" if targeted_facts else comparison_instruction
 
-                logger.info(f"[Comparison] branches={comparison} additional_hits={len(comparison_hits)}")
-
-            # --- Personalized retrieval — also independent of framework
-            # success. Uses the raw message_text/life_area even if
-            # targeted_facts is empty, so this stage still has a real
-            # chance to find something. ---
             personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts, life_area)
             personalized_vector = self.embeddings_provider.get_embedding(personalized_query)
 
@@ -616,13 +760,25 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             logger.error(f"Follow-up RAG failed: {e}")
             return "", []
 
+    # ------------------------------------------------------------------
+    # Per-topic cache — versioned (see TOPIC_BUNDLE_LOGIC_VERSION above).
+    # ------------------------------------------------------------------
     def _get_topic_cache(self, session: Dict, topic: str) -> Optional[Dict]:
         raw = session.get("topic_cache")
         if not raw:
             return None
         try:
             cache = json.loads(raw)
-            return cache.get(topic)
+            entry = cache.get(topic)
+            if not entry:
+                return None
+            if entry.get("_version") != TOPIC_BUNDLE_LOGIC_VERSION:
+                logger.info(
+                    f"Topic cache for '{topic}' is stale "
+                    f"(v{entry.get('_version')} != v{TOPIC_BUNDLE_LOGIC_VERSION}) — recomputing"
+                )
+                return None
+            return entry
         except Exception:
             return None
 
@@ -630,7 +786,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         try:
             raw = session.get("topic_cache")
             cache = json.loads(raw) if raw else {}
-            cache[topic] = bundle
+            bundle_to_store = dict(bundle)
+            bundle_to_store["_version"] = TOPIC_BUNDLE_LOGIC_VERSION
+            cache[topic] = bundle_to_store
             cache_json = json.dumps(cache, ensure_ascii=False)
             db.update_session(session_id, {"topic_cache": cache_json})
             session["topic_cache"] = cache_json
@@ -645,11 +803,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         cached = self._get_topic_cache(session, topic)
         if cached is not None:
             logger.info(f"Using cached topic bundle for '{topic}'")
-            if "evidence_vote" not in cached:
-                cached["evidence_vote"] = None
-            if "consensus_label" not in cached:
-                cached["consensus_label"] = get_evidence_consensus_label(cached.get("evidence_vote"))
-            return cached
+            return {k: cached.get(k, empty[k]) for k in empty}
 
         bundle = dict(empty)
         try:
@@ -696,7 +850,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             bundle["timeline"] = self._get_dasha_timeline(session_id, session, topic, language)
         except Exception as e:
-            logger.error(f"Topic bundle build failed for '{topic}': {e}")
+            logger.error(f"Topic bundle build failed for '{topic}': {e}", exc_info=True)
 
         self._save_topic_cache(session_id, session, topic, bundle)
         return bundle
@@ -839,6 +993,159 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             logger.error(f"Follow-up suggestion generation failed: {followup_err}")
             return []
 
+    def _prepare_common_context(self, session_id: str, message_text: str, history: List[Dict[str, str]],
+                                  history_text: str, session: Dict, language: str):
+        """Shared by both non-streaming and streaming paths: query
+        understanding -> topic resolution -> RAG -> topic bundle -> final
+        prompt materials. Pulling this into one place guarantees the
+        streaming path can no longer drift out of sync with the
+        non-streaming path (ISSUE C's buffer-then-validate approach reuses
+        this directly instead of duplicating the whole block again)."""
+        query_understanding = self._understand_query_intent(message_text, history_text)
+        logger.info(
+            f"[QueryUnderstanding] life_area='{query_understanding['life_area']}' "
+            f"restated='{query_understanding['restated_intent']}' "
+            f"comparison={query_understanding.get('comparison')} "
+            f"requires_timing={query_understanding.get('requires_timing')}"
+        )
+
+        topic = self._resolve_topic(message_text, query_understanding)
+        intent = classify_intent(message_text)
+        response_contract = get_response_contract(intent)
+
+        cached_kundli = session.get("kundli_data")
+        kundli_str = cached_kundli if cached_kundli else self._fetch_and_cache_kundli(session_id, session)
+
+        context_str = ""
+        rag_hits: List[Dict[str, Any]] = []
+        targeted_facts = ""
+        if self._is_followup_retrieval_question(message_text, history):
+            context_str, rag_hits = self._get_followup_rag_context(message_text, topic, history)
+        if not rag_hits:
+            context_str, rag_hits, targeted_facts = self._get_rag_first_context(message_text, topic, session, query_understanding)
+        logger.info(f"[RAGPipeline] hits={len(rag_hits)} targeted_facts={'yes' if targeted_facts else 'no'}")
+
+        yoga_text = self._get_yoga_text(session)
+
+        topic_emphasis = divisional_text = consistency_note = missing_evidence = dasha_timeline_str = ""
+        evidence_vote = None
+        if topic:
+            bundle = self._get_topic_bundle(session_id, session, topic, language)
+            topic_emphasis = bundle["emphasis"]
+            divisional_text = bundle["divisional"]
+            consistency_note = bundle["consistency"]
+            missing_evidence = bundle["missing_evidence"]
+            dasha_timeline_str = bundle["timeline"]
+            evidence_vote = bundle.get("evidence_vote")
+
+        final_kundli_data = self._build_final_kundli_data(kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence)
+        if targeted_facts:
+            final_kundli_data = f"{final_kundli_data}\n\n{targeted_facts}" if final_kundli_data else targeted_facts
+
+        verified_block = self._build_verified_chart_block(session)
+        if verified_block:
+            final_kundli_data = f"{final_kundli_data}\n\n{verified_block}" if final_kundli_data else verified_block
+
+        user_memory = self._get_user_memory_block(session, topic)
+        repeat_hint = self._get_repeat_topic_hint(session, topic)
+
+        return {
+            "query_understanding": query_understanding,
+            "topic": topic,
+            "response_contract": response_contract,
+            "context_str": context_str,
+            "rag_hits": rag_hits,
+            "targeted_facts": targeted_facts,
+            "final_kundli_data": final_kundli_data,
+            "user_memory": user_memory,
+            "repeat_hint": repeat_hint,
+            "consistency_note": consistency_note,
+            "dasha_timeline_str": dasha_timeline_str,
+            "evidence_vote": evidence_vote,
+        }
+
+    def _build_astrologer_prompt(self, session: Dict, language: str, history_text: str,
+                                   message_text: str, ctx: Dict[str, Any]) -> str:
+        prompt = ASTROLOGER_PROMPT.format(
+            name=session.get("name") or "Friend",
+            language=language, dob=session.get("dob") or "Not provided",
+            birth_time=session.get("birth_time") or "Not provided",
+            birth_place=session.get("birth_place") or "Not provided",
+            context=ctx["context_str"] or "No book context.", kundli_data=ctx["final_kundli_data"],
+            user_memory=ctx["user_memory"] or "No prior topics discussed yet.",
+            consistency_note=ctx["consistency_note"] or "No specific conflict detected.",
+            dasha_timeline=ctx["dasha_timeline_str"] or "No timeline data available.",
+            response_contract=ctx["response_contract"],
+            history=history_text, query=message_text
+        )
+        if ctx["repeat_hint"]:
+            prompt += f"\n\n{ctx['repeat_hint']}"
+        prompt += f"\n\n{self._build_temporal_context()}"
+        return prompt
+
+    def _generate_and_validate(self, session_id: str, session: Dict, astrologer_prompt: str,
+                                 dasha_timeline_str: str, evidence_vote) -> str:
+        """Shared generate -> validate -> retry-once loop. Runs the SAME
+        checks (claim_validator, ISSUE A past-date check, specificity)
+        whether called from the non-streaming path or from the streaming
+        path's internal buffer-then-validate flow."""
+        response_text = llm_service.generate(prompt=astrologer_prompt, temperature=0.6)
+
+        recent_texts = self._get_recent_assistant_texts(session_id)
+        similar_to = self._is_too_similar(response_text, recent_texts)
+
+        verify_planets, verify_ascendant = [], None
+        cached_raw_for_verify = session.get("kundli_raw")
+        if cached_raw_for_verify:
+            try:
+                parsed_verify = json.loads(cached_raw_for_verify)
+                verify_planets = parsed_verify.get("planets", [])
+                verify_ascendant = parsed_verify.get("ascendant_sign")
+            except Exception:
+                pass
+
+        claim_failures = validate_claims(
+            response_text, dasha_timeline_str, evidence_vote,
+            planets=verify_planets, ascendant_sign=verify_ascendant
+        )
+
+        specificity_score = compute_chart_specificity(response_text)
+        specificity_correction = build_specificity_correction(specificity_score)
+        if specificity_correction:
+            logger.info(f"[Specificity] response flagged as generic: ratio={specificity_score['specificity_ratio']}")
+
+        temporal_correction = self._check_past_date_claims(response_text)
+        if temporal_correction:
+            logger.info("[TemporalCheck] response flagged a past date/period presented as upcoming")
+
+        if similar_to or claim_failures or specificity_correction or temporal_correction:
+            retry_prompt = astrologer_prompt
+            if similar_to:
+                retry_prompt += (
+                    f"\n\nIMPORTANT: Your previous response was very similar to this one:\n"
+                    f"\"{similar_to}\"\n"
+                    f"Express the same astrological reasoning but do NOT repeat the same wording. "
+                    f"Focus specifically on what's different about the CURRENT question."
+                )
+            if claim_failures:
+                logger.info(f"Claim validation found {len(claim_failures)} issue(s) — regenerating with corrections")
+                retry_prompt += "\n\n" + build_claim_correction_instructions(claim_failures)
+            if specificity_correction:
+                retry_prompt += "\n\n" + specificity_correction
+            if temporal_correction:
+                retry_prompt += "\n\n" + temporal_correction
+
+            response_text = llm_service.generate(prompt=retry_prompt, temperature=0.75)
+
+            remaining_claims = validate_claims(response_text, dasha_timeline_str, evidence_vote)
+            remaining_temporal = self._check_past_date_claims(response_text)
+            if remaining_claims:
+                logger.warning(f"Claim validation still found {len(remaining_claims)} issue(s) after regeneration")
+            if remaining_temporal:
+                logger.warning("Temporal check still found a past-as-upcoming date after regeneration")
+
+        return response_text
+
     # ------------------------------------------------------------------
     # NON-STREAMING — POST /api/chat
     # ------------------------------------------------------------------
@@ -902,129 +1209,32 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         "birth_place": session.get("birth_place"), "language": language
                     }
 
-            topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
-            intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
-            response_contract = get_response_contract(intent)
+            if not is_astrology or missing_fields:
+                db.add_message(session_id, "assistant", "Kripya dobara koshish karein.")
+                return {"session_id": session_id, "message": "Kripya dobara koshish karein.",
+                        "dob": session.get("dob"), "birth_time": session.get("birth_time"),
+                        "birth_place": session.get("birth_place"), "language": session.get("language", "Hinglish")}
 
-            query_understanding: Dict[str, Any] = {"life_area": "", "restated_intent": "", "comparison": [], "requires_timing": False}
-            if is_astrology and not missing_fields:
-                query_understanding = self._understand_query_intent(message_text, history_text)
-                logger.info(
-                    f"[QueryUnderstanding] life_area='{query_understanding['life_area']}' "
-                    f"restated='{query_understanding['restated_intent']}' "
-                    f"comparison={query_understanding.get('comparison')} "
-                    f"requires_timing={query_understanding.get('requires_timing')}"
-                )
-
-            context_str = ""
-            rag_hits: List[Dict[str, Any]] = []
-            targeted_facts = ""
-
-            kundli_str = "No chart data available."
-            if is_astrology and not missing_fields:
-                cached_kundli = session.get("kundli_data")
-                kundli_str = cached_kundli if cached_kundli else self._fetch_and_cache_kundli(session_id, session)
-
-            if is_astrology and not missing_fields:
-                if self._is_followup_retrieval_question(message_text, history):
-                    context_str, rag_hits = self._get_followup_rag_context(message_text, topic, history)
-
-                if not rag_hits:
-                    context_str, rag_hits, targeted_facts = self._get_rag_first_context(message_text, topic, session, query_understanding)
-
-                logger.info(f"[RAGPipeline] hits={len(rag_hits)} targeted_facts={'yes' if targeted_facts else 'no'}")
-
-            yoga_text = self._get_yoga_text(session) if (is_astrology and not missing_fields) else ""
-
-            topic_emphasis = divisional_text = consistency_note = missing_evidence = dasha_timeline_str = ""
-            evidence_vote = None
-            if is_astrology and not missing_fields and topic:
-                bundle = self._get_topic_bundle(session_id, session, topic, language)
-                topic_emphasis = bundle["emphasis"]
-                divisional_text = bundle["divisional"]
-                consistency_note = bundle["consistency"]
-                missing_evidence = bundle["missing_evidence"]
-                dasha_timeline_str = bundle["timeline"]
-                evidence_vote = bundle.get("evidence_vote")
-
-            final_kundli_data = self._build_final_kundli_data(kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence)
-            if targeted_facts:
-                final_kundli_data = f"{final_kundli_data}\n\n{targeted_facts}" if final_kundli_data else targeted_facts
-
-            user_memory = self._get_user_memory_block(session, topic) if (is_astrology and not missing_fields) else ""
+            ctx = self._prepare_common_context(session_id, message_text, history, history_text, session, language)
+            topic = ctx["topic"]
 
             try:
-                astrologer_prompt = ASTROLOGER_PROMPT.format(
-                    name=session.get("name") or "Friend",
-                    language=language, dob=session.get("dob") or "Not provided",
-                    birth_time=session.get("birth_time") or "Not provided",
-                    birth_place=session.get("birth_place") or "Not provided",
-                    context=context_str or "No book context.", kundli_data=final_kundli_data,
-                    user_memory=user_memory or "No prior topics discussed yet.",
-                    consistency_note=consistency_note or "No specific conflict detected.",
-                    dasha_timeline=dasha_timeline_str or "No timeline data available.",
-                    response_contract=response_contract,
-                    history=history_text, query=message_text
+                astrologer_prompt = self._build_astrologer_prompt(session, language, history_text, message_text, ctx)
+                response_text = self._generate_and_validate(
+                    session_id, session, astrologer_prompt, ctx["dasha_timeline_str"], ctx["evidence_vote"]
                 )
-                response_text = llm_service.generate(prompt=astrologer_prompt, temperature=0.6)
-
-                if is_astrology and not missing_fields:
-                    recent_texts = self._get_recent_assistant_texts(session_id)
-                    similar_to = self._is_too_similar(response_text, recent_texts)
-
-                    verify_planets, verify_ascendant = [], None
-                    cached_raw_for_verify = session.get("kundli_raw")
-                    if cached_raw_for_verify:
-                        try:
-                            parsed_verify = json.loads(cached_raw_for_verify)
-                            verify_planets = parsed_verify.get("planets", [])
-                            verify_ascendant = parsed_verify.get("ascendant_sign")
-                        except Exception:
-                            pass
-
-                    claim_failures = validate_claims(
-                        response_text, dasha_timeline_str, evidence_vote,
-                        planets=verify_planets, ascendant_sign=verify_ascendant
-                        )
-
-                    specificity_score = compute_chart_specificity(response_text)
-                    specificity_correction = build_specificity_correction(specificity_score)
-                    if specificity_correction:
-                        logger.info(f"[Specificity] response flagged as generic: ratio={specificity_score['specificity_ratio']}")
-
-                    if similar_to or claim_failures or specificity_correction:
-                        retry_prompt = astrologer_prompt
-                        if similar_to:
-                            retry_prompt += (
-                                f"\n\nIMPORTANT: Your previous response was very similar to this one:\n"
-                                f"\"{similar_to}\"\n"
-                                f"Express the same astrological reasoning but do NOT repeat the same wording. "
-                                f"Focus specifically on what's different about the CURRENT question."
-                            )
-                        if claim_failures:
-                            logger.info(f"Claim validation found {len(claim_failures)} issue(s) — regenerating with corrections")
-                            retry_prompt += "\n\n" + build_claim_correction_instructions(claim_failures)
-                        if specificity_correction:
-                            retry_prompt += "\n\n" + specificity_correction
-
-                        response_text = llm_service.generate(prompt=retry_prompt, temperature=0.75)
-
-                        remaining = validate_claims(response_text, dasha_timeline_str, evidence_vote)
-                        if remaining:
-                            logger.warning(f"Claim validation still found {len(remaining)} issue(s) after regeneration")
             except Exception as gen_err:
                 logger.error(f"Generation failed: {gen_err}")
                 response_text = "Mujhe samajhne mein kuch pareshani ho gayi."
 
             db.add_message(session_id, "assistant", response_text)
 
-            if is_astrology and not missing_fields:
-                try:
-                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, response_text, query_understanding)
-                    db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
-                except Exception as trace_err:
-                    logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
-                self._update_topic_memory(session_id, session, topic, response_text)
+            try:
+                trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], response_text, ctx["query_understanding"])
+                db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
+            except Exception as trace_err:
+                logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
+            self._update_topic_memory(session_id, session, topic, response_text)
 
             suggestions = []
             if response_text and len(response_text) > 20:
@@ -1044,6 +1254,15 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
     # ------------------------------------------------------------------
     # STREAMING — POST /api/chat/stream
+    #
+    # ISSUE C FIX: no longer streams raw tokens from the first generation
+    # call. Instead: generate the full response internally, run it through
+    # the SAME validate/retry loop as the non-streaming path
+    # (_generate_and_validate), and only THEN chunk the final,
+    # already-corrected text out to the client. This trades away true
+    # token-level low-latency streaming for the guarantee that the user
+    # never sees a sentence that later gets silently corrected out from
+    # under them.
     # ------------------------------------------------------------------
     def process_chat_message_stream(self, session_id: str, message_text: str):
         logger.info(f"Processing chat message (stream) for session: {session_id}")
@@ -1109,127 +1328,41 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                            "birth_place": session.get("birth_place"), "language": language}
                     return
 
-            topic = classify_topic(message_text) if (is_astrology and not missing_fields) else None
-            intent = classify_intent(message_text) if (is_astrology and not missing_fields) else "general"
-            response_contract = get_response_contract(intent)
+            if not is_astrology or missing_fields:
+                fallback = "Kripya dobara koshish karein."
+                yield {"type": "chunk", "text": fallback}
+                db.add_message(session_id, "assistant", fallback)
+                yield {"type": "done", "session_id": session_id, "message": fallback,
+                       "dob": session.get("dob"), "birth_time": session.get("birth_time"),
+                       "birth_place": session.get("birth_place"), "language": session.get("language", "Hinglish")}
+                return
 
-            query_understanding: Dict[str, Any] = {"life_area": "", "restated_intent": "", "comparison": [], "requires_timing": False}
-            if is_astrology and not missing_fields:
-                query_understanding = self._understand_query_intent(message_text, history_text)
-                logger.info(
-                    f"[QueryUnderstanding] life_area='{query_understanding['life_area']}' "
-                    f"restated='{query_understanding['restated_intent']}' "
-                    f"comparison={query_understanding.get('comparison')} "
-                    f"requires_timing={query_understanding.get('requires_timing')}"
-                )
+            ctx = self._prepare_common_context(session_id, message_text, history, history_text, session, language)
+            topic = ctx["topic"]
 
-            context_str = ""
-            rag_hits: List[Dict[str, Any]] = []
-            targeted_facts = ""
-
-            kundli_str = "No chart data available."
-            if is_astrology and not missing_fields:
-                cached_kundli = session.get("kundli_data")
-                kundli_str = cached_kundli if cached_kundli else self._fetch_and_cache_kundli(session_id, session)
-
-            if is_astrology and not missing_fields:
-                if self._is_followup_retrieval_question(message_text, history):
-                    context_str, rag_hits = self._get_followup_rag_context(message_text, topic, history)
-
-                if not rag_hits:
-                    context_str, rag_hits, targeted_facts = self._get_rag_first_context(message_text, topic, session, query_understanding)
-
-                logger.info(f"[RAGPipeline] hits={len(rag_hits)} targeted_facts={'yes' if targeted_facts else 'no'}")
-
-            yoga_text = self._get_yoga_text(session) if (is_astrology and not missing_fields) else ""
-
-            topic_emphasis = divisional_text = consistency_note = missing_evidence = dasha_timeline_str = ""
-            evidence_vote = None
-            if is_astrology and not missing_fields and topic:
-                bundle = self._get_topic_bundle(session_id, session, topic, language)
-                topic_emphasis = bundle["emphasis"]
-                divisional_text = bundle["divisional"]
-                consistency_note = bundle["consistency"]
-                missing_evidence = bundle["missing_evidence"]
-                dasha_timeline_str = bundle["timeline"]
-                evidence_vote = bundle.get("evidence_vote")
-
-            final_kundli_data = self._build_final_kundli_data(kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence)
-            if targeted_facts:
-                final_kundli_data = f"{final_kundli_data}\n\n{targeted_facts}" if final_kundli_data else targeted_facts
-
-            user_memory = ""
-            repeat_hint = ""
-            if is_astrology and not missing_fields:
-                user_memory = self._get_user_memory_block(session, topic)
-                repeat_hint = self._get_repeat_topic_hint(session, topic)
-
-            astrologer_prompt = ASTROLOGER_PROMPT.format(
-                name=session.get("name") or "Friend",
-                language=language, dob=session.get("dob") or "Not provided",
-                birth_time=session.get("birth_time") or "Not provided",
-                birth_place=session.get("birth_place") or "Not provided",
-                context=context_str or "No book context.", kundli_data=final_kundli_data,
-                user_memory=user_memory or "No prior topics discussed yet.",
-                consistency_note=consistency_note or "No specific conflict detected.",
-                dasha_timeline=dasha_timeline_str or "No timeline data available.",
-                response_contract=response_contract,
-                history=history_text, query=message_text
-            )
-            if repeat_hint:
-                astrologer_prompt += f"\n\n{repeat_hint}"
-
-            gen_temperature = 0.75 if repeat_hint else 0.6
-
-            full_text = ""
             try:
-                for token in llm_service.generate_stream(prompt=astrologer_prompt, temperature=gen_temperature):
-                    full_text += token
-                    yield {"type": "chunk", "text": token}
+                astrologer_prompt = self._build_astrologer_prompt(session, language, history_text, message_text, ctx)
+                full_text = self._generate_and_validate(
+                    session_id, session, astrologer_prompt, ctx["dasha_timeline_str"], ctx["evidence_vote"]
+                )
             except Exception as gen_err:
                 logger.error(f"Streaming generation failed: {gen_err}")
                 full_text = "Mujhe samajhne mein kuch pareshani ho gayi."
-                yield {"type": "chunk", "text": full_text}
+
+            # Simulated streaming: full_text is already validated/corrected
+            # at this point — chunking it out preserves a typing UI effect
+            # without ever showing the user a pre-correction sentence.
+            for chunk in self._chunk_text_for_streaming(full_text):
+                yield {"type": "chunk", "text": chunk}
 
             db.add_message(session_id, "assistant", full_text)
 
-            correction_note = ""
-            if is_astrology and not missing_fields:
-                try:
-                    verify_planets, verify_ascendant = [], None
-                    cached_raw_for_verify = session.get("kundli_raw")
-                    if cached_raw_for_verify:
-                        try:
-                            parsed_verify = json.loads(cached_raw_for_verify)
-                            verify_planets = parsed_verify.get("planets", [])
-                            verify_ascendant = parsed_verify.get("ascendant_sign")
-                        except Exception:
-                            pass
-
-                    claim_failures = validate_claims(
-                        full_text, dasha_timeline_str, evidence_vote,
-                        planets=verify_planets, ascendant_sign=verify_ascendant
-                    )
-                    if claim_failures:
-                        logger.warning(f"Claim validation found {len(claim_failures)} issue(s) in streamed response: {claim_failures}")
-                        correction_note = build_streamed_correction_note(claim_failures, language)
-                        if correction_note:
-                            full_text += correction_note
-                            yield {"type": "chunk", "text": correction_note}
-                            logger.info("Appended correction note to streamed response for chart-fact mismatch")
-
-                    specificity_score = compute_chart_specificity(full_text)
-                    if specificity_score["is_generic"]:
-                        logger.warning(f"[Specificity] streamed response flagged as generic: ratio={specificity_score['specificity_ratio']} (not corrected — log only)")
-                except Exception as validate_err:
-                    logger.error(f"Claim validation failed: {validate_err}")
-            if is_astrology and not missing_fields:
-                try:
-                    trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, full_text, query_understanding)
-                    db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
-                except Exception as trace_err:
-                    logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
-                self._update_topic_memory(session_id, session, topic, full_text)
+            try:
+                trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], full_text, ctx["query_understanding"])
+                db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
+            except Exception as trace_err:
+                logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
+            self._update_topic_memory(session_id, session, topic, full_text)
 
             suggestions = get_instant_suggestions(topic, language)
 
@@ -1254,10 +1387,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         response_text: str = "",
         query_understanding: Optional[Dict[str, Any]] = None,
     ) -> list:
-        """9-step trace: Query Understanding (LLM, incl. comparison/timing),
-        Classical Framework, Chart Factors, Personalized+Comparative
-        Evidence, Evidence Consensus, Dasha & Timing, Classical Evidence,
-        Evidence Synthesis, Chart-Specificity Check."""
+        """9-step trace: Query Understanding (LLM), Classical Framework,
+        Chart Factors, Personalized+Comparative Evidence, Evidence
+        Consensus, Dasha & Timing, Classical Evidence, Evidence Synthesis,
+        Chart-Specificity Check."""
         if not topic and not rag_hits and not (query_understanding and query_understanding.get("restated_intent")):
             return []
 
@@ -1272,16 +1405,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps = []
 
-            # STEP 1 — QUERY UNDERSTANDING (LLM)
             qu = query_understanding or {}
             life_area = qu.get("life_area", "")
             restated = qu.get("restated_intent", "")
             comparison = qu.get("comparison") or []
             requires_timing = qu.get("requires_timing", False)
             if restated:
+                topic_source = "LLM life_area (primary)" if (life_area and life_area.strip().lower() == topic) else "keyword fallback"
                 qu_detail = f"What the system understood you're asking:\n\"{restated}\""
                 if life_area:
                     qu_detail += f"\n\nLife area: {life_area}"
+                qu_detail += f"\n\nTopic used for chart analysis: {topic or 'none'} ({topic_source})"
                 if comparison:
                     qu_detail += f"\n\nComparing: {' vs '.join(comparison)}"
                 qu_detail += f"\n\nTiming/Dasha relevant: {'Yes' if requires_timing else 'No'}"
@@ -1292,7 +1426,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 )
             steps.append({"step": 1, "title": "Query Understanding", "detail": qu_detail, "type": "query_understanding"})
 
-            # STEP 2 — CLASSICAL FRAMEWORK RETRIEVED
             framework_lines = []
             if houses:
                 house_labels = []
@@ -1321,7 +1454,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps.append({"step": 2, "title": "Classical Framework Retrieved", "detail": framework_detail, "type": "rag"})
 
-            # STEP 3 — RELEVANT CHART FACTORS
             if targeted_facts:
                 chart_detail = (
                     "The user's Kundli was examined for the factors identified by the retrieved classical sources.\n\n"
@@ -1332,7 +1464,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps.append({"step": 3, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
 
-            # STEP 4 — PERSONALIZED + COMPARATIVE EVIDENCE RETRIEVED
             personalized_hits = [hit for hit in rag_hits if hit.get("stage") == "personalized"]
             comparison_hits_trace = [hit for hit in rag_hits if hit.get("stage") == "comparison"]
 
@@ -1369,7 +1500,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             evidence_detail_step4 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or comparative evidence was retrieved."
             steps.append({"step": 4, "title": "Personalized + Comparative Evidence Retrieved", "detail": evidence_detail_step4, "type": "personalized_rag"})
 
-            # STEP 5 — EVIDENCE CONSENSUS
             consensus_label = None
             evidence_vote = None
             consistency = ""
@@ -1422,10 +1552,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 if verdict:
                     consensus_lines.append(f"• Verdict: {verdict}")
 
-            # FIX: flag when this confidence is chart/Dasha/Yoga-only, since
-            # rag_hits (classical text evidence) is empty for this specific
-            # turn — prevents "HIGH confidence" reading as if it were backed
-            # by retrieved book passages when it wasn't.
             if not rag_hits:
                 consensus_lines.append(
                     "\nNote: No classical text evidence was retrieved for this specific question. "
@@ -1438,7 +1564,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps.append({"step": 5, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
 
-            # STEP 6 — DASHA & TIMING
             dasha_detail = ""
             try:
                 cached_dasha = session.get("kundli_dasha")
@@ -1460,7 +1585,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps.append({"step": 6, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
 
-            # STEP 7 — CLASSICAL EVIDENCE
             reference_lines = []
             seen_references = set()
             for hit in rag_hits:
@@ -1487,14 +1611,13 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             evidence_detail_step7 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
             steps.append({"step": 7, "title": "Classical Evidence", "detail": evidence_detail_step7, "type": "evidence"})
 
-            # STEP 8 — EVIDENCE SYNTHESIS
             synthesis_detail = (
-                "The final interpretation combines the retrieved classical evidence, comparative "
-                "branch analysis (if applicable), and the relevant Kundli and Dasha information."
+                "The final interpretation combines the retrieved classical evidence, verified chart "
+                "placements, comparative branch analysis (if applicable), current-date temporal "
+                "filtering, and the relevant Kundli and Dasha information."
             )
             steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 
-            # STEP 9 — CHART-SPECIFICITY CHECK
             specificity_lines = []
 
             if response_text:

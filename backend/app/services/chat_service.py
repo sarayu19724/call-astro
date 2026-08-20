@@ -1134,16 +1134,19 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 retry_prompt += "\n\n" + specificity_correction
             if temporal_correction:
                 retry_prompt += "\n\n" + temporal_correction
-
+            
             response_text = llm_service.generate(prompt=retry_prompt, temperature=0.75)
 
-            remaining_claims = validate_claims(response_text, dasha_timeline_str, evidence_vote)
+            remaining_claims = validate_claims(
+                response_text, dasha_timeline_str, evidence_vote,
+                planets=verify_planets, ascendant_sign=verify_ascendant
+            )
             remaining_temporal = self._check_past_date_claims(response_text)
             if remaining_claims:
                 logger.warning(f"Claim validation still found {len(remaining_claims)} issue(s) after regeneration")
             if remaining_temporal:
                 logger.warning("Temporal check still found a past-as-upcoming date after regeneration")
-
+            
         return response_text
 
     # ------------------------------------------------------------------

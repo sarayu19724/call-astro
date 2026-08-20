@@ -1399,49 +1399,83 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 astrologer_prompt += f"\n\n{repeat_hint}"
 
             gen_temperature = 0.75 if repeat_hint else 0.6
+            
+                        # --- Pre-validation stage (silent, before anything reaches the user) ---
+            # Generate a DRAFT non-streamed first. If it contains a chart-fact
+            # error, regenerate a CORRECTED draft (still non-streamed). Only
+            # the final, validated text ever gets streamed to the user — no
+            # "wrong claim + patched note" pattern.
+            verify_planets, verify_ascendant = [], None
+            cached_raw_for_verify = session.get("kundli_raw")
+            if cached_raw_for_verify:
+                try:
+                    parsed_verify = json.loads(cached_raw_for_verify)
+                    verify_planets = parsed_verify.get("planets", [])
+                    verify_ascendant = parsed_verify.get("ascendant_sign")
+                except Exception:
+                    pass
 
+            final_prompt = astrologer_prompt
             full_text = ""
-            try:
-                for token in llm_service.generate_stream(prompt=astrologer_prompt, temperature=gen_temperature):
-                    full_text += token
-                    yield {"type": "chunk", "text": token}
-            except Exception as gen_err:
-                logger.error(f"Streaming generation failed: {gen_err}")
-                full_text = "Mujhe samajhne mein kuch pareshani ho gayi."
+
+            if is_astrology and not missing_fields:
+                try:
+                    draft_text = llm_service.generate(prompt=astrologer_prompt, temperature=gen_temperature)
+                    draft_failures = validate_claims(
+                        draft_text, dasha_timeline_str, evidence_vote,
+                        planets=verify_planets, ascendant_sign=verify_ascendant
+                    )
+                    draft_specificity = compute_chart_specificity(draft_text)
+                    draft_spec_correction = build_specificity_correction(draft_specificity)
+
+                    if draft_failures or draft_spec_correction:
+                        logger.info(f"[StreamPreValidation] Draft failed validation ({len(draft_failures)} claim issue(s), generic={bool(draft_spec_correction)}) — regenerating corrected version before streaming")
+                        if draft_failures:
+                            final_prompt += "\n\n" + build_claim_correction_instructions(draft_failures)
+                        if draft_spec_correction:
+                            final_prompt += "\n\n" + draft_spec_correction
+                    else:
+                        # Draft was already correct — reuse it directly instead
+                        # of generating twice for no reason.
+                        full_text = draft_text
+                except Exception as draft_err:
+                    logger.warning(f"[StreamPreValidation] Draft generation/validation failed, proceeding without pre-check: {draft_err}")
+
+            if not full_text:
+                try:
+                    for token in llm_service.generate_stream(prompt=final_prompt, temperature=gen_temperature):
+                        full_text += token
+                        yield {"type": "chunk", "text": token}
+                except Exception as gen_err:
+                    logger.error(f"Streaming generation failed: {gen_err}")
+                    full_text = "Mujhe samajhne mein kuch pareshani ho gayi."
+                    yield {"type": "chunk", "text": full_text}
+            else:
+                # Draft was already valid — stream it in one shot (still one
+                # "chunk" event so the frontend renders it the same way).
                 yield {"type": "chunk", "text": full_text}
 
             db.add_message(session_id, "assistant", full_text)
 
-            correction_note = ""
+            # Final check, log-only — the pre-validation above should have
+            # caught real errors already; this just confirms and records
+            # whether anything still slipped through.
             if is_astrology and not missing_fields:
                 try:
-                    verify_planets, verify_ascendant = [], None
-                    cached_raw_for_verify = session.get("kundli_raw")
-                    if cached_raw_for_verify:
-                        try:
-                            parsed_verify = json.loads(cached_raw_for_verify)
-                            verify_planets = parsed_verify.get("planets", [])
-                            verify_ascendant = parsed_verify.get("ascendant_sign")
-                        except Exception:
-                            pass
-
-                    claim_failures = validate_claims(
+                    remaining_failures = validate_claims(
                         full_text, dasha_timeline_str, evidence_vote,
                         planets=verify_planets, ascendant_sign=verify_ascendant
                     )
-                    if claim_failures:
-                        logger.warning(f"Claim validation found {len(claim_failures)} issue(s) in streamed response: {claim_failures}")
-                        correction_note = build_streamed_correction_note(claim_failures, language)
-                        if correction_note:
-                            full_text += correction_note
-                            yield {"type": "chunk", "text": correction_note}
-                            logger.info("Appended correction note to streamed response for chart-fact mismatch")
+                    if remaining_failures:
+                        logger.warning(f"[StreamPreValidation] Claim issues STILL present after pre-validation regeneration (not corrected further): {remaining_failures}")
 
                     specificity_score = compute_chart_specificity(full_text)
                     if specificity_score["is_generic"]:
-                        logger.warning(f"[Specificity] streamed response flagged as generic: ratio={specificity_score['specificity_ratio']} (not corrected — log only)")
+                        logger.warning(f"[Specificity] final streamed response still flagged as generic: ratio={specificity_score['specificity_ratio']}")
                 except Exception as validate_err:
-                    logger.error(f"Claim validation failed: {validate_err}")
+                    logger.error(f"Final claim validation check failed: {validate_err}")
+            
+            
             if is_astrology and not missing_fields:
                 try:
                     trace = self._build_reasoning_trace(session, topic, rag_hits, targeted_facts, full_text, query_understanding)

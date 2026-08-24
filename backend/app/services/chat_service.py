@@ -26,15 +26,22 @@ from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
 
 
-TOPIC_BUNDLE_LOGIC_VERSION = 2
+TOPIC_BUNDLE_LOGIC_VERSION = 3  # bumped: "timeline" removed from bundle, now computed separately (timing-gated)
 FRAMEWORK_CACHE_VERSION = 1
 
 # Evidence Ranking + Dedup — chunks scoring above this similarity to a
 # higher-scored chunk in the same batch are dropped as near-duplicates.
 DEDUP_SIMILARITY_THRESHOLD = 0.90
-FRAMEWORK_MAX_HITS = 6
-PERSONALIZED_MAX_HITS = 6
-COMPARISON_MAX_HITS_PER_BRANCH = 3
+
+# Base retrieval depth — adjusted per-question by _compute_retrieval_depth()
+FRAMEWORK_MAX_HITS_BASE = 6
+PERSONALIZED_MAX_HITS_BASE = 6
+COMPARISON_MAX_HITS_PER_BRANCH_BASE = 3
+
+# Adaptive depth bounds — never retrieve fewer than MIN or more than MAX,
+# regardless of computed complexity multiplier.
+DEPTH_MIN_HITS = 3
+DEPTH_MAX_HITS = 12
 
 MONTH_NAME_TO_NUM = {
     'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
@@ -186,15 +193,59 @@ class ChatService:
             yield ' '.join(buf)
 
     # ------------------------------------------------------------------
+    # ADAPTIVE RAG DEPTH — scales how much evidence gets retrieved based
+    # on question complexity, instead of a fixed depth for every question.
+    # ------------------------------------------------------------------
+    def _compute_retrieval_depth(self, message_text: str, query_understanding: Dict[str, Any]) -> Dict[str, int]:
+        """Returns per-question retrieval depth. A simple factual question
+        ("what is my ascendant meaning") gets a shallow, fast retrieval; a
+        multi-option comparison with timing gets a deeper one. This is a
+        heuristic complexity score, not a precise cost model — the goal is
+        to avoid wasting retrieval budget on easy questions and under-
+        serving genuinely complex ones."""
+        comparison = query_understanding.get("comparison") or []
+        requires_timing = bool(query_understanding.get("requires_timing"))
+        life_area = (query_understanding.get("life_area") or "").strip().lower()
+        word_count = len(message_text.split())
+
+        complexity = 1.0  # baseline multiplier
+
+        if len(comparison) >= 2:
+            complexity += 0.6  # comparisons genuinely need more evidence per branch
+        if requires_timing:
+            complexity += 0.3
+        if word_count > 18:
+            complexity += 0.3  # longer questions tend to bundle multiple sub-asks
+        if not life_area or life_area == "general":
+            complexity -= 0.3  # unclassified/general questions rarely need deep retrieval
+
+        complexity = max(0.5, min(complexity, 2.0))  # clamp multiplier range
+
+        def _scaled(base: int) -> int:
+            return max(DEPTH_MIN_HITS, min(DEPTH_MAX_HITS, round(base * complexity)))
+
+        depth = {
+            "framework_max": _scaled(FRAMEWORK_MAX_HITS_BASE),
+            "personalized_max": _scaled(PERSONALIZED_MAX_HITS_BASE),
+            "comparison_max_per_branch": _scaled(COMPARISON_MAX_HITS_PER_BRANCH_BASE),
+            "complexity": round(complexity, 2),
+        }
+        logger.info(
+            f"[AdaptiveDepth] complexity={depth['complexity']} "
+            f"(comparison={len(comparison)}, timing={requires_timing}, words={word_count}, life_area='{life_area}') "
+            f"-> framework={depth['framework_max']}, personalized={depth['personalized_max']}, "
+            f"comparison_per_branch={depth['comparison_max_per_branch']}"
+        )
+        return depth
+
+    # ------------------------------------------------------------------
     # EVIDENCE RANKING + SEMANTIC DEDUPLICATION
     # ------------------------------------------------------------------
     def _rank_and_dedupe_hits(self, hits: List[Dict[str, Any]], max_hits: int) -> List[Dict[str, Any]]:
         """Sorts hits by score (highest first), then walks the list keeping
         each hit only if it's not a near-duplicate (text similarity above
         DEDUP_SIMILARITY_THRESHOLD) of an already-kept, higher-scored hit.
-        Caps the result at max_hits. Two chunks from different pages that
-        say almost the same thing collapse into one — the higher-scoring
-        one wins."""
+        Caps the result at max_hits."""
         if not hits:
             return []
 
@@ -606,6 +657,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             life_area = qu.get("life_area") or ""
             comparison = qu.get("comparison") or []
 
+            # Adaptive RAG depth — compute once per question, use throughout
+            depth = self._compute_retrieval_depth(message_text, qu)
+
             preferred_sources = TOPIC_RELEVANT_BOOKS.get(topic) if topic else None
             seen_keys: set = set()
 
@@ -633,8 +687,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     query_vector_topic=self.embeddings_provider.get_embedding(framework_query),
                     query_vector_global=self.embeddings_provider.get_embedding(message_text),
                     preferred_sources=preferred_sources,
-                    top_k_each=6,
-                    final_top_k=settings.TOP_K_RETRIEVAL,
+                    top_k_each=depth["framework_max"],
+                    final_top_k=depth["framework_max"],
                     alpha=settings.HYBRID_ALPHA,
                 )
                 framework_hits_raw = [h for h in framework_hits_raw if h["score"] >= settings.MIN_RAG_RELEVANCE]
@@ -654,8 +708,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                             "text": hit["text"], "stage": "framework",
                         })
 
-                    # Evidence Ranking + Semantic Dedup — before formatting/caching
-                    framework_rag_hits = self._rank_and_dedupe_hits(pre_dedup_hits, FRAMEWORK_MAX_HITS)
+                    framework_rag_hits = self._rank_and_dedupe_hits(pre_dedup_hits, depth["framework_max"])
 
                     for i, hit in enumerate(framework_rag_hits):
                         seen_keys.add((hit["source"], hit["page"]))
@@ -687,7 +740,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         branch_vector = self.embeddings_provider.get_embedding(branch_query)
                         branch_results = vector_store.hybrid_search(
                             query=branch_query, query_vector=branch_vector,
-                            top_k=4, alpha=settings.HYBRID_ALPHA
+                            top_k=depth["comparison_max_per_branch"] + 1,  # small headroom before dedup
+                            alpha=settings.HYBRID_ALPHA
                         )
                     except Exception as e:
                         logger.error(f"[Comparison] retrieval failed for branch '{branch}': {e}")
@@ -707,7 +761,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                             "text": hit["text"], "stage": "comparison", "branch": branch,
                         })
 
-                    branch_rag_hits = self._rank_and_dedupe_hits(branch_rag_hits_raw, COMPARISON_MAX_HITS_PER_BRANCH)
+                    branch_rag_hits = self._rank_and_dedupe_hits(branch_rag_hits_raw, depth["comparison_max_per_branch"])
                     for hit in branch_rag_hits:
                         seen_keys.add((hit["source"], hit["page"]))
                         comparison_hits.append(hit)
@@ -736,8 +790,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 query_vector_topic=personalized_vector,
                 query_vector_global=personalized_vector,
                 preferred_sources=preferred_sources,
-                top_k_each=8,
-                final_top_k=settings.TOP_K_RETRIEVAL,
+                top_k_each=depth["personalized_max"] + 2,  # headroom before dedup
+                final_top_k=depth["personalized_max"] + 2,
                 alpha=settings.HYBRID_ALPHA,
             )
             personalized_hits_raw = [h for h in personalized_hits_raw if h["score"] >= settings.MIN_RAG_RELEVANCE]
@@ -754,8 +808,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     "text": hit["text"], "stage": "personalized",
                 })
 
-            # Evidence Ranking + Semantic Dedup
-            personalized_rag_hits = self._rank_and_dedupe_hits(pre_dedup_personalized, PERSONALIZED_MAX_HITS)
+            personalized_rag_hits = self._rank_and_dedupe_hits(pre_dedup_personalized, depth["personalized_max"])
 
             personalized_chunks = []
             for i, hit in enumerate(personalized_rag_hits):
@@ -784,7 +837,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             context = "\n".join(p for p in context_parts if p) or "No reference available."
 
             logger.info(
-                f"[RAGFirst] framework_cached={bool(framework_cached)}, "
+                f"[RAGFirst] framework_cached={bool(framework_cached)}, depth_complexity={depth['complexity']}, "
                 f"comparison={len(comparison_hits)}, personalized={len(personalized_rag_hits)}"
             )
 
@@ -896,7 +949,13 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             logger.error(f"Failed to save topic cache for '{topic}': {e}")
 
     def _get_topic_bundle(self, session_id: str, session: Dict, topic: Optional[str], language: str) -> Dict[str, Any]:
-        empty = {"emphasis": "", "divisional": "", "consistency": "", "missing_evidence": "", "timeline": "", "evidence_vote": None, "consensus_label": "LOW"}
+        """NOTE: 'timeline' is deliberately NOT part of this bundle anymore —
+        it's computed separately in _prepare_common_context, gated by
+        requires_timing (see Timing-Gated Dasha Retrieval), since whether a
+        Dasha timeline is needed depends on the CURRENT message, not on the
+        topic alone, and shouldn't be permanently baked into a per-topic
+        cache entry."""
+        empty = {"emphasis": "", "divisional": "", "consistency": "", "missing_evidence": "", "evidence_vote": None, "consensus_label": "LOW"}
         if not topic:
             return empty
 
@@ -947,8 +1006,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         )
 
                 bundle["missing_evidence"] = build_missing_evidence_note(topic, planets, ascendant_sign, dasha_info, bundle["divisional"])
-
-            bundle["timeline"] = self._get_dasha_timeline(session_id, session, topic, language)
         except Exception as e:
             logger.error(f"Topic bundle build failed for '{topic}': {e}", exc_info=True)
 
@@ -1121,7 +1178,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
         yoga_text = self._get_yoga_text(session)
 
-        topic_emphasis = divisional_text = consistency_note = missing_evidence = dasha_timeline_str = ""
+        topic_emphasis = divisional_text = consistency_note = missing_evidence = ""
         evidence_vote = None
         if topic:
             bundle = self._get_topic_bundle(session_id, session, topic, language)
@@ -1129,8 +1186,21 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             divisional_text = bundle["divisional"]
             consistency_note = bundle["consistency"]
             missing_evidence = bundle["missing_evidence"]
-            dasha_timeline_str = bundle["timeline"]
             evidence_vote = bundle.get("evidence_vote")
+
+        # --- TIMING-GATED DASHA RETRIEVAL ---
+        # Only fetch/build the Dasha timeline (and, on a cold session, trigger
+        # the external Dasha API call it depends on) when the query-
+        # understanding step actually flagged this question as needing
+        # timing. A "what does my 10th house mean" question never touches
+        # this; a "when will I get a job" question does.
+        dasha_timeline_str = ""
+        requires_timing = bool(query_understanding.get("requires_timing"))
+        if topic and requires_timing:
+            dasha_timeline_str = self._get_dasha_timeline(session_id, session, topic, language)
+            logger.info(f"[TimingGate] requires_timing=True — Dasha timeline fetched/reused for topic '{topic}'")
+        else:
+            logger.info(f"[TimingGate] requires_timing={requires_timing}, topic={topic} — skipping Dasha timeline retrieval")
 
         final_kundli_data = self._build_final_kundli_data(kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence)
         if targeted_facts:
@@ -1496,6 +1566,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 if comparison:
                     qu_detail += f"\n\nComparing: {' vs '.join(comparison)}"
                 qu_detail += f"\n\nTiming/Dasha relevant: {'Yes' if requires_timing else 'No'}"
+                if not requires_timing:
+                    qu_detail += " (Dasha timeline retrieval was skipped for this question — see 'Timing-Gated Retrieval' note in Dasha & Timing step)"
             else:
                 qu_detail = (
                     "Query understanding was not available for this response — "
@@ -1555,7 +1627,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     seen_p.add(key)
                     ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
                     p_sources.append(f"• {ref}")
-                evidence_lines.append("Personalized retrieval (using chart configuration, ranked & deduplicated):")
+                evidence_lines.append("Personalized retrieval (using chart configuration, ranked, deduplicated, adaptive depth):")
                 evidence_lines.extend(p_sources)
 
             if comparison_hits_trace:
@@ -1660,6 +1732,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if not dasha_detail:
                 dasha_detail = "Current Dasha information was not available in the cached chart data."
 
+            timeline_note = (
+                "\n\n(Timing-Gated Retrieval: the full upcoming Dasha timeline was only fetched/used "
+                "because this question was classified as requiring timing — otherwise this step is skipped "
+                "to avoid an unnecessary external Dasha API call.)"
+                if (query_understanding or {}).get("requires_timing")
+                else "\n\n(Timing-Gated Retrieval: this question wasn't classified as needing timing, so the "
+                     "full upcoming Dasha timeline retrieval was skipped — only the current Mahadasha/Antardasha "
+                     "above, already cached from the Kundli fetch, is shown.)"
+            )
+            dasha_detail += timeline_note
+
             steps.append({"step": 6, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
 
             reference_lines = []
@@ -1686,13 +1769,13 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 reference_lines.append(f"• {reference}")
 
             evidence_detail_step7 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
-            steps.append({"step": 7, "title": "Classical Evidence (Ranked & Deduplicated)", "detail": evidence_detail_step7, "type": "evidence"})
+            steps.append({"step": 7, "title": "Classical Evidence (Ranked, Deduplicated, Adaptive Depth)", "detail": evidence_detail_step7, "type": "evidence"})
 
             synthesis_detail = (
-                "The final interpretation combines the retrieved classical evidence (ranked and "
-                "deduplicated to remove near-identical chunks), verified chart placements, comparative "
-                "branch analysis (if applicable), current-date temporal filtering, and the relevant "
-                "Kundli and Dasha information."
+                "The final interpretation combines the retrieved classical evidence (ranked, deduplicated, "
+                "and depth-scaled to this question's complexity), verified chart placements, comparative "
+                "branch analysis (if applicable), timing-gated Dasha data (only when actually needed), "
+                "current-date temporal filtering, and the relevant Kundli and Dasha information."
             )
             steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 

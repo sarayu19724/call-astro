@@ -26,18 +26,22 @@ from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
 
 
-# Bump whenever the logic feeding a topic bundle changes (evidence vote
-# computation, consensus labeling, consistency checks). A cached bundle
-# written under an older version is a miss and gets recomputed — this is
-# what prevents a topic bundle that failed to fully compute once (e.g. a
-# transient error mid-build) from staying cached incomplete for the rest
-# of the session.
 TOPIC_BUNDLE_LOGIC_VERSION = 2
+FRAMEWORK_CACHE_VERSION = 1
+
+# Evidence Ranking + Dedup — chunks scoring above this similarity to a
+# higher-scored chunk in the same batch are dropped as near-duplicates.
+DEDUP_SIMILARITY_THRESHOLD = 0.90
+FRAMEWORK_MAX_HITS = 6
+PERSONALIZED_MAX_HITS = 6
+COMPARISON_MAX_HITS_PER_BRANCH = 3
 
 MONTH_NAME_TO_NUM = {
     'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
     'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12,
 }
+
+COMPARISON_HINT_WORDS = (" or ", " ya ", " vs ", " versus ", "अथवा", " ki jagah ", " nahi to ")
 
 
 class ChatService:
@@ -67,10 +71,6 @@ class ChatService:
             except ValueError:
                 return time_str
 
-    # ------------------------------------------------------------------
-    # ISSUE-FIX: Temporal grounding (current date + rule against
-    # presenting a past period as upcoming).
-    # ------------------------------------------------------------------
     def _build_temporal_context(self) -> str:
         today_str = datetime.now().strftime("%d %B %Y")
         return (
@@ -89,17 +89,6 @@ class ChatService:
             "current period continues that trend'), just never framed as something yet to happen."
         )
 
-    # ------------------------------------------------------------------
-    # ISSUE A FIX: deterministic past-date detector. Separate from
-    # claim_validator.py (not available to edit here) — scans the actual
-    # generated text for a year, or month+year, that has already passed
-    # relative to the real current date, and flags it for correction.
-    # This is intentionally strict/simple (regex-based) rather than
-    # trying to parse every possible date phrasing — false negatives
-    # (a missed past-date mention) are acceptable, false positives
-    # (flagging a correctly-future date) are not, so it only fires on
-    # clear year/month-year matches.
-    # ------------------------------------------------------------------
     def _check_past_date_claims(self, response_text: str) -> Optional[str]:
         if not response_text:
             return None
@@ -149,12 +138,6 @@ class ChatService:
             "as genuine future predictions."
         )
 
-    # ------------------------------------------------------------------
-    # ISSUE B FIX: hard constraint block listing the REAL verified chart
-    # placements, so the LLM can't blend a classical RAG example's
-    # hypothetical placement ("if Mercury is in the 10th house...") with
-    # the user's actual chart.
-    # ------------------------------------------------------------------
     def _build_verified_chart_block(self, session: Dict) -> str:
         cached_raw = session.get("kundli_raw")
         if not cached_raw:
@@ -192,12 +175,6 @@ class ChatService:
         )
 
     def _chunk_text_for_streaming(self, text: str, words_per_chunk: int = 6):
-        """Splits already-generated (and already-validated) text into
-        small word groups so the client still gets a progressive typing
-        effect, even though the underlying generation is no longer
-        streamed token-by-token. See process_chat_message_stream — this
-        exists specifically so a validated/corrected response can still
-        feel like it's streaming."""
         words = text.split(' ')
         buf: List[str] = []
         for w in words:
@@ -207,6 +184,43 @@ class ChatService:
                 buf = []
         if buf:
             yield ' '.join(buf)
+
+    # ------------------------------------------------------------------
+    # EVIDENCE RANKING + SEMANTIC DEDUPLICATION
+    # ------------------------------------------------------------------
+    def _rank_and_dedupe_hits(self, hits: List[Dict[str, Any]], max_hits: int) -> List[Dict[str, Any]]:
+        """Sorts hits by score (highest first), then walks the list keeping
+        each hit only if it's not a near-duplicate (text similarity above
+        DEDUP_SIMILARITY_THRESHOLD) of an already-kept, higher-scored hit.
+        Caps the result at max_hits. Two chunks from different pages that
+        say almost the same thing collapse into one — the higher-scoring
+        one wins."""
+        if not hits:
+            return []
+
+        ranked = sorted(hits, key=lambda h: h.get("score", 0), reverse=True)
+        kept: List[Dict[str, Any]] = []
+
+        for hit in ranked:
+            text = (hit.get("text") or "").strip().lower()
+            is_duplicate = False
+            for kept_hit in kept:
+                kept_text = (kept_hit.get("text") or "").strip().lower()
+                if not text or not kept_text:
+                    continue
+                similarity = SequenceMatcher(None, text, kept_text).ratio()
+                if similarity >= DEDUP_SIMILARITY_THRESHOLD:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                kept.append(hit)
+            if len(kept) >= max_hits:
+                break
+
+        if len(hits) > len(kept):
+            logger.info(f"[EvidenceRank] {len(hits)} hits -> {len(kept)} after ranking+dedup (max={max_hits})")
+
+        return kept
 
     def _fetch_and_cache_kundli(self, session_id: str, session: Dict) -> str:
         try:
@@ -249,6 +263,7 @@ class ChatService:
                     "longitude": lon,
                     "yoga_text": yoga_text,
                     "topic_cache": None,
+                    "framework_cache": None,
                     "dasha_tree_raw": None,
                 }
                 db.update_session(session_id, updates)
@@ -307,12 +322,6 @@ class ChatService:
             return "No reference available.", []
 
     def _understand_query_intent(self, message_text: str, history_text: str) -> Dict[str, Any]:
-        """LLM-based query understanding — runs BEFORE topic resolution
-        and BEFORE RAG. This is now the PRIMARY source for topic
-        ('life_area') — see _resolve_topic(). classify_topic() (keyword-
-        based) only runs as a fallback when this call fails or returns an
-        unrecognized area. Once resolved, `topic` is used consistently
-        everywhere downstream — nothing re-runs classify_topic()."""
         prompt = f"""You are a query-understanding layer for a Vedic astrology assistant.
 Do NOT answer the astrology question and do NOT name any houses, planets, or astrological rules.
 Only restate what the user is asking about in plain language, and classify its structure.
@@ -369,23 +378,58 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             logger.warning(f"Query-understanding LLM call failed, falling back to keyword topic: {e}")
             return default
 
+    def _get_intent_cache(self, session: Dict) -> Optional[Dict]:
+        raw = session.get("intent_cache")
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def _save_intent_cache(self, session_id: str, session: Dict, query_understanding: Dict[str, Any], fast_topic: Optional[str]):
+        try:
+            entry = dict(query_understanding)
+            entry["fast_topic"] = fast_topic
+            entry_json = json.dumps(entry, ensure_ascii=False)
+            db.update_session(session_id, {"intent_cache": entry_json})
+            session["intent_cache"] = entry_json
+        except Exception as e:
+            logger.error(f"Failed to save intent cache: {e}")
+
+    def _get_query_understanding_cached(self, session_id: str, message_text: str, history_text: str, session: Dict) -> Dict[str, Any]:
+        fast_topic = classify_topic(message_text)
+        cached = self._get_intent_cache(session)
+        looks_comparative = any(w in f" {message_text.lower()} " for w in COMPARISON_HINT_WORDS)
+
+        if cached and fast_topic and cached.get("fast_topic") == fast_topic and not looks_comparative:
+            logger.info(f"[IntentCache] HIT — reusing cached intent for topic '{fast_topic}' (LLM call skipped)")
+            return {
+                "life_area": cached.get("life_area", fast_topic),
+                "restated_intent": cached.get("restated_intent", ""),
+                "comparison": [],
+                "requires_timing": cached.get("requires_timing", False),
+            }
+
+        logger.info(
+            f"[IntentCache] MISS (fast_topic='{fast_topic}', "
+            f"cached_topic='{cached.get('fast_topic') if cached else None}', "
+            f"comparative={looks_comparative}) — calling LLM"
+        )
+        query_understanding = self._understand_query_intent(message_text, history_text)
+        self._save_intent_cache(session_id, session, query_understanding, fast_topic)
+        return query_understanding
+
     def _resolve_topic(self, message_text: str, query_understanding: Dict[str, Any]) -> Optional[str]:
-        """ISSUE D FIX — PRIMARY topic resolution: uses the LLM's life_area
-        if it matches a known TOPIC_CHART_FACTORS key. classify_topic()
-        (keyword-based) is used ONLY as a fallback when life_area is
-        missing, 'general', or doesn't match a known key. This is the
-        single resolution point — _get_topic_bundle, _build_reasoning_trace,
-        and evidence voting all consume the SAME resulting value; nothing
-        downstream calls classify_topic() again independently."""
         life_area = (query_understanding.get("life_area") or "").strip().lower()
 
         if life_area and life_area in TOPIC_CHART_FACTORS:
-            logger.info(f"[TopicResolution] using LLM life_area='{life_area}' as topic (primary)")
+            logger.info(f"[TopicResolution] using life_area='{life_area}' as topic (primary)")
             return life_area
 
         fallback = classify_topic(message_text)
         logger.info(
-            f"[TopicResolution] LLM life_area='{life_area or 'none'}' not in TOPIC_CHART_FACTORS — "
+            f"[TopicResolution] life_area='{life_area or 'none'}' not in TOPIC_CHART_FACTORS — "
             f"falling back to keyword classify_topic()='{fallback}'"
         )
         return fallback
@@ -520,7 +564,41 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             parts.append(targeted_facts)
         return " ".join(p for p in parts if p).strip()
 
-    def _get_rag_first_context(self, message_text: str, topic: Optional[str], session: Dict, query_understanding: Optional[Dict[str, Any]] = None):
+    def _get_framework_cache(self, session: Dict, topic: str) -> Optional[Dict]:
+        raw = session.get("framework_cache")
+        if not raw:
+            return None
+        try:
+            cache = json.loads(raw)
+            entry = cache.get(topic)
+            if not entry or entry.get("_version") != FRAMEWORK_CACHE_VERSION:
+                return None
+            return entry
+        except Exception:
+            return None
+
+    def _save_framework_cache(self, session_id: str, session: Dict, topic: str,
+                                referenced: Dict[str, Set[str]], targeted_facts: str, framework_context: str):
+        try:
+            raw = session.get("framework_cache")
+            cache = json.loads(raw) if raw else {}
+            cache[topic] = {
+                "_version": FRAMEWORK_CACHE_VERSION,
+                "houses": sorted(referenced.get("houses", set()), key=lambda x: int(x)),
+                "planets": sorted(referenced.get("planets", set())),
+                "charts": sorted(referenced.get("charts", set())),
+                "concepts": sorted(referenced.get("concepts", set())),
+                "targeted_facts": targeted_facts,
+                "framework_context": framework_context,
+            }
+            cache_json = json.dumps(cache, ensure_ascii=False)
+            db.update_session(session_id, {"framework_cache": cache_json})
+            session["framework_cache"] = cache_json
+        except Exception as e:
+            logger.error(f"Failed to save framework cache for '{topic}': {e}")
+
+    def _get_rag_first_context(self, session_id: str, message_text: str, topic: Optional[str], session: Dict,
+                                 query_understanding: Optional[Dict[str, Any]] = None):
         try:
             from app.services.topic_service import TOPIC_RELEVANT_BOOKS
 
@@ -528,55 +606,77 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             life_area = qu.get("life_area") or ""
             comparison = qu.get("comparison") or []
 
-            framework_query = self._build_framework_query(message_text, topic, life_area)
             preferred_sources = TOPIC_RELEVANT_BOOKS.get(topic) if topic else None
+            seen_keys: set = set()
 
-            framework_hits = vector_store.dual_retrieve(
-                topic_query=framework_query,
-                global_query=message_text,
-                query_vector_topic=self.embeddings_provider.get_embedding(framework_query),
-                query_vector_global=self.embeddings_provider.get_embedding(message_text),
-                preferred_sources=preferred_sources,
-                top_k_each=6,
-                final_top_k=settings.TOP_K_RETRIEVAL,
-                alpha=settings.HYBRID_ALPHA,
-            )
-
-            framework_hits = [h for h in framework_hits if h["score"] >= settings.MIN_RAG_RELEVANCE]
-
+            framework_cached = self._get_framework_cache(session, topic) if topic else None
             framework_rag_hits: List[Dict[str, Any]] = []
             framework_chunks: List[str] = []
-            seen_keys: set = set()
-            referenced: Dict[str, Set[str]] = {"houses": set(), "planets": set(), "charts": set(), "concepts": set()}
-            targeted_facts = ""
 
-            if not framework_hits:
-                logger.info("[RAGFirst] no sufficiently relevant framework chunks — continuing with comparison/personalized retrieval anyway")
+            if framework_cached:
+                logger.info(f"[FrameworkCache] HIT for topic '{topic}' — skipping framework RAG retrieval")
+                referenced: Dict[str, Set[str]] = {
+                    "houses": set(framework_cached.get("houses", [])),
+                    "planets": set(framework_cached.get("planets", [])),
+                    "charts": set(framework_cached.get("charts", [])),
+                    "concepts": set(framework_cached.get("concepts", [])),
+                }
+                targeted_facts = framework_cached.get("targeted_facts", "")
+                cached_context = framework_cached.get("framework_context", "")
+                if cached_context:
+                    framework_chunks.append(cached_context)
             else:
-                for i, hit in enumerate(framework_hits):
-                    source = hit["metadata"].get("source", "Unknown")
-                    page = hit["metadata"].get("page")
-                    seen_keys.add((source, page))
-                    page_label = f", Page: {page}" if page is not None else ""
-
-                    framework_chunks.append(
-                        f"--- Classical Principle {i+1} [Source: {source}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
-                    )
-                    framework_rag_hits.append({
-                        "source": source, "page": page, "score": hit["score"],
-                        "text": hit["text"], "stage": "framework",
-                    })
-
-                referenced = self._extract_referenced_factors(framework_rag_hits)
-                targeted_facts = self._build_targeted_kundli_facts(referenced, session)
-
-                logger.info(
-                    f"[RAGFirst] framework factors houses={referenced['houses']} "
-                    f"planets={referenced['planets']} charts={referenced['charts']} concepts={referenced['concepts']}"
+                framework_query = self._build_framework_query(message_text, topic, life_area)
+                framework_hits_raw = vector_store.dual_retrieve(
+                    topic_query=framework_query,
+                    global_query=message_text,
+                    query_vector_topic=self.embeddings_provider.get_embedding(framework_query),
+                    query_vector_global=self.embeddings_provider.get_embedding(message_text),
+                    preferred_sources=preferred_sources,
+                    top_k_each=6,
+                    final_top_k=settings.TOP_K_RETRIEVAL,
+                    alpha=settings.HYBRID_ALPHA,
                 )
+                framework_hits_raw = [h for h in framework_hits_raw if h["score"] >= settings.MIN_RAG_RELEVANCE]
 
-            if not targeted_facts:
-                targeted_facts = self._build_targeted_kundli_facts(referenced, session)
+                referenced = {"houses": set(), "planets": set(), "charts": set(), "concepts": set()}
+                targeted_facts = ""
+
+                if not framework_hits_raw:
+                    logger.info("[RAGFirst] no sufficiently relevant framework chunks — continuing with comparison/personalized retrieval anyway")
+                else:
+                    pre_dedup_hits = []
+                    for hit in framework_hits_raw:
+                        source = hit["metadata"].get("source", "Unknown")
+                        page = hit["metadata"].get("page")
+                        pre_dedup_hits.append({
+                            "source": source, "page": page, "score": hit["score"],
+                            "text": hit["text"], "stage": "framework",
+                        })
+
+                    # Evidence Ranking + Semantic Dedup — before formatting/caching
+                    framework_rag_hits = self._rank_and_dedupe_hits(pre_dedup_hits, FRAMEWORK_MAX_HITS)
+
+                    for i, hit in enumerate(framework_rag_hits):
+                        seen_keys.add((hit["source"], hit["page"]))
+                        page_label = f", Page: {hit['page']}" if hit["page"] is not None else ""
+                        framework_chunks.append(
+                            f"--- Classical Principle {i+1} [Source: {hit['source']}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
+                        )
+
+                    referenced = self._extract_referenced_factors(framework_rag_hits)
+                    targeted_facts = self._build_targeted_kundli_facts(referenced, session)
+
+                    logger.info(
+                        f"[RAGFirst] framework factors houses={referenced['houses']} "
+                        f"planets={referenced['planets']} charts={referenced['charts']} concepts={referenced['concepts']}"
+                    )
+
+                if not targeted_facts:
+                    targeted_facts = self._build_targeted_kundli_facts(referenced, session)
+
+                if topic:
+                    self._save_framework_cache(session_id, session, topic, referenced, targeted_facts, "\n".join(framework_chunks))
 
             comparison_hits: List[Dict[str, Any]] = []
             if len(comparison) >= 2:
@@ -593,7 +693,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         logger.error(f"[Comparison] retrieval failed for branch '{branch}': {e}")
                         continue
 
-                    branch_rag_hits = []
+                    branch_rag_hits_raw = []
                     for hit in branch_results:
                         if hit["score"] < settings.MIN_RAG_RELEVANCE:
                             continue
@@ -602,14 +702,15 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         key = (source, page)
                         if key in seen_keys:
                             continue
-                        seen_keys.add(key)
-                        comparison_hits.append({
+                        branch_rag_hits_raw.append({
                             "source": source, "page": page, "score": hit["score"],
                             "text": hit["text"], "stage": "comparison", "branch": branch,
                         })
-                        branch_rag_hits.append({
-                            "source": source, "page": page, "score": hit["score"], "text": hit["text"],
-                        })
+
+                    branch_rag_hits = self._rank_and_dedupe_hits(branch_rag_hits_raw, COMPARISON_MAX_HITS_PER_BRANCH)
+                    for hit in branch_rag_hits:
+                        seen_keys.add((hit["source"], hit["page"]))
+                        comparison_hits.append(hit)
 
                     if branch_rag_hits:
                         branch_referenced = self._extract_referenced_factors(branch_rag_hits)
@@ -629,7 +730,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts, life_area)
             personalized_vector = self.embeddings_provider.get_embedding(personalized_query)
 
-            personalized_hits = vector_store.dual_retrieve(
+            personalized_hits_raw = vector_store.dual_retrieve(
                 topic_query=personalized_query,
                 global_query=personalized_query,
                 query_vector_topic=personalized_vector,
@@ -639,28 +740,30 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 final_top_k=settings.TOP_K_RETRIEVAL,
                 alpha=settings.HYBRID_ALPHA,
             )
+            personalized_hits_raw = [h for h in personalized_hits_raw if h["score"] >= settings.MIN_RAG_RELEVANCE]
 
-            personalized_hits = [h for h in personalized_hits if h["score"] >= settings.MIN_RAG_RELEVANCE]
-
-            personalized_rag_hits = []
-            personalized_chunks = []
-
-            for i, hit in enumerate(personalized_hits):
+            pre_dedup_personalized = []
+            for hit in personalized_hits_raw:
                 source = hit["metadata"].get("source", "Unknown")
                 page = hit["metadata"].get("page")
                 key = (source, page)
                 if key in seen_keys:
                     continue
-                seen_keys.add(key)
-                page_label = f", Page: {page}" if page is not None else ""
-
-                personalized_chunks.append(
-                    f"--- Personalized Evidence {i+1} [Source: {source}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
-                )
-                personalized_rag_hits.append({
+                pre_dedup_personalized.append({
                     "source": source, "page": page, "score": hit["score"],
                     "text": hit["text"], "stage": "personalized",
                 })
+
+            # Evidence Ranking + Semantic Dedup
+            personalized_rag_hits = self._rank_and_dedupe_hits(pre_dedup_personalized, PERSONALIZED_MAX_HITS)
+
+            personalized_chunks = []
+            for i, hit in enumerate(personalized_rag_hits):
+                seen_keys.add((hit["source"], hit["page"]))
+                page_label = f", Page: {hit['page']}" if hit["page"] is not None else ""
+                personalized_chunks.append(
+                    f"--- Personalized Evidence {i+1} [Source: {hit['source']}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
+                )
 
             comparison_chunks = []
             for hit in comparison_hits:
@@ -681,7 +784,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             context = "\n".join(p for p in context_parts if p) or "No reference available."
 
             logger.info(
-                f"[RAGFirst] framework={len(framework_rag_hits)}, "
+                f"[RAGFirst] framework_cached={bool(framework_cached)}, "
                 f"comparison={len(comparison_hits)}, personalized={len(personalized_rag_hits)}"
             )
 
@@ -760,9 +863,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             logger.error(f"Follow-up RAG failed: {e}")
             return "", []
 
-    # ------------------------------------------------------------------
-    # Per-topic cache — versioned (see TOPIC_BUNDLE_LOGIC_VERSION above).
-    # ------------------------------------------------------------------
     def _get_topic_cache(self, session: Dict, topic: str) -> Optional[Dict]:
         raw = session.get("topic_cache")
         if not raw:
@@ -995,13 +1095,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
     def _prepare_common_context(self, session_id: str, message_text: str, history: List[Dict[str, str]],
                                   history_text: str, session: Dict, language: str):
-        """Shared by both non-streaming and streaming paths: query
-        understanding -> topic resolution -> RAG -> topic bundle -> final
-        prompt materials. Pulling this into one place guarantees the
-        streaming path can no longer drift out of sync with the
-        non-streaming path (ISSUE C's buffer-then-validate approach reuses
-        this directly instead of duplicating the whole block again)."""
-        query_understanding = self._understand_query_intent(message_text, history_text)
+        query_understanding = self._get_query_understanding_cached(session_id, message_text, history_text, session)
         logger.info(
             f"[QueryUnderstanding] life_area='{query_understanding['life_area']}' "
             f"restated='{query_understanding['restated_intent']}' "
@@ -1022,7 +1116,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         if self._is_followup_retrieval_question(message_text, history):
             context_str, rag_hits = self._get_followup_rag_context(message_text, topic, history)
         if not rag_hits:
-            context_str, rag_hits, targeted_facts = self._get_rag_first_context(message_text, topic, session, query_understanding)
+            context_str, rag_hits, targeted_facts = self._get_rag_first_context(session_id, message_text, topic, session, query_understanding)
         logger.info(f"[RAGPipeline] hits={len(rag_hits)} targeted_facts={'yes' if targeted_facts else 'no'}")
 
         yoga_text = self._get_yoga_text(session)
@@ -1085,10 +1179,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
     def _generate_and_validate(self, session_id: str, session: Dict, astrologer_prompt: str,
                                  dasha_timeline_str: str, evidence_vote) -> str:
-        """Shared generate -> validate -> retry-once loop. Runs the SAME
-        checks (claim_validator, ISSUE A past-date check, specificity)
-        whether called from the non-streaming path or from the streaming
-        path's internal buffer-then-validate flow."""
         response_text = llm_service.generate(prompt=astrologer_prompt, temperature=0.6)
 
         recent_texts = self._get_recent_assistant_texts(session_id)
@@ -1134,7 +1224,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 retry_prompt += "\n\n" + specificity_correction
             if temporal_correction:
                 retry_prompt += "\n\n" + temporal_correction
-            
+
             response_text = llm_service.generate(prompt=retry_prompt, temperature=0.75)
 
             remaining_claims = validate_claims(
@@ -1146,7 +1236,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 logger.warning(f"Claim validation still found {len(remaining_claims)} issue(s) after regeneration")
             if remaining_temporal:
                 logger.warning("Temporal check still found a past-as-upcoming date after regeneration")
-            
+
         return response_text
 
     # ------------------------------------------------------------------
@@ -1257,15 +1347,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
     # ------------------------------------------------------------------
     # STREAMING — POST /api/chat/stream
-    #
-    # ISSUE C FIX: no longer streams raw tokens from the first generation
-    # call. Instead: generate the full response internally, run it through
-    # the SAME validate/retry loop as the non-streaming path
-    # (_generate_and_validate), and only THEN chunk the final,
-    # already-corrected text out to the client. This trades away true
-    # token-level low-latency streaming for the guarantee that the user
-    # never sees a sentence that later gets silently corrected out from
-    # under them.
     # ------------------------------------------------------------------
     def process_chat_message_stream(self, session_id: str, message_text: str):
         logger.info(f"Processing chat message (stream) for session: {session_id}")
@@ -1352,9 +1433,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 logger.error(f"Streaming generation failed: {gen_err}")
                 full_text = "Mujhe samajhne mein kuch pareshani ho gayi."
 
-            # Simulated streaming: full_text is already validated/corrected
-            # at this point — chunking it out preserves a typing UI effect
-            # without ever showing the user a pre-correction sentence.
             for chunk in self._chunk_text_for_streaming(full_text):
                 yield {"type": "chunk", "text": chunk}
 
@@ -1390,10 +1468,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         response_text: str = "",
         query_understanding: Optional[Dict[str, Any]] = None,
     ) -> list:
-        """9-step trace: Query Understanding (LLM), Classical Framework,
-        Chart Factors, Personalized+Comparative Evidence, Evidence
-        Consensus, Dasha & Timing, Classical Evidence, Evidence Synthesis,
-        Chart-Specificity Check."""
         if not topic and not rag_hits and not (query_understanding and query_understanding.get("restated_intent")):
             return []
 
@@ -1451,7 +1525,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     + "\n".join(f"• {line}" for line in framework_lines)
                 )
             elif framework_hit_count == 0:
-                framework_detail = "No classical sources scored above the relevance threshold for this question's core framework query."
+                framework_detail = "No classical sources scored above the relevance threshold for this question's core framework query (or the framework was reused from cache for this topic)."
             else:
                 framework_detail = "RAG retrieved classical sources, but no specific house/planet/concept factors were confidently identified in the text."
 
@@ -1481,7 +1555,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     seen_p.add(key)
                     ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
                     p_sources.append(f"• {ref}")
-                evidence_lines.append("Personalized retrieval (using chart configuration):")
+                evidence_lines.append("Personalized retrieval (using chart configuration, ranked & deduplicated):")
                 evidence_lines.extend(p_sources)
 
             if comparison_hits_trace:
@@ -1612,12 +1686,13 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 reference_lines.append(f"• {reference}")
 
             evidence_detail_step7 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
-            steps.append({"step": 7, "title": "Classical Evidence", "detail": evidence_detail_step7, "type": "evidence"})
+            steps.append({"step": 7, "title": "Classical Evidence (Ranked & Deduplicated)", "detail": evidence_detail_step7, "type": "evidence"})
 
             synthesis_detail = (
-                "The final interpretation combines the retrieved classical evidence, verified chart "
-                "placements, comparative branch analysis (if applicable), current-date temporal "
-                "filtering, and the relevant Kundli and Dasha information."
+                "The final interpretation combines the retrieved classical evidence (ranked and "
+                "deduplicated to remove near-identical chunks), verified chart placements, comparative "
+                "branch analysis (if applicable), current-date temporal filtering, and the relevant "
+                "Kundli and Dasha information."
             )
             steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 

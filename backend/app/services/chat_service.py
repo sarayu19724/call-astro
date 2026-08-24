@@ -239,37 +239,41 @@ class ChatService:
         return depth
 
     # ------------------------------------------------------------------
-    # EVIDENCE RANKING + SEMANTIC DEDUPLICATION
+    # SEMANTIC DEDUPLICATION
     # ------------------------------------------------------------------
-    def _rank_and_dedupe_hits(self, hits: List[Dict[str, Any]], max_hits: int) -> List[Dict[str, Any]]:
-        """Sorts hits by score (highest first), then walks the list keeping
-        each hit only if it's not a near-duplicate (text similarity above
-        DEDUP_SIMILARITY_THRESHOLD) of an already-kept, higher-scored hit.
-        Caps the result at max_hits."""
+    def _dedupe_hits(self, hits: List[Dict[str, Any]], max_hits: int) -> List[Dict[str, Any]]:
+        """Keeps the original retrieval order and removes only near-duplicate
+        evidence based on text similarity. Relevance scores are not used to
+        rank, prioritize, or discard evidence."""
         if not hits:
-            return []
+         return []
 
-        ranked = sorted(hits, key=lambda h: h.get("score", 0), reverse=True)
         kept: List[Dict[str, Any]] = []
 
-        for hit in ranked:
+        for hit in hits:
             text = (hit.get("text") or "").strip().lower()
+            if not text:
+                continue
+
             is_duplicate = False
             for kept_hit in kept:
                 kept_text = (kept_hit.get("text") or "").strip().lower()
-                if not text or not kept_text:
+                if not kept_text:
                     continue
+
                 similarity = SequenceMatcher(None, text, kept_text).ratio()
                 if similarity >= DEDUP_SIMILARITY_THRESHOLD:
                     is_duplicate = True
                     break
+
             if not is_duplicate:
                 kept.append(hit)
+
             if len(kept) >= max_hits:
                 break
 
         if len(hits) > len(kept):
-            logger.info(f"[EvidenceRank] {len(hits)} hits -> {len(kept)} after ranking+dedup (max={max_hits})")
+         logger.info(f"[EvidenceDedup] {len(hits)} hits -> {len(kept)} after semantic dedup (max={max_hits})")
 
         return kept
 
@@ -708,7 +712,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                             "text": hit["text"], "stage": "framework",
                         })
 
-                    framework_rag_hits = self._rank_and_dedupe_hits(pre_dedup_hits, depth["framework_max"])
+                    framework_rag_hits = self._dedupe_hits(pre_dedup_hits, depth["framework_max"])
 
                     for i, hit in enumerate(framework_rag_hits):
                         seen_keys.add((hit["source"], hit["page"]))
@@ -761,7 +765,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                             "text": hit["text"], "stage": "comparison", "branch": branch,
                         })
 
-                    branch_rag_hits = self._rank_and_dedupe_hits(branch_rag_hits_raw, depth["comparison_max_per_branch"])
+                    branch_rag_hits = self._dedupe_hits(branch_rag_hits_raw, depth["comparison_max_per_branch"])
                     for hit in branch_rag_hits:
                         seen_keys.add((hit["source"], hit["page"]))
                         comparison_hits.append(hit)
@@ -808,7 +812,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     "text": hit["text"], "stage": "personalized",
                 })
 
-            personalized_rag_hits = self._rank_and_dedupe_hits(pre_dedup_personalized, depth["personalized_max"])
+            personalized_rag_hits = self._dedupe_hits(pre_dedup_personalized, depth["personalized_max"])
 
             personalized_chunks = []
             for i, hit in enumerate(personalized_rag_hits):

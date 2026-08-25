@@ -38,21 +38,6 @@ COMPARISON_MAX_HITS_PER_BRANCH_BASE = 3
 DEPTH_MIN_HITS = 3
 DEPTH_MAX_HITS = 12
 
-# Source Diversity — no single source may contribute more than this many
-# chunks to one evidence batch, so the final answer can never be built
-# from "mostly one book said this" even if that book scored highest
-# across many chunks.
-MAX_CHUNKS_PER_SOURCE = 2
-
-# Reranking — blend weight between the original retrieval score
-# (semantic + lexical hybrid from vector_store) and a fresh lexical
-# overlap score against the ACTUAL question text. Retrieval score alone
-# can favor a chunk that's topically similar but doesn't actually share
-# vocabulary with what the user asked; this rerank step pulls chunks
-# that are both semantically close AND textually responsive back up.
-RERANK_ORIGINAL_WEIGHT = 0.65
-RERANK_LEXICAL_WEIGHT = 0.35
-
 MONTH_NAME_TO_NUM = {
     'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
     'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12,
@@ -60,10 +45,28 @@ MONTH_NAME_TO_NUM = {
 
 COMPARISON_HINT_WORDS = (" or ", " ya ", " vs ", " versus ", "अथवा", " ki jagah ", " nahi to ")
 
-STOPWORDS = {
-    "the", "a", "an", "is", "are", "of", "in", "on", "for", "to", "and", "or", "will", "my",
-    "what", "how", "when", "does", "do", "i", "me", "about", "with", "this", "that",
+STAGE_TO_BUCKET = {
+    "framework": "classical_rule",
+    "personalized": "classical_rule",
+    "comparison": "classical_rule",
+    "followup": "classical_rule",
 }
+
+BUCKET_LABELS = {
+    "classical_rule": "Classical Rules (from retrieved books)",
+    "dasha_timing": "Dasha / Timing Evidence",
+    "yoga": "Yoga Evidence",
+    "chart_fact": "Verified Chart Facts",
+}
+
+PLANET_NAMES = ["Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn", "Rahu", "Ketu"]
+
+# --- Evidence Sufficiency Gate thresholds ---
+# Deterministic count of independent evidence signals available for this
+# specific answer. Below MIN_SUFFICIENT_SIGNALS, the model is instructed to
+# hedge explicitly rather than sound confident on thin evidence.
+MIN_SUFFICIENT_SIGNALS = 2
+MIN_UNIQUE_SOURCES_FOR_STRONG = 2
 
 
 class ChatService:
@@ -160,31 +163,45 @@ class ChatService:
             "as genuine future predictions."
         )
 
-    def _build_verified_chart_block(self, session: Dict) -> str:
+    def _get_verified_planet_house_map(self, session: Dict) -> Optional[Dict[str, Any]]:
         cached_raw = session.get("kundli_raw")
         if not cached_raw:
-            return ""
+            return None
         try:
             parsed = json.loads(cached_raw)
             planets = parsed.get("planets", []) or []
             ascendant_sign = parsed.get("ascendant_sign")
         except Exception:
-            return ""
+            return None
         if not ascendant_sign or not planets:
-            return ""
+            return None
 
         from app.services.topic_service import get_house_for_sign
 
-        lines = [f"Ascendant (Lagna): {ascendant_sign}"]
+        result: Dict[str, Any] = {"ascendant": ascendant_sign, "planets": {}}
         for p in planets:
             name = p.get("name")
             sign = p.get("sign_name", "")
             if not name or not sign:
                 continue
             house = get_house_for_sign(sign, ascendant_sign)
-            retro = " (retrograde)" if str(p.get("isRetro", "")).lower() == "true" else ""
-            house_str = f", house {house}" if house else ""
-            lines.append(f"{name}: {sign}{house_str}{retro}")
+            result["planets"][name] = {
+                "house": house,
+                "sign": sign,
+                "retro": str(p.get("isRetro", "")).lower() == "true",
+            }
+        return result
+
+    def _build_verified_chart_block(self, session: Dict) -> str:
+        chart = self._get_verified_planet_house_map(session)
+        if not chart:
+            return ""
+
+        lines = [f"Ascendant (Lagna): {chart['ascendant']}"]
+        for name, info in chart["planets"].items():
+            house_str = f", house {info['house']}" if info["house"] else ""
+            retro = " (retrograde)" if info["retro"] else ""
+            lines.append(f"{name}: {info['sign']}{house_str}{retro}")
 
         return (
             "ACTUAL VERIFIED CHART PLACEMENTS (this is the user's real chart — the ONLY source of "
@@ -195,6 +212,270 @@ class ChatService:
             "description of this user's actual chart — never state a planet's house placement that "
             "contradicts the verified list above."
         )
+
+    def _build_evidence_buckets(self, rag_hits: List[Dict[str, Any]], session: Dict,
+                                  dasha_timeline_str: str) -> str:
+        buckets: Dict[str, List[str]] = {"classical_rule": [], "dasha_timing": [], "yoga": []}
+
+        for hit in rag_hits:
+            bucket = STAGE_TO_BUCKET.get(hit.get("stage"), "classical_rule")
+            source = hit.get("source", "Unknown")
+            page = hit.get("page")
+            page_label = f", p.{page}" if page is not None else ""
+            snippet = (hit.get("text") or "").strip()
+            if len(snippet) > 220:
+                snippet = snippet[:220].rsplit(" ", 1)[0] + "..."
+            buckets[bucket].append(f"[{source}{page_label}] {snippet}")
+
+        yoga_text = session.get("yoga_text") or ""
+        if yoga_text:
+            buckets["yoga"].append(yoga_text.strip())
+
+        if dasha_timeline_str:
+            buckets["dasha_timing"].append(dasha_timeline_str.strip())
+        else:
+            cached_dasha = session.get("kundli_dasha")
+            if cached_dasha:
+                try:
+                    dasha_info = json.loads(cached_dasha)
+                    maha = dasha_info.get("current_mahadasha", {}) or {}
+                    antar = dasha_info.get("current_antardasha", {}) or {}
+                    maha_lord = maha.get("lord") or maha.get("name") or maha.get("planet")
+                    antar_lord = antar.get("lord") or antar.get("name") or antar.get("planet")
+                    if maha_lord:
+                        line = f"Current Mahadasha: {maha_lord}"
+                        if antar_lord:
+                            line += f", Antardasha: {antar_lord}"
+                        buckets["dasha_timing"].append(line)
+                except Exception:
+                    pass
+
+        sections = []
+        for key in ("classical_rule", "dasha_timing", "yoga"):
+            items = buckets[key]
+            if not items:
+                continue
+            label = BUCKET_LABELS[key]
+            body = "\n".join(f"- {item}" for item in items)
+            sections.append(f"[{label}]\n{body}")
+
+        if not sections:
+            return ""
+        return "EVIDENCE BY TYPE (each category below is a distinct KIND of signal — do not blend " \
+               "a classical rule with a Dasha timing fact as if they were the same type of evidence):\n\n" \
+               + "\n\n".join(sections)
+
+    def _build_structured_evidence_table(self, rag_hits: List[Dict[str, Any]], session: Dict,
+                                           referenced: Dict[str, Set[str]]) -> str:
+        chart = self._get_verified_planet_house_map(session)
+        if not chart:
+            return ""
+
+        planets_of_interest = referenced.get("planets", set()) or set(chart["planets"].keys())
+
+        rows: List[str] = []
+        for planet_name in sorted(planets_of_interest):
+            if planet_name not in chart["planets"]:
+                continue
+            info = chart["planets"][planet_name]
+            house = info["house"]
+            if not house:
+                continue
+            fact_str = f"{planet_name} in {info['sign']} ({house}th house)"
+            if info["retro"]:
+                fact_str += " (retrograde)"
+
+            matched_rule = None
+            matched_source = None
+            house_pattern = re.compile(rf"\b{house}(?:st|nd|rd|th)\s+house\b", re.IGNORECASE)
+            for hit in rag_hits:
+                text = hit.get("text", "") or ""
+                if planet_name.lower() not in text.lower():
+                    continue
+                if not house_pattern.search(text):
+                    continue
+                snippet = text.strip()
+                if len(snippet) > 180:
+                    snippet = snippet[:180].rsplit(" ", 1)[0] + "..."
+                matched_rule = snippet
+                page = hit.get("page")
+                matched_source = f"{hit.get('source', 'Unknown')}" + (f", p.{page}" if page is not None else "")
+                break
+
+            if matched_rule:
+                rows.append(f"| {fact_str} | {matched_rule} | {matched_source} |")
+            else:
+                rows.append(f"| {fact_str} | No retrieved rule matches this exact placement — do not invent one | — |")
+
+        if not rows:
+            return ""
+
+        header = "| VERIFIED FACT | MATCHING RETRIEVED RULE | SOURCE |\n|---|---|---|"
+        return (
+            "STRUCTURED FACT -> RULE TABLE (use ONLY these rows for chart-specific claims about the "
+            "planets listed — if a row says no rule matches, do not describe that placement using a "
+            "rule from elsewhere in the retrieved text):\n\n" + header + "\n" + "\n".join(rows)
+        )
+
+    # ------------------------------------------------------------------
+    # EVIDENCE SUFFICIENCY GATE
+    # Deterministic count of independent evidence signals available for
+    # THIS specific answer: unique RAG sources, verified chart-fact rows
+    # with a matched rule, presence of Dasha/timing data, and presence of
+    # an evidence vote. Below MIN_SUFFICIENT_SIGNALS, a single explicit
+    # hedging instruction is injected — never multiple competing
+    # instructions, and never an LLM judgment call, so it can't itself
+    # introduce inconsistency.
+    # ------------------------------------------------------------------
+    def _compute_evidence_sufficiency(self, rag_hits: List[Dict[str, Any]], evidence_table: str,
+                                        dasha_timeline_str: str, evidence_vote: Optional[Dict],
+                                        session: Dict) -> Dict[str, Any]:
+        unique_sources = set()
+        for hit in rag_hits:
+            unique_sources.add((hit.get("source"), hit.get("page")))
+
+        matched_rule_rows = 0
+        if evidence_table:
+            for line in evidence_table.splitlines():
+                if line.startswith("|") and "No retrieved rule matches" not in line and "VERIFIED FACT" not in line and "---" not in line:
+                    matched_rule_rows += 1
+
+        has_timing = bool(dasha_timeline_str) or bool(session.get("kundli_dasha"))
+        has_vote = evidence_vote is not None
+
+        signal_count = 0
+        signal_count += 1 if unique_sources else 0
+        signal_count += 1 if matched_rule_rows > 0 else 0
+        signal_count += 1 if has_timing else 0
+        signal_count += 1 if has_vote else 0
+
+        is_sufficient = signal_count >= MIN_SUFFICIENT_SIGNALS and len(unique_sources) >= 1
+        is_strong = len(unique_sources) >= MIN_UNIQUE_SOURCES_FOR_STRONG and matched_rule_rows > 0
+
+        return {
+            "unique_source_count": len(unique_sources),
+            "matched_rule_rows": matched_rule_rows,
+            "has_timing": has_timing,
+            "has_vote": has_vote,
+            "signal_count": signal_count,
+            "is_sufficient": is_sufficient,
+            "is_strong": is_strong,
+        }
+
+    def _build_sufficiency_instruction(self, sufficiency: Dict[str, Any]) -> str:
+        if sufficiency["is_strong"]:
+            return (
+                "EVIDENCE SUFFICIENCY: Strong — multiple independent sources and a matched chart-to-rule "
+                "pairing are available. You may state the answer with grounded, direct confidence."
+            )
+        if sufficiency["is_sufficient"]:
+            return (
+                "EVIDENCE SUFFICIENCY: Adequate but limited — some independent evidence is available "
+                f"(unique sources: {sufficiency['unique_source_count']}, matched chart facts: "
+                f"{sufficiency['matched_rule_rows']}). State the answer clearly but avoid absolute or "
+                "guaranteed language."
+            )
+        return (
+            "EVIDENCE SUFFICIENCY: LOW — only "
+            f"{sufficiency['unique_source_count']} unique retrieved source(s) and "
+            f"{sufficiency['matched_rule_rows']} matched chart-to-rule pairing(s) are available for this "
+            "specific question. Do NOT present a confident, single-answer verdict. Explicitly acknowledge "
+            "the limited evidence (e.g. 'based on limited textual evidence' or 'this needs a fuller "
+            "reading of your chart'), and lean on general classical principles and the verified chart "
+            "placements rather than manufacturing certainty."
+        )
+
+    # ------------------------------------------------------------------
+    # EVIDENCE-TO-CLAIM MAPPING
+    # Pure post-hoc analysis — no new LLM call. Splits the final response
+    # into sentences and labels each as "grounded" (overlaps with a
+    # verified chart fact, a matched rule, or Dasha data) or "interpretive"
+    # (no direct evidence overlap — narrative/connective text). Purely for
+    # transparency in the reasoning trace; never fed back into generation.
+    # ------------------------------------------------------------------
+    def _map_evidence_to_claims(self, response_text: str, session: Dict,
+                                  rag_hits: List[Dict[str, Any]], evidence_table: str) -> List[Dict[str, str]]:
+        if not response_text:
+            return []
+
+        chart = self._get_verified_planet_house_map(session)
+        chart_terms: Set[str] = set()
+        if chart:
+            chart_terms.add(chart["ascendant"].lower())
+            for name, info in chart["planets"].items():
+                chart_terms.add(name.lower())
+                chart_terms.add(info["sign"].lower())
+                if info["house"]:
+                    chart_terms.add(f"{info['house']}th house")
+                    chart_terms.add(f"house {info['house']}")
+
+        rule_terms: Set[str] = set()
+        for hit in rag_hits:
+            text = (hit.get("text") or "").lower()
+            for planet in PLANET_NAMES:
+                if planet.lower() in text:
+                    rule_terms.add(planet.lower())
+            for match in re.finditer(r"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+house\b", text):
+                rule_terms.add(f"{match.group(1)}th house")
+
+        dasha_terms: Set[str] = set()
+        cached_dasha = session.get("kundli_dasha")
+        if cached_dasha:
+            try:
+                dasha_info = json.loads(cached_dasha)
+                maha = dasha_info.get("current_mahadasha", {}) or {}
+                antar = dasha_info.get("current_antardasha", {}) or {}
+                for lord_field in (maha.get("lord"), maha.get("name"), maha.get("planet"),
+                                    antar.get("lord"), antar.get("name"), antar.get("planet")):
+                    if lord_field:
+                        dasha_terms.add(str(lord_field).lower())
+            except Exception:
+                pass
+
+        sentences = re.split(r'(?<=[.!?])\s+', response_text.strip())
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        mapped: List[Dict[str, str]] = []
+        for sentence in sentences:
+            s_lower = sentence.lower()
+            matched_chart = [t for t in chart_terms if t in s_lower]
+            matched_rule = [t for t in rule_terms if t in s_lower]
+            matched_dasha = [t for t in dasha_terms if t in s_lower]
+
+            if matched_chart or matched_rule or matched_dasha:
+                basis_parts = []
+                if matched_chart:
+                    basis_parts.append(f"chart fact ({', '.join(sorted(set(matched_chart))[:3])})")
+                if matched_rule:
+                    basis_parts.append(f"retrieved rule mentions ({', '.join(sorted(set(matched_rule))[:3])})")
+                if matched_dasha:
+                    basis_parts.append(f"Dasha data ({', '.join(sorted(set(matched_dasha))[:3])})")
+                mapped.append({
+                    "sentence": sentence,
+                    "label": "grounded",
+                    "basis": "; ".join(basis_parts),
+                })
+            else:
+                mapped.append({
+                    "sentence": sentence,
+                    "label": "interpretive",
+                    "basis": "no direct overlap with verified chart facts, retrieved rule text, or Dasha data — narrative/connective or general astrological reasoning",
+                })
+
+        return mapped
+
+    def _format_claim_mapping_for_trace(self, mapping: List[Dict[str, str]]) -> str:
+        if not mapping:
+            return "No response text was available to map."
+
+        grounded_count = sum(1 for m in mapping if m["label"] == "grounded")
+        total = len(mapping)
+        lines = [f"{grounded_count} of {total} sentence(s) are directly grounded in retrieved evidence or verified chart facts.\n"]
+        for m in mapping:
+            tag = "✓ GROUNDED" if m["label"] == "grounded" else "○ INTERPRETIVE"
+            lines.append(f"[{tag}] \"{m['sentence']}\"")
+            lines.append(f"   basis: {m['basis']}")
+        return "\n".join(lines)
 
     def _chunk_text_for_streaming(self, text: str, words_per_chunk: int = 6):
         words = text.split(' ')
@@ -243,83 +524,7 @@ class ChatService:
         )
         return depth
 
-    # ------------------------------------------------------------------
-    # RERANKING — combines the original hybrid retrieval score with a
-    # fresh lexical-overlap score against the actual question text. Pure
-    # vector similarity can rank a chunk highly because it's topically
-    # nearby without actually sharing much vocabulary with what was
-    # asked; this pulls textually-responsive chunks back up so the top
-    # results aren't just "semantically adjacent."
-    # ------------------------------------------------------------------
-    def _tokenize_for_overlap(self, text: str) -> Set[str]:
-        words = re.findall(r"[a-zA-Z]+", text.lower())
-        return {w for w in words if w not in STOPWORDS and len(w) > 2}
-
-    def _lexical_overlap_score(self, query_tokens: Set[str], chunk_text: str) -> float:
-        if not query_tokens:
-            return 0.0
-        chunk_tokens = self._tokenize_for_overlap(chunk_text)
-        if not chunk_tokens:
-            return 0.0
-        overlap = query_tokens & chunk_tokens
-        return len(overlap) / len(query_tokens)
-
-    def _rerank_hits(self, hits: List[Dict[str, Any]], query_text: str) -> List[Dict[str, Any]]:
-        """Recomputes each hit's score as a blend of its original retrieval
-        score and lexical overlap with the actual question, then re-sorts.
-        Does not filter anything — just reorders so the strongest, most
-        directly-responsive evidence surfaces first, before diversity
-        capping and dedup run on top of this new order."""
-        if not hits:
-            return []
-        query_tokens = self._tokenize_for_overlap(query_text)
-
-        reranked = []
-        for hit in hits:
-            original_score = hit.get("score", 0.0)
-            lexical_score = self._lexical_overlap_score(query_tokens, hit.get("text", ""))
-            blended = (RERANK_ORIGINAL_WEIGHT * original_score) + (RERANK_LEXICAL_WEIGHT * lexical_score)
-            new_hit = dict(hit)
-            new_hit["original_score"] = original_score
-            new_hit["score"] = round(blended, 4)
-            reranked.append(new_hit)
-
-        reranked.sort(key=lambda h: h["score"], reverse=True)
-        return reranked
-
-    # ------------------------------------------------------------------
-    # SOURCE DIVERSITY — caps how many chunks from the same book/source
-    # can appear in one evidence batch, so the final answer is never
-    # effectively built from a single classical text repeated several
-    # times, even if that source happened to score highest across
-    # multiple chunks.
-    # ------------------------------------------------------------------
-    def _enforce_source_diversity(self, hits: List[Dict[str, Any]], max_per_source: int = MAX_CHUNKS_PER_SOURCE) -> List[Dict[str, Any]]:
-        if not hits:
-            return []
-        source_counts: Dict[str, int] = {}
-        diversified = []
-        for hit in hits:
-            source = hit.get("source", "Unknown")
-            count = source_counts.get(source, 0)
-            if count >= max_per_source:
-                continue
-            source_counts[source] = count + 1
-            diversified.append(hit)
-
-        if len(diversified) < len(hits):
-            logger.info(
-                f"[SourceDiversity] {len(hits)} hits -> {len(diversified)} after capping at "
-                f"{max_per_source}/source (sources: {list(source_counts.keys())})"
-            )
-        return diversified
-
     def _dedupe_hits(self, hits: List[Dict[str, Any]], max_hits: int) -> List[Dict[str, Any]]:
-        """Removes near-duplicate evidence (text similarity above
-        DEDUP_SIMILARITY_THRESHOLD), keeping the higher-ranked copy.
-        Assumes hits are already in the desired priority order (i.e.
-        already reranked and diversity-capped) — this only walks that
-        order and drops duplicates, it does not re-sort."""
         if not hits:
             return []
 
@@ -335,6 +540,7 @@ class ChatService:
                 kept_text = (kept_hit.get("text") or "").strip().lower()
                 if not kept_text:
                     continue
+
                 similarity = SequenceMatcher(None, text, kept_text).ratio()
                 if similarity >= DEDUP_SIMILARITY_THRESHOLD:
                     is_duplicate = True
@@ -342,6 +548,7 @@ class ChatService:
 
             if not is_duplicate:
                 kept.append(hit)
+
             if len(kept) >= max_hits:
                 break
 
@@ -349,16 +556,6 @@ class ChatService:
             logger.info(f"[EvidenceDedup] {len(hits)} hits -> {len(kept)} after semantic dedup (max={max_hits})")
 
         return kept
-
-    def _process_evidence(self, hits: List[Dict[str, Any]], query_text: str, max_hits: int) -> List[Dict[str, Any]]:
-        """Full evidence pipeline for one retrieval batch: rerank (semantic
-        + lexical blend) -> source diversity cap -> semantic dedup -> depth
-        cap. Order matters: rerank first so diversity/dedup operate on the
-        best ordering, not raw retrieval order."""
-        reranked = self._rerank_hits(hits, query_text)
-        diversified = self._enforce_source_diversity(reranked)
-        deduped = self._dedupe_hits(diversified, max_hits)
-        return deduped
 
     def _fetch_and_cache_kundli(self, session_id: str, session: Dict) -> str:
         try:
@@ -591,10 +788,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         charts: Set[str] = set()
         concepts: Set[str] = set()
 
-        planet_names = [
-            "Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus",
-            "Saturn", "Rahu", "Ketu", "Ascendant"
-        ]
+        planet_names = PLANET_NAMES + ["Ascendant"]
         house_pattern = re.compile(r"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+house\b", re.IGNORECASE)
         chart_pattern = re.compile(r"\bD(?:1|7|9|10|24)\b", re.IGNORECASE)
 
@@ -767,16 +961,14 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     framework_chunks.append(cached_context)
             else:
                 framework_query = self._build_framework_query(message_text, topic, life_area)
-                # Retrieve wider than the target depth — reranking + diversity
-                # + dedup below will narrow it back down to depth["framework_max"].
                 framework_hits_raw = vector_store.dual_retrieve(
                     topic_query=framework_query,
                     global_query=message_text,
                     query_vector_topic=self.embeddings_provider.get_embedding(framework_query),
                     query_vector_global=self.embeddings_provider.get_embedding(message_text),
                     preferred_sources=preferred_sources,
-                    top_k_each=depth["framework_max"] * 2,
-                    final_top_k=depth["framework_max"] * 2,
+                    top_k_each=depth["framework_max"],
+                    final_top_k=depth["framework_max"],
                     alpha=settings.HYBRID_ALPHA,
                 )
                 framework_hits_raw = [h for h in framework_hits_raw if h["score"] >= settings.MIN_RAG_RELEVANCE]
@@ -787,17 +979,16 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 if not framework_hits_raw:
                     logger.info("[RAGFirst] no sufficiently relevant framework chunks — continuing with comparison/personalized retrieval anyway")
                 else:
-                    pre_process_hits = []
+                    pre_dedup_hits = []
                     for hit in framework_hits_raw:
                         source = hit["metadata"].get("source", "Unknown")
                         page = hit["metadata"].get("page")
-                        pre_process_hits.append({
+                        pre_dedup_hits.append({
                             "source": source, "page": page, "score": hit["score"],
                             "text": hit["text"], "stage": "framework",
                         })
 
-                    # Reranking + Source Diversity + Dedup
-                    framework_rag_hits = self._process_evidence(pre_process_hits, message_text, depth["framework_max"])
+                    framework_rag_hits = self._dedupe_hits(pre_dedup_hits, depth["framework_max"])
 
                     for i, hit in enumerate(framework_rag_hits):
                         seen_keys.add((hit["source"], hit["page"]))
@@ -829,14 +1020,14 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         branch_vector = self.embeddings_provider.get_embedding(branch_query)
                         branch_results = vector_store.hybrid_search(
                             query=branch_query, query_vector=branch_vector,
-                            top_k=(depth["comparison_max_per_branch"] * 2) + 1,
+                            top_k=depth["comparison_max_per_branch"] + 1,
                             alpha=settings.HYBRID_ALPHA
                         )
                     except Exception as e:
                         logger.error(f"[Comparison] retrieval failed for branch '{branch}': {e}")
                         continue
 
-                    branch_pre_process = []
+                    branch_rag_hits_raw = []
                     for hit in branch_results:
                         if hit["score"] < settings.MIN_RAG_RELEVANCE:
                             continue
@@ -845,12 +1036,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         key = (source, page)
                         if key in seen_keys:
                             continue
-                        branch_pre_process.append({
+                        branch_rag_hits_raw.append({
                             "source": source, "page": page, "score": hit["score"],
                             "text": hit["text"], "stage": "comparison", "branch": branch,
                         })
 
-                    branch_rag_hits = self._process_evidence(branch_pre_process, branch_query, depth["comparison_max_per_branch"])
+                    branch_rag_hits = self._dedupe_hits(branch_rag_hits_raw, depth["comparison_max_per_branch"])
                     for hit in branch_rag_hits:
                         seen_keys.add((hit["source"], hit["page"]))
                         comparison_hits.append(hit)
@@ -879,25 +1070,25 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 query_vector_topic=personalized_vector,
                 query_vector_global=personalized_vector,
                 preferred_sources=preferred_sources,
-                top_k_each=depth["personalized_max"] * 2,
-                final_top_k=depth["personalized_max"] * 2,
+                top_k_each=depth["personalized_max"] + 2,
+                final_top_k=depth["personalized_max"] + 2,
                 alpha=settings.HYBRID_ALPHA,
             )
             personalized_hits_raw = [h for h in personalized_hits_raw if h["score"] >= settings.MIN_RAG_RELEVANCE]
 
-            pre_process_personalized = []
+            pre_dedup_personalized = []
             for hit in personalized_hits_raw:
                 source = hit["metadata"].get("source", "Unknown")
                 page = hit["metadata"].get("page")
                 key = (source, page)
                 if key in seen_keys:
                     continue
-                pre_process_personalized.append({
+                pre_dedup_personalized.append({
                     "source": source, "page": page, "score": hit["score"],
                     "text": hit["text"], "stage": "personalized",
                 })
 
-            personalized_rag_hits = self._process_evidence(pre_process_personalized, message_text, depth["personalized_max"])
+            personalized_rag_hits = self._dedupe_hits(pre_dedup_personalized, depth["personalized_max"])
 
             personalized_chunks = []
             for i, hit in enumerate(personalized_rag_hits):
@@ -930,11 +1121,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 f"comparison={len(comparison_hits)}, personalized={len(personalized_rag_hits)}"
             )
 
-            return context, all_hits, targeted_facts
+            return context, all_hits, targeted_facts, referenced
 
         except Exception as e:
             logger.error(f"RAG-first context build failed: {e}", exc_info=True)
-            return "No reference available.", [], ""
+            return "No reference available.", [], "", {"houses": set(), "planets": set(), "charts": set(), "concepts": set()}
 
     def _is_followup_retrieval_question(self, message_text: str, history: List[Dict[str, str]]) -> bool:
         if not history:
@@ -976,30 +1167,27 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 query_vector_topic=self.embeddings_provider.get_embedding(query),
                 query_vector_global=self.embeddings_provider.get_embedding(message_text),
                 preferred_sources=preferred_sources,
-                top_k_each=12,
-                final_top_k=12,
+                top_k_each=6,
+                final_top_k=settings.TOP_K_RETRIEVAL,
                 alpha=settings.HYBRID_ALPHA,
             )
 
             hits = [h for h in hits if h["score"] >= settings.MIN_RAG_RELEVANCE]
 
-            pre_process = []
-            for hit in hits:
+            chunks, rag_hits = [], []
+
+            for i, hit in enumerate(hits):
                 source = hit["metadata"].get("source", "Unknown")
                 page = hit["metadata"].get("page")
-                pre_process.append({
+                page_label = f", Page: {page}" if page is not None else ""
+
+                chunks.append(
+                    f"--- Follow-up Evidence {i+1} [Source: {source}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
+                )
+                rag_hits.append({
                     "source": source, "page": page, "score": hit["score"],
                     "text": hit["text"], "stage": "followup",
                 })
-
-            rag_hits = self._process_evidence(pre_process, message_text, settings.TOP_K_RETRIEVAL)
-
-            chunks = []
-            for i, hit in enumerate(rag_hits):
-                page_label = f", Page: {hit['page']}" if hit["page"] is not None else ""
-                chunks.append(
-                    f"--- Follow-up Evidence {i+1} [Source: {hit['source']}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
-                )
 
             logger.info(f"[FollowUpRAG] retrieved {len(rag_hits)} supporting chunks")
             return "\n".join(chunks), rag_hits
@@ -1256,10 +1444,14 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         context_str = ""
         rag_hits: List[Dict[str, Any]] = []
         targeted_facts = ""
+        referenced: Dict[str, Set[str]] = {"houses": set(), "planets": set(), "charts": set(), "concepts": set()}
+
         if self._is_followup_retrieval_question(message_text, history):
             context_str, rag_hits = self._get_followup_rag_context(message_text, topic, history)
         if not rag_hits:
-            context_str, rag_hits, targeted_facts = self._get_rag_first_context(session_id, message_text, topic, session, query_understanding)
+            context_str, rag_hits, targeted_facts, referenced = self._get_rag_first_context(
+                session_id, message_text, topic, session, query_understanding
+            )
         logger.info(f"[RAGPipeline] hits={len(rag_hits)} targeted_facts={'yes' if targeted_facts else 'no'}")
 
         yoga_text = self._get_yoga_text(session)
@@ -1290,6 +1482,24 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         if verified_block:
             final_kundli_data = f"{final_kundli_data}\n\n{verified_block}" if final_kundli_data else verified_block
 
+        bucketed_evidence = self._build_evidence_buckets(rag_hits, session, dasha_timeline_str)
+        if bucketed_evidence:
+            final_kundli_data = f"{final_kundli_data}\n\n{bucketed_evidence}" if final_kundli_data else bucketed_evidence
+
+        evidence_table = self._build_structured_evidence_table(rag_hits, session, referenced)
+        if evidence_table:
+            final_kundli_data = f"{final_kundli_data}\n\n{evidence_table}" if final_kundli_data else evidence_table
+
+        # --- Evidence Sufficiency Gate ---
+        sufficiency = self._compute_evidence_sufficiency(rag_hits, evidence_table, dasha_timeline_str, evidence_vote, session)
+        sufficiency_instruction = self._build_sufficiency_instruction(sufficiency)
+        final_kundli_data = f"{final_kundli_data}\n\n{sufficiency_instruction}" if final_kundli_data else sufficiency_instruction
+        logger.info(
+            f"[SufficiencyGate] sources={sufficiency['unique_source_count']} "
+            f"matched_rows={sufficiency['matched_rule_rows']} signals={sufficiency['signal_count']} "
+            f"sufficient={sufficiency['is_sufficient']} strong={sufficiency['is_strong']}"
+        )
+
         user_memory = self._get_user_memory_block(session, topic)
         repeat_hint = self._get_repeat_topic_hint(session, topic)
 
@@ -1300,6 +1510,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             "context_str": context_str,
             "rag_hits": rag_hits,
             "targeted_facts": targeted_facts,
+            "referenced": referenced,
+            "evidence_table": evidence_table,
+            "bucketed_evidence": bucketed_evidence,
+            "sufficiency": sufficiency,
             "final_kundli_data": final_kundli_data,
             "user_memory": user_memory,
             "repeat_hint": repeat_hint,
@@ -1472,8 +1686,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             db.add_message(session_id, "assistant", response_text)
 
+            claim_mapping = self._map_evidence_to_claims(response_text, session, ctx["rag_hits"], ctx["evidence_table"])
+
             try:
-                trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], response_text, ctx["query_understanding"])
+                trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], response_text,
+                                                     ctx["query_understanding"], ctx.get("evidence_table", ""), ctx.get("bucketed_evidence", ""),
+                                                     ctx.get("sufficiency"), claim_mapping)
                 db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
             except Exception as trace_err:
                 logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
@@ -1588,8 +1806,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             db.add_message(session_id, "assistant", full_text)
 
+            claim_mapping = self._map_evidence_to_claims(full_text, session, ctx["rag_hits"], ctx["evidence_table"])
+
             try:
-                trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], full_text, ctx["query_understanding"])
+                trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], full_text,
+                                                     ctx["query_understanding"], ctx.get("evidence_table", ""), ctx.get("bucketed_evidence", ""),
+                                                     ctx.get("sufficiency"), claim_mapping)
                 db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
             except Exception as trace_err:
                 logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
@@ -1617,6 +1839,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         targeted_facts: str = "",
         response_text: str = "",
         query_understanding: Optional[Dict[str, Any]] = None,
+        evidence_table: str = "",
+        bucketed_evidence: str = "",
+        sufficiency: Optional[Dict[str, Any]] = None,
+        claim_mapping: Optional[List[Dict[str, str]]] = None,
     ) -> list:
         if not topic and not rag_hits and not (query_understanding and query_understanding.get("restated_intent")):
             return []
@@ -1646,6 +1872,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 if comparison:
                     qu_detail += f"\n\nComparing: {' vs '.join(comparison)}"
                 qu_detail += f"\n\nTiming/Dasha relevant: {'Yes' if requires_timing else 'No'}"
+                if not requires_timing:
+                    qu_detail += " (Dasha timeline retrieval was skipped for this question)"
             else:
                 qu_detail = (
                     "Query understanding was not available for this response — "
@@ -1675,21 +1903,41 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     + "\n".join(f"• {line}" for line in framework_lines)
                 )
             elif framework_hit_count == 0:
-                framework_detail = "No classical sources scored above the relevance threshold for this question's core framework query (or the framework was reused from cache for this topic)."
+                framework_detail = "No classical sources scored above the relevance threshold (or framework was reused from cache)."
             else:
-                framework_detail = "RAG retrieved classical sources, but no specific house/planet/concept factors were confidently identified in the text."
+                framework_detail = "RAG retrieved classical sources, but no specific house/planet/concept factors were confidently identified."
 
             steps.append({"step": 2, "title": "Classical Framework Retrieved", "detail": framework_detail, "type": "rag"})
 
             if targeted_facts:
-                chart_detail = (
-                    "The user's Kundli was examined for the factors identified by the retrieved classical sources.\n\n"
-                    + targeted_facts
-                )
+                chart_detail = "The user's Kundli was examined for the factors identified by retrieved classical sources.\n\n" + targeted_facts
             else:
                 chart_detail = "No targeted chart facts were identified from the retrieved classical framework."
-
             steps.append({"step": 3, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
+
+            bucket_detail = bucketed_evidence if bucketed_evidence else "No bucketed evidence categories were populated for this question."
+            steps.append({"step": 4, "title": "Evidence Bucketed by Type", "detail": bucket_detail, "type": "buckets"})
+
+            table_detail = evidence_table if evidence_table else "No structured fact-to-rule pairing was produced (no matching retrieved rule text for the verified placements checked)."
+            steps.append({"step": 5, "title": "Structured Fact → Rule Table", "detail": table_detail, "type": "fact_rule_table"})
+
+            # NEW — Evidence Sufficiency Gate step
+            if sufficiency:
+                sufficiency_lines = [
+                    f"Unique retrieved sources: {sufficiency['unique_source_count']}",
+                    f"Matched chart-fact-to-rule pairings: {sufficiency['matched_rule_rows']}",
+                    f"Dasha/timing data available: {'Yes' if sufficiency['has_timing'] else 'No'}",
+                    f"Evidence vote available: {'Yes' if sufficiency['has_vote'] else 'No'}",
+                    f"Total independent signal count: {sufficiency['signal_count']}",
+                    "",
+                    "Verdict: " + ("STRONG — confident language permitted" if sufficiency['is_strong']
+                                    else "SUFFICIENT — clear but non-absolute language" if sufficiency['is_sufficient']
+                                    else "LOW — model was instructed to hedge explicitly"),
+                ]
+                sufficiency_detail = "\n".join(sufficiency_lines)
+            else:
+                sufficiency_detail = "Evidence sufficiency was not computed for this response."
+            steps.append({"step": 6, "title": "Evidence Sufficiency Gate", "detail": sufficiency_detail, "type": "sufficiency"})
 
             personalized_hits = [hit for hit in rag_hits if hit.get("stage") == "personalized"]
             comparison_hits_trace = [hit for hit in rag_hits if hit.get("stage") == "comparison"]
@@ -1705,7 +1953,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     seen_p.add(key)
                     ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
                     p_sources.append(f"• {ref}")
-                evidence_lines.append("Personalized retrieval (reranked by lexical+semantic relevance, source-diversity capped, deduplicated):")
+                evidence_lines.append("Personalized retrieval (ranked, deduplicated, adaptive depth):")
                 evidence_lines.extend(p_sources)
 
             if comparison_hits_trace:
@@ -1719,13 +1967,13 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     seen_c.add(key)
                     ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
                     by_branch.setdefault(branch, []).append(f"  • {ref}")
-                evidence_lines.append("\nComparative retrieval (separate query per option being compared):")
+                evidence_lines.append("\nComparative retrieval (separate query per option):")
                 for branch, refs in by_branch.items():
                     evidence_lines.append(f"{branch}:")
                     evidence_lines.extend(refs)
 
-            evidence_detail_step4 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or comparative evidence was retrieved."
-            steps.append({"step": 4, "title": "Personalized + Comparative Evidence Retrieved", "detail": evidence_detail_step4, "type": "personalized_rag"})
+            evidence_detail_step7 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or comparative evidence was retrieved."
+            steps.append({"step": 7, "title": "Personalized + Comparative Evidence Retrieved", "detail": evidence_detail_step7, "type": "personalized_rag"})
 
             consensus_label = None
             evidence_vote = None
@@ -1742,39 +1990,23 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 logger.warning(f"Could not build evidence consensus trace: {evidence_err}")
 
             consensus_lines = []
-
             if consensus_label:
                 consensus_lines.append(f"Evidence confidence: {consensus_label}")
             else:
-                consensus_lines.append(
-                    "Evidence confidence: Not available (this question wasn't classified under a "
-                    "specific life-area topic, so no evidence vote was computed)"
-                )
+                consensus_lines.append("Evidence confidence: Not available (no life-area topic classified)")
 
             if isinstance(evidence_vote, dict):
                 votes = evidence_vote.get("votes", [])
-                supportive = 0
-                challenging = 0
-                neutral = 0
-
-                for vote in votes:
-                    value = vote.get("vote", 0)
-                    if value > 0:
-                        supportive += 1
-                    elif value < 0:
-                        challenging += 1
-                    else:
-                        neutral += 1
-
+                supportive = sum(1 for v in votes if v.get("vote", 0) > 0)
+                challenging = sum(1 for v in votes if v.get("vote", 0) < 0)
+                neutral = sum(1 for v in votes if v.get("vote", 0) == 0)
                 if votes:
                     consensus_lines.append(f"• Supportive: {supportive}")
                     consensus_lines.append(f"• Challenging: {challenging}")
                     consensus_lines.append(f"• Neutral: {neutral}")
-
                 confidence = evidence_vote.get("confidence_pct")
                 if confidence is not None:
                     consensus_lines.append(f"• Confidence score: {confidence}%")
-
                 verdict = evidence_vote.get("verdict")
                 if verdict:
                     consensus_lines.append(f"• Verdict: {verdict}")
@@ -1782,14 +2014,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if not rag_hits:
                 consensus_lines.append(
                     "\nNote: No classical text evidence was retrieved for this specific question. "
-                    "The confidence above reflects chart placement, Dasha timing, and Yoga signals only — "
-                    "not retrieved book passages."
+                    "The confidence above reflects chart placement, Dasha timing, and Yoga signals only."
                 )
-
             if consistency:
                 consensus_lines.append(f"\nSignal consistency:\n{consistency}")
 
-            steps.append({"step": 5, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
+            steps.append({"step": 8, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
 
             dasha_detail = ""
             try:
@@ -1811,17 +2041,14 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 dasha_detail = "Current Dasha information was not available in the cached chart data."
 
             timeline_note = (
-                "\n\n(Timing-Gated Retrieval: the full upcoming Dasha timeline was only fetched/used "
-                "because this question was classified as requiring timing — otherwise this step is skipped "
-                "to avoid an unnecessary external Dasha API call.)"
+                "\n\n(Timing-Gated Retrieval: the full upcoming Dasha timeline was fetched because this "
+                "question was classified as requiring timing.)"
                 if (query_understanding or {}).get("requires_timing")
                 else "\n\n(Timing-Gated Retrieval: this question wasn't classified as needing timing, so the "
-                     "full upcoming Dasha timeline retrieval was skipped — only the current Mahadasha/Antardasha "
-                     "above, already cached from the Kundli fetch, is shown.)"
+                     "full timeline retrieval was skipped — only the current Mahadasha/Antardasha above is shown.)"
             )
             dasha_detail += timeline_note
-
-            steps.append({"step": 6, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
+            steps.append({"step": 9, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
 
             reference_lines = []
             seen_references = set()
@@ -1846,20 +2073,19 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     reference += f" (option: {hit['branch']})"
                 reference_lines.append(f"• {reference}")
 
-            evidence_detail_step7 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
-            steps.append({"step": 7, "title": "Classical Evidence (Reranked, Source-Diversified, Deduplicated)", "detail": evidence_detail_step7, "type": "evidence"})
+            evidence_detail_step10 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
+            steps.append({"step": 10, "title": "Classical Evidence (Ranked, Deduplicated, Adaptive Depth)", "detail": evidence_detail_step10, "type": "evidence"})
 
             synthesis_detail = (
-                "The final interpretation combines evidence that was reranked by lexical+semantic relevance "
-                "to the actual question, capped so no single source dominates, deduplicated, and depth-scaled "
-                "to this question's complexity — along with verified chart placements, comparative branch "
-                "analysis (if applicable), timing-gated Dasha data (only when needed), current-date temporal "
-                "filtering, and the relevant Kundli and Dasha information."
+                "The final interpretation combines the bucketed evidence (classical rule / Dasha timing / "
+                "Yoga, kept as distinct categories), the structured Fact→Rule table (verified placements "
+                "paired only with rules that match them exactly), the Evidence Sufficiency Gate's confidence "
+                "calibration, verified chart placements, comparative branch analysis, timing-gated Dasha "
+                "data, and current-date temporal filtering."
             )
-            steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
+            steps.append({"step": 11, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 
             specificity_lines = []
-
             if response_text:
                 try:
                     score = compute_chart_specificity(response_text)
@@ -1875,7 +2101,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             else:
                 specificity_lines.append("Status: Not available — no response text supplied")
 
-            steps.append({"step": 9, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
+            steps.append({"step": 12, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
+
+            # NEW — Evidence-to-Claim Mapping step
+            mapping_detail = self._format_claim_mapping_for_trace(claim_mapping or [])
+            steps.append({"step": 13, "title": "Evidence-to-Claim Mapping", "detail": mapping_detail, "type": "claim_mapping"})
 
             logger.info(f"[TRACE] Reasoning trace built: {len(steps)} steps — titles: {[s['title'] for s in steps]}")
             return steps

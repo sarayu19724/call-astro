@@ -26,22 +26,32 @@ from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
 
 
-TOPIC_BUNDLE_LOGIC_VERSION = 3  # bumped: "timeline" removed from bundle, now computed separately (timing-gated)
+TOPIC_BUNDLE_LOGIC_VERSION = 3
 FRAMEWORK_CACHE_VERSION = 1
 
-# Evidence Ranking + Dedup — chunks scoring above this similarity to a
-# higher-scored chunk in the same batch are dropped as near-duplicates.
 DEDUP_SIMILARITY_THRESHOLD = 0.90
 
-# Base retrieval depth — adjusted per-question by _compute_retrieval_depth()
 FRAMEWORK_MAX_HITS_BASE = 6
 PERSONALIZED_MAX_HITS_BASE = 6
 COMPARISON_MAX_HITS_PER_BRANCH_BASE = 3
 
-# Adaptive depth bounds — never retrieve fewer than MIN or more than MAX,
-# regardless of computed complexity multiplier.
 DEPTH_MIN_HITS = 3
 DEPTH_MAX_HITS = 12
+
+# Source Diversity — no single source may contribute more than this many
+# chunks to one evidence batch, so the final answer can never be built
+# from "mostly one book said this" even if that book scored highest
+# across many chunks.
+MAX_CHUNKS_PER_SOURCE = 2
+
+# Reranking — blend weight between the original retrieval score
+# (semantic + lexical hybrid from vector_store) and a fresh lexical
+# overlap score against the ACTUAL question text. Retrieval score alone
+# can favor a chunk that's topically similar but doesn't actually share
+# vocabulary with what the user asked; this rerank step pulls chunks
+# that are both semantically close AND textually responsive back up.
+RERANK_ORIGINAL_WEIGHT = 0.65
+RERANK_LEXICAL_WEIGHT = 0.35
 
 MONTH_NAME_TO_NUM = {
     'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
@@ -49,6 +59,11 @@ MONTH_NAME_TO_NUM = {
 }
 
 COMPARISON_HINT_WORDS = (" or ", " ya ", " vs ", " versus ", "अथवा", " ki jagah ", " nahi to ")
+
+STOPWORDS = {
+    "the", "a", "an", "is", "are", "of", "in", "on", "for", "to", "and", "or", "will", "my",
+    "what", "how", "when", "does", "do", "i", "me", "about", "with", "this", "that",
+}
 
 
 class ChatService:
@@ -192,34 +207,24 @@ class ChatService:
         if buf:
             yield ' '.join(buf)
 
-    # ------------------------------------------------------------------
-    # ADAPTIVE RAG DEPTH — scales how much evidence gets retrieved based
-    # on question complexity, instead of a fixed depth for every question.
-    # ------------------------------------------------------------------
     def _compute_retrieval_depth(self, message_text: str, query_understanding: Dict[str, Any]) -> Dict[str, int]:
-        """Returns per-question retrieval depth. A simple factual question
-        ("what is my ascendant meaning") gets a shallow, fast retrieval; a
-        multi-option comparison with timing gets a deeper one. This is a
-        heuristic complexity score, not a precise cost model — the goal is
-        to avoid wasting retrieval budget on easy questions and under-
-        serving genuinely complex ones."""
         comparison = query_understanding.get("comparison") or []
         requires_timing = bool(query_understanding.get("requires_timing"))
         life_area = (query_understanding.get("life_area") or "").strip().lower()
         word_count = len(message_text.split())
 
-        complexity = 1.0  # baseline multiplier
+        complexity = 1.0
 
         if len(comparison) >= 2:
-            complexity += 0.6  # comparisons genuinely need more evidence per branch
+            complexity += 0.6
         if requires_timing:
             complexity += 0.3
         if word_count > 18:
-            complexity += 0.3  # longer questions tend to bundle multiple sub-asks
+            complexity += 0.3
         if not life_area or life_area == "general":
-            complexity -= 0.3  # unclassified/general questions rarely need deep retrieval
+            complexity -= 0.3
 
-        complexity = max(0.5, min(complexity, 2.0))  # clamp multiplier range
+        complexity = max(0.5, min(complexity, 2.0))
 
         def _scaled(base: int) -> int:
             return max(DEPTH_MIN_HITS, min(DEPTH_MAX_HITS, round(base * complexity)))
@@ -239,14 +244,84 @@ class ChatService:
         return depth
 
     # ------------------------------------------------------------------
-    # SEMANTIC DEDUPLICATION
+    # RERANKING — combines the original hybrid retrieval score with a
+    # fresh lexical-overlap score against the actual question text. Pure
+    # vector similarity can rank a chunk highly because it's topically
+    # nearby without actually sharing much vocabulary with what was
+    # asked; this pulls textually-responsive chunks back up so the top
+    # results aren't just "semantically adjacent."
     # ------------------------------------------------------------------
-    def _dedupe_hits(self, hits: List[Dict[str, Any]], max_hits: int) -> List[Dict[str, Any]]:
-        """Keeps the original retrieval order and removes only near-duplicate
-        evidence based on text similarity. Relevance scores are not used to
-        rank, prioritize, or discard evidence."""
+    def _tokenize_for_overlap(self, text: str) -> Set[str]:
+        words = re.findall(r"[a-zA-Z]+", text.lower())
+        return {w for w in words if w not in STOPWORDS and len(w) > 2}
+
+    def _lexical_overlap_score(self, query_tokens: Set[str], chunk_text: str) -> float:
+        if not query_tokens:
+            return 0.0
+        chunk_tokens = self._tokenize_for_overlap(chunk_text)
+        if not chunk_tokens:
+            return 0.0
+        overlap = query_tokens & chunk_tokens
+        return len(overlap) / len(query_tokens)
+
+    def _rerank_hits(self, hits: List[Dict[str, Any]], query_text: str) -> List[Dict[str, Any]]:
+        """Recomputes each hit's score as a blend of its original retrieval
+        score and lexical overlap with the actual question, then re-sorts.
+        Does not filter anything — just reorders so the strongest, most
+        directly-responsive evidence surfaces first, before diversity
+        capping and dedup run on top of this new order."""
         if not hits:
-         return []
+            return []
+        query_tokens = self._tokenize_for_overlap(query_text)
+
+        reranked = []
+        for hit in hits:
+            original_score = hit.get("score", 0.0)
+            lexical_score = self._lexical_overlap_score(query_tokens, hit.get("text", ""))
+            blended = (RERANK_ORIGINAL_WEIGHT * original_score) + (RERANK_LEXICAL_WEIGHT * lexical_score)
+            new_hit = dict(hit)
+            new_hit["original_score"] = original_score
+            new_hit["score"] = round(blended, 4)
+            reranked.append(new_hit)
+
+        reranked.sort(key=lambda h: h["score"], reverse=True)
+        return reranked
+
+    # ------------------------------------------------------------------
+    # SOURCE DIVERSITY — caps how many chunks from the same book/source
+    # can appear in one evidence batch, so the final answer is never
+    # effectively built from a single classical text repeated several
+    # times, even if that source happened to score highest across
+    # multiple chunks.
+    # ------------------------------------------------------------------
+    def _enforce_source_diversity(self, hits: List[Dict[str, Any]], max_per_source: int = MAX_CHUNKS_PER_SOURCE) -> List[Dict[str, Any]]:
+        if not hits:
+            return []
+        source_counts: Dict[str, int] = {}
+        diversified = []
+        for hit in hits:
+            source = hit.get("source", "Unknown")
+            count = source_counts.get(source, 0)
+            if count >= max_per_source:
+                continue
+            source_counts[source] = count + 1
+            diversified.append(hit)
+
+        if len(diversified) < len(hits):
+            logger.info(
+                f"[SourceDiversity] {len(hits)} hits -> {len(diversified)} after capping at "
+                f"{max_per_source}/source (sources: {list(source_counts.keys())})"
+            )
+        return diversified
+
+    def _dedupe_hits(self, hits: List[Dict[str, Any]], max_hits: int) -> List[Dict[str, Any]]:
+        """Removes near-duplicate evidence (text similarity above
+        DEDUP_SIMILARITY_THRESHOLD), keeping the higher-ranked copy.
+        Assumes hits are already in the desired priority order (i.e.
+        already reranked and diversity-capped) — this only walks that
+        order and drops duplicates, it does not re-sort."""
+        if not hits:
+            return []
 
         kept: List[Dict[str, Any]] = []
 
@@ -260,7 +335,6 @@ class ChatService:
                 kept_text = (kept_hit.get("text") or "").strip().lower()
                 if not kept_text:
                     continue
-
                 similarity = SequenceMatcher(None, text, kept_text).ratio()
                 if similarity >= DEDUP_SIMILARITY_THRESHOLD:
                     is_duplicate = True
@@ -268,14 +342,23 @@ class ChatService:
 
             if not is_duplicate:
                 kept.append(hit)
-
             if len(kept) >= max_hits:
                 break
 
         if len(hits) > len(kept):
-         logger.info(f"[EvidenceDedup] {len(hits)} hits -> {len(kept)} after semantic dedup (max={max_hits})")
+            logger.info(f"[EvidenceDedup] {len(hits)} hits -> {len(kept)} after semantic dedup (max={max_hits})")
 
         return kept
+
+    def _process_evidence(self, hits: List[Dict[str, Any]], query_text: str, max_hits: int) -> List[Dict[str, Any]]:
+        """Full evidence pipeline for one retrieval batch: rerank (semantic
+        + lexical blend) -> source diversity cap -> semantic dedup -> depth
+        cap. Order matters: rerank first so diversity/dedup operate on the
+        best ordering, not raw retrieval order."""
+        reranked = self._rerank_hits(hits, query_text)
+        diversified = self._enforce_source_diversity(reranked)
+        deduped = self._dedupe_hits(diversified, max_hits)
+        return deduped
 
     def _fetch_and_cache_kundli(self, session_id: str, session: Dict) -> str:
         try:
@@ -661,7 +744,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             life_area = qu.get("life_area") or ""
             comparison = qu.get("comparison") or []
 
-            # Adaptive RAG depth — compute once per question, use throughout
             depth = self._compute_retrieval_depth(message_text, qu)
 
             preferred_sources = TOPIC_RELEVANT_BOOKS.get(topic) if topic else None
@@ -685,14 +767,16 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     framework_chunks.append(cached_context)
             else:
                 framework_query = self._build_framework_query(message_text, topic, life_area)
+                # Retrieve wider than the target depth — reranking + diversity
+                # + dedup below will narrow it back down to depth["framework_max"].
                 framework_hits_raw = vector_store.dual_retrieve(
                     topic_query=framework_query,
                     global_query=message_text,
                     query_vector_topic=self.embeddings_provider.get_embedding(framework_query),
                     query_vector_global=self.embeddings_provider.get_embedding(message_text),
                     preferred_sources=preferred_sources,
-                    top_k_each=depth["framework_max"],
-                    final_top_k=depth["framework_max"],
+                    top_k_each=depth["framework_max"] * 2,
+                    final_top_k=depth["framework_max"] * 2,
                     alpha=settings.HYBRID_ALPHA,
                 )
                 framework_hits_raw = [h for h in framework_hits_raw if h["score"] >= settings.MIN_RAG_RELEVANCE]
@@ -703,16 +787,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 if not framework_hits_raw:
                     logger.info("[RAGFirst] no sufficiently relevant framework chunks — continuing with comparison/personalized retrieval anyway")
                 else:
-                    pre_dedup_hits = []
+                    pre_process_hits = []
                     for hit in framework_hits_raw:
                         source = hit["metadata"].get("source", "Unknown")
                         page = hit["metadata"].get("page")
-                        pre_dedup_hits.append({
+                        pre_process_hits.append({
                             "source": source, "page": page, "score": hit["score"],
                             "text": hit["text"], "stage": "framework",
                         })
 
-                    framework_rag_hits = self._dedupe_hits(pre_dedup_hits, depth["framework_max"])
+                    # Reranking + Source Diversity + Dedup
+                    framework_rag_hits = self._process_evidence(pre_process_hits, message_text, depth["framework_max"])
 
                     for i, hit in enumerate(framework_rag_hits):
                         seen_keys.add((hit["source"], hit["page"]))
@@ -744,14 +829,14 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         branch_vector = self.embeddings_provider.get_embedding(branch_query)
                         branch_results = vector_store.hybrid_search(
                             query=branch_query, query_vector=branch_vector,
-                            top_k=depth["comparison_max_per_branch"] + 1,  # small headroom before dedup
+                            top_k=(depth["comparison_max_per_branch"] * 2) + 1,
                             alpha=settings.HYBRID_ALPHA
                         )
                     except Exception as e:
                         logger.error(f"[Comparison] retrieval failed for branch '{branch}': {e}")
                         continue
 
-                    branch_rag_hits_raw = []
+                    branch_pre_process = []
                     for hit in branch_results:
                         if hit["score"] < settings.MIN_RAG_RELEVANCE:
                             continue
@@ -760,12 +845,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         key = (source, page)
                         if key in seen_keys:
                             continue
-                        branch_rag_hits_raw.append({
+                        branch_pre_process.append({
                             "source": source, "page": page, "score": hit["score"],
                             "text": hit["text"], "stage": "comparison", "branch": branch,
                         })
 
-                    branch_rag_hits = self._dedupe_hits(branch_rag_hits_raw, depth["comparison_max_per_branch"])
+                    branch_rag_hits = self._process_evidence(branch_pre_process, branch_query, depth["comparison_max_per_branch"])
                     for hit in branch_rag_hits:
                         seen_keys.add((hit["source"], hit["page"]))
                         comparison_hits.append(hit)
@@ -794,25 +879,25 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 query_vector_topic=personalized_vector,
                 query_vector_global=personalized_vector,
                 preferred_sources=preferred_sources,
-                top_k_each=depth["personalized_max"] + 2,  # headroom before dedup
-                final_top_k=depth["personalized_max"] + 2,
+                top_k_each=depth["personalized_max"] * 2,
+                final_top_k=depth["personalized_max"] * 2,
                 alpha=settings.HYBRID_ALPHA,
             )
             personalized_hits_raw = [h for h in personalized_hits_raw if h["score"] >= settings.MIN_RAG_RELEVANCE]
 
-            pre_dedup_personalized = []
+            pre_process_personalized = []
             for hit in personalized_hits_raw:
                 source = hit["metadata"].get("source", "Unknown")
                 page = hit["metadata"].get("page")
                 key = (source, page)
                 if key in seen_keys:
                     continue
-                pre_dedup_personalized.append({
+                pre_process_personalized.append({
                     "source": source, "page": page, "score": hit["score"],
                     "text": hit["text"], "stage": "personalized",
                 })
 
-            personalized_rag_hits = self._dedupe_hits(pre_dedup_personalized, depth["personalized_max"])
+            personalized_rag_hits = self._process_evidence(pre_process_personalized, message_text, depth["personalized_max"])
 
             personalized_chunks = []
             for i, hit in enumerate(personalized_rag_hits):
@@ -891,27 +976,30 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 query_vector_topic=self.embeddings_provider.get_embedding(query),
                 query_vector_global=self.embeddings_provider.get_embedding(message_text),
                 preferred_sources=preferred_sources,
-                top_k_each=6,
-                final_top_k=settings.TOP_K_RETRIEVAL,
+                top_k_each=12,
+                final_top_k=12,
                 alpha=settings.HYBRID_ALPHA,
             )
 
             hits = [h for h in hits if h["score"] >= settings.MIN_RAG_RELEVANCE]
 
-            chunks, rag_hits = [], []
-
-            for i, hit in enumerate(hits):
+            pre_process = []
+            for hit in hits:
                 source = hit["metadata"].get("source", "Unknown")
                 page = hit["metadata"].get("page")
-                page_label = f", Page: {page}" if page is not None else ""
-
-                chunks.append(
-                    f"--- Follow-up Evidence {i+1} [Source: {source}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
-                )
-                rag_hits.append({
+                pre_process.append({
                     "source": source, "page": page, "score": hit["score"],
                     "text": hit["text"], "stage": "followup",
                 })
+
+            rag_hits = self._process_evidence(pre_process, message_text, settings.TOP_K_RETRIEVAL)
+
+            chunks = []
+            for i, hit in enumerate(rag_hits):
+                page_label = f", Page: {hit['page']}" if hit["page"] is not None else ""
+                chunks.append(
+                    f"--- Follow-up Evidence {i+1} [Source: {hit['source']}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
+                )
 
             logger.info(f"[FollowUpRAG] retrieved {len(rag_hits)} supporting chunks")
             return "\n".join(chunks), rag_hits
@@ -953,12 +1041,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             logger.error(f"Failed to save topic cache for '{topic}': {e}")
 
     def _get_topic_bundle(self, session_id: str, session: Dict, topic: Optional[str], language: str) -> Dict[str, Any]:
-        """NOTE: 'timeline' is deliberately NOT part of this bundle anymore —
-        it's computed separately in _prepare_common_context, gated by
-        requires_timing (see Timing-Gated Dasha Retrieval), since whether a
-        Dasha timeline is needed depends on the CURRENT message, not on the
-        topic alone, and shouldn't be permanently baked into a per-topic
-        cache entry."""
         empty = {"emphasis": "", "divisional": "", "consistency": "", "missing_evidence": "", "evidence_vote": None, "consensus_label": "LOW"}
         if not topic:
             return empty
@@ -1192,12 +1274,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             missing_evidence = bundle["missing_evidence"]
             evidence_vote = bundle.get("evidence_vote")
 
-        # --- TIMING-GATED DASHA RETRIEVAL ---
-        # Only fetch/build the Dasha timeline (and, on a cold session, trigger
-        # the external Dasha API call it depends on) when the query-
-        # understanding step actually flagged this question as needing
-        # timing. A "what does my 10th house mean" question never touches
-        # this; a "when will I get a job" question does.
         dasha_timeline_str = ""
         requires_timing = bool(query_understanding.get("requires_timing"))
         if topic and requires_timing:
@@ -1570,8 +1646,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 if comparison:
                     qu_detail += f"\n\nComparing: {' vs '.join(comparison)}"
                 qu_detail += f"\n\nTiming/Dasha relevant: {'Yes' if requires_timing else 'No'}"
-                if not requires_timing:
-                    qu_detail += " (Dasha timeline retrieval was skipped for this question — see 'Timing-Gated Retrieval' note in Dasha & Timing step)"
             else:
                 qu_detail = (
                     "Query understanding was not available for this response — "
@@ -1631,7 +1705,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     seen_p.add(key)
                     ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
                     p_sources.append(f"• {ref}")
-                evidence_lines.append("Personalized retrieval (using chart configuration, ranked, deduplicated, adaptive depth):")
+                evidence_lines.append("Personalized retrieval (reranked by lexical+semantic relevance, source-diversity capped, deduplicated):")
                 evidence_lines.extend(p_sources)
 
             if comparison_hits_trace:
@@ -1773,13 +1847,14 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 reference_lines.append(f"• {reference}")
 
             evidence_detail_step7 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
-            steps.append({"step": 7, "title": "Classical Evidence (Ranked, Deduplicated, Adaptive Depth)", "detail": evidence_detail_step7, "type": "evidence"})
+            steps.append({"step": 7, "title": "Classical Evidence (Reranked, Source-Diversified, Deduplicated)", "detail": evidence_detail_step7, "type": "evidence"})
 
             synthesis_detail = (
-                "The final interpretation combines the retrieved classical evidence (ranked, deduplicated, "
-                "and depth-scaled to this question's complexity), verified chart placements, comparative "
-                "branch analysis (if applicable), timing-gated Dasha data (only when actually needed), "
-                "current-date temporal filtering, and the relevant Kundli and Dasha information."
+                "The final interpretation combines evidence that was reranked by lexical+semantic relevance "
+                "to the actual question, capped so no single source dominates, deduplicated, and depth-scaled "
+                "to this question's complexity — along with verified chart placements, comparative branch "
+                "analysis (if applicable), timing-gated Dasha data (only when needed), current-date temporal "
+                "filtering, and the relevant Kundli and Dasha information."
             )
             steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 

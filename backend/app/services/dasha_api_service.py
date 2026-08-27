@@ -2,7 +2,7 @@ import json
 import urllib.request
 import urllib.error
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 from app.utils.logger import logger
 
@@ -11,9 +11,8 @@ DATE_FORMAT = "%d/%m/%Y %H:%M:%S"
 import os
 
 DASHA_LAMBDA_URL = "https://bivrov2febq5ued37psv2hcxyi0wlxet.lambda-url.ap-south-1.on.aws/"
-DASHA_LAMBDA_BEARER_TOKEN = os.environ.get("DASHA_LAMBDA_BEARER_TOKEN", "f83c6105-1731-4cd9-9d94-9543ff01bfe1") # Fallback for now to not break anything
+DASHA_LAMBDA_BEARER_TOKEN = os.environ.get("DASHA_LAMBDA_BEARER_TOKEN", "f83c6105-1731-4cd9-9d94-9543ff01bfe1")
 
-# Confirmed working value — casing matters ("Mahadasha", not "MahaDasha").
 FEATURE = "Mahadasha"
 
 
@@ -64,7 +63,6 @@ class DashaApiService:
 
                 logger.info(f"Dasha API response fetched successfully (attempt {attempt})")
 
-                # Handle API Gateway envelope: {"body": "...json string..."}
                 if isinstance(response, dict) and "body" in response:
                     body_value = response["body"]
                     response = json.loads(body_value) if isinstance(body_value, str) else body_value
@@ -92,7 +90,7 @@ class DashaApiService:
                 error_body = e.read().decode("utf-8")
                 if 400 <= e.code < 500:
                     logger.error(f"Dasha API rejected request (HTTP {e.code}): {error_body}")
-                    return None  # 4xx won't fix itself on retry
+                    return None
                 logger.warning(f"Dasha API HTTP error {e.code} on attempt {attempt}: {error_body}")
 
             except Exception as e:
@@ -154,13 +152,33 @@ class DashaApiService:
             }
 
         return result
-    
-    
+
+    def fetch_tree_and_current_period(
+        self,
+        date: str,
+        time: str,
+        latitude: float,
+        longitude: float,
+        ascendant_data: Dict,
+        timezone_name: str = "Asia/Kolkata",
+        language: str = "english",
+    ) -> Tuple[Optional[List[Dict]], Optional[Dict]]:
+        """PERFORMANCE FIX: single external API call that returns BOTH the
+        full Dasha tree AND the derived current period, so callers never
+        need to hit the Dasha Lambda twice for the same birth data — once
+        for 'what's the current period' and again for 'give me the full
+        upcoming timeline'. Both come from this one fetch. Returns
+        (tree, current_period) — either half may be None on failure."""
+        tree = self.fetch_dasha_tree(
+            date=date, time=time, latitude=latitude, longitude=longitude,
+            ascendant_data=ascendant_data, timezone_name=timezone_name, language=language,
+        )
+        if not tree:
+            return None, None
+        current_period = self.find_current_period(tree)
+        return tree, current_period
+
     def flatten_periods(self, dasha_tree: List[Dict], level: str = "antardasha") -> List[Dict]:
-        """Flattens the nested Mahadasha -> Antardasha tree into a single
-        chronological list of periods at the requested level. Each period
-        includes which Mahadasha it belongs to, so downstream code can
-        reason about combinations (e.g. 'Venus Mahadasha + Jupiter Antardasha')."""
         flat = []
         for maha in dasha_tree:
             maha_lord = maha.get("mahadasha") or maha.get("mahadasha_display")
@@ -183,9 +201,6 @@ class DashaApiService:
         return flat
 
     def get_upcoming_periods(self, dasha_tree: List[Dict], months_ahead: int = 60) -> List[Dict]:
-        """Returns Antardasha-level periods from today through `months_ahead`
-        months into the future — the practical window for 'when will X happen'
-        questions (5 years by default)."""
         now = datetime.now()
         cutoff = now.replace(year=now.year + (months_ahead // 12))
 
@@ -197,9 +212,9 @@ class DashaApiService:
             if not start or not end:
                 continue
             if end < now:
-                continue  # already passed
+                continue
             if start > cutoff:
-                break  # too far ahead, stop scanning (tree is chronological)
+                break
             upcoming.append(period)
         return upcoming
 

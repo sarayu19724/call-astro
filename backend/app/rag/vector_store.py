@@ -1,7 +1,8 @@
 import os
 import json
-import pickle
+import threading
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Tuple, Optional
 from app.config.settings import settings
 from app.utils.logger import logger
@@ -15,7 +16,25 @@ class LocalVectorStore:
         self.chunks: List[Dict] = []
         self.vectors: Optional[np.ndarray] = None
 
+        # PERFORMANCE FIX: normalized vectors were previously recomputed
+        # (full matrix norm + divide) on EVERY single hybrid_search() call —
+        # wasted O(N*D) work repeated identically across the several
+        # searches a single question triggers (framework, personalized,
+        # comparison x N, counter-evidence, ...). Now computed once here
+        # and invalidated only when the underlying data actually changes.
+        self._normalized_vectors: Optional[np.ndarray] = None
+        self._norm_lock = threading.Lock()
+
         self.load()
+
+    def _rebuild_normalized_cache(self):
+        with self._norm_lock:
+            if self.vectors is None or len(self.vectors) == 0:
+                self._normalized_vectors = None
+                return
+            v_norms = np.linalg.norm(self.vectors, axis=1, keepdims=True)
+            v_norms[v_norms == 0] = 1.0
+            self._normalized_vectors = self.vectors / v_norms
 
     def load(self):
         logger.info(f"[VectorStore] data_dir = {self.data_dir}")
@@ -24,25 +43,27 @@ class LocalVectorStore:
 
         try:
             if os.path.exists(self.chunks_path) and os.path.exists(self.vectors_path):
-              with open(self.chunks_path, "r", encoding="utf-8") as f:
-                self.chunks = json.load(f)
+                with open(self.chunks_path, "r", encoding="utf-8") as f:
+                    self.chunks = json.load(f)
 
-              self.vectors = np.load(self.vectors_path)
+                self.vectors = np.load(self.vectors_path)
 
-              logger.info(
-                f"[VectorStore] Loaded {len(self.chunks)} chunks and vectors from local cache."
-             )
+                logger.info(
+                    f"[VectorStore] Loaded {len(self.chunks)} chunks and vectors from local cache."
+                )
             else:
-              logger.warning(
-                "[VectorStore] VECTOR STORE NOT FOUND — starting with empty store."
-            )
-              self.chunks = []
-              self.vectors = None
+                logger.warning(
+                    "[VectorStore] VECTOR STORE NOT FOUND — starting with empty store."
+                )
+                self.chunks = []
+                self.vectors = None
 
         except Exception as e:
             logger.error(f"[VectorStore] Error loading vector store: {e}")
             self.chunks = []
             self.vectors = None
+
+        self._rebuild_normalized_cache()
 
     def save(self):
         try:
@@ -59,6 +80,7 @@ class LocalVectorStore:
     def clear(self):
         self.chunks = []
         self.vectors = None
+        self._normalized_vectors = None
         if os.path.exists(self.chunks_path):
             os.remove(self.chunks_path)
         if os.path.exists(self.vectors_path):
@@ -76,6 +98,7 @@ class LocalVectorStore:
         else:
             self.chunks.extend(new_chunks)
             self.vectors = np.vstack([self.vectors, new_vectors])
+        self._rebuild_normalized_cache()
         self.save()
 
     def _lexical_score(self, text: str, query_tokens: List[str]) -> float:
@@ -92,12 +115,12 @@ class LocalVectorStore:
     def hybrid_search(self, query: str, query_vector: List[float], top_k: int = 5,
                        alpha: float = 0.5, preferred_sources: Optional[List[str]] = None,
                        boost_factor: float = 1.4) -> List[Dict]:
-        """Combined semantic + lexical search. If preferred_sources is given,
-        chunks from those source files get a scoring boost — they are NOT
-        the only chunks searchable, the whole store stays in play (per your
-        architecture principle: 'the entire knowledge base should remain
-        searchable', TOPIC_RELEVANT_BOOKS is a preference, not a filter)."""
-        if not self.chunks or self.vectors is None:
+        """Combined semantic + lexical search. Uses the PRE-NORMALIZED
+        vector matrix cached at load/add time instead of renormalizing the
+        entire store on every call — this was previously the single most
+        repeated wasted computation across a question's multiple retrieval
+        stages."""
+        if not self.chunks or self.vectors is None or self._normalized_vectors is None:
             return []
 
         q_vec = np.array(query_vector, dtype=np.float32)
@@ -105,10 +128,7 @@ class LocalVectorStore:
         if q_norm > 0:
             q_vec = q_vec / q_norm
 
-        v_norms = np.linalg.norm(self.vectors, axis=1, keepdims=True)
-        v_norms[v_norms == 0] = 1.0
-        normalized_vectors = self.vectors / v_norms
-        cosine_scores = np.dot(normalized_vectors, q_vec)
+        cosine_scores = np.dot(self._normalized_vectors, q_vec)
 
         min_cos, max_cos = cosine_scores.min(), cosine_scores.max()
         range_cos = max_cos - min_cos
@@ -147,34 +167,38 @@ class LocalVectorStore:
     def dual_retrieve(self, topic_query: str, global_query: str, query_vector_topic: List[float],
                        query_vector_global: List[float], preferred_sources: Optional[List[str]] = None,
                        top_k_each: int = 6, final_top_k: int = 6, alpha: float = 0.5) -> List[Dict]:
-        """Implements: Topic-preferred Search + Global Search → Merge +
-        Deduplicate → Rerank → Best Relevant Chunks (per your architecture
-        diagram). Two retrieval passes:
-          1. topic_query, boosted toward preferred_sources (if any)
-          2. global_query (usually the raw user message), unboosted — covers
-             the whole knowledge base without topic bias, so a good chunk
-             from an unrelated-seeming book isn't excluded just because it
-             wasn't in TOPIC_RELEVANT_BOOKS.
-        Results are merged, deduplicated by (source, chunk_index), then
-        reranked by combined_score across the merged set."""
-        topic_hits = self.hybrid_search(
-            query=topic_query, query_vector=query_vector_topic,
-            top_k=top_k_each, alpha=alpha, preferred_sources=preferred_sources
-        ) if preferred_sources else []
+        """Topic-preferred Search + Global Search → Merge + Deduplicate →
+        Rerank → Best Relevant Chunks. The two hybrid_search() calls are
+        independent read-only operations over the same (now pre-normalized)
+        data, so they're run concurrently via a thread pool — this is CPU-
+        bound numpy work, so the win is smaller than for network-bound
+        embedding calls, but it's free given the normalized-vector cache
+        above makes each call itself much cheaper too."""
+        def _run_topic():
+            if not preferred_sources:
+                return []
+            return self.hybrid_search(
+                query=topic_query, query_vector=query_vector_topic,
+                top_k=top_k_each, alpha=alpha, preferred_sources=preferred_sources
+            )
 
-        global_hits = self.hybrid_search(
-            query=global_query, query_vector=query_vector_global,
-            top_k=top_k_each, alpha=alpha, preferred_sources=None
-        )
+        def _run_global():
+            return self.hybrid_search(
+                query=global_query, query_vector=query_vector_global,
+                top_k=top_k_each, alpha=alpha, preferred_sources=None
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            topic_future = executor.submit(_run_topic)
+            global_future = executor.submit(_run_global)
+            topic_hits = topic_future.result()
+            global_hits = global_future.result()
 
         merged: Dict[Tuple[str, int], Dict] = {}
         for hit in topic_hits + global_hits:
             source = hit.get("metadata", {}).get("source", "unknown")
             chunk_idx = hit.get("metadata", {}).get("chunk_index", -1)
             key = (source, chunk_idx)
-            # Deduplicate: if this exact chunk appeared in both passes,
-            # keep whichever scored higher (it may have been boosted in
-            # the topic pass, which is a meaningful signal to keep).
             if key not in merged or hit["score"] > merged[key]["score"]:
                 merged[key] = hit
 

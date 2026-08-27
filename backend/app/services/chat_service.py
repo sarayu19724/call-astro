@@ -24,7 +24,8 @@ from app.services.topic_service import (
 )
 from app.services.dasha_api_service import dasha_api_service
 from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
-
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 TOPIC_BUNDLE_LOGIC_VERSION = 3
 FRAMEWORK_CACHE_VERSION = 1
@@ -84,7 +85,13 @@ SIMPLE_LOOKUP_PATTERNS = [
 class ChatService:
     def __init__(self):
         self.embeddings_provider = EmbeddingsProvider()
-
+    
+    def _get_embeddings_parallel(self, texts: List[str]) -> List[List[float]]:
+        """Thin wrapper over EmbeddingsProvider.get_embeddings_parallel —
+        used wherever this service needs 2+ INDEPENDENT embeddings for a
+        single request (e.g. framework_query + raw message_text) so they
+        fire concurrently instead of one-after-another."""
+        return self.embeddings_provider.get_embeddings_parallel(texts)
     def _format_history_for_llm(self, history: List[Dict[str, str]]) -> str:
         formatted = []
         for msg in history:
@@ -487,7 +494,7 @@ class ChatService:
     def _is_simple_chart_lookup(self, message_text: str) -> bool:
         text = message_text.strip().lower()
         return any(re.search(p, text) for p in SIMPLE_LOOKUP_PATTERNS)
-
+    
     def _fetch_and_cache_kundli(self, session_id: str, session: Dict) -> str:
         try:
             coords = geocoding_service.geocode(session.get("birth_place"))
@@ -503,14 +510,42 @@ class ChatService:
                 date=session.get("dob"), time=time_24h, latitude=lat, longitude=lon,
             )
             if kundli_data:
-                dasha_info = kundli_service.get_real_or_calculated_dasha(
-                    kundli_data, session.get("dob"), time_24h, lat, lon
-                )
+                # PERFORMANCE FIX: single Dasha API call instead of two.
+                # Previously, kundli_service.get_real_or_calculated_dasha()
+                # fetched the full Dasha tree just to derive the current
+                # period, and dasha_tree_raw was set to None here — so the
+                # FIRST time a timing question came in, _get_dasha_timeline
+                # fetched the SAME tree again from the same external
+                # Lambda. Now the tree is fetched once, right here, and
+                # cached — _get_dasha_timeline will find it already present.
+                dasha_tree = None
+                dasha_info = None
+                try:
+                    ascendant_data = kundli_service.get_ascendant_data(kundli_data)
+                    if ascendant_data:
+                        dasha_tree, dasha_info = dasha_api_service.fetch_tree_and_current_period(
+                            date=session.get("dob"), time=time_24h,
+                            latitude=lat, longitude=lon, ascendant_data=ascendant_data,
+                        )
+                except Exception as tree_err:
+                    logger.warning(f"[DashaSingleFetch] direct tree fetch failed, falling back: {tree_err}")
+
+                if not dasha_info:
+                    # Fallback to existing kundli_service logic (calculated
+                    # Vimshottari fallback lives there) — only hit when the
+                    # direct single fetch above didn't produce a usable
+                    # current period.
+                    dasha_info = kundli_service.get_real_or_calculated_dasha(
+                        kundli_data, session.get("dob"), time_24h, lat, lon
+                    )
+                    dasha_tree = None  # unknown provenance — don't cache as authoritative tree
+
                 kundli_str = kundli_service.summarize_kundli(kundli_data, dob=session.get("dob"))
                 chart_data = kundli_service.extract_chart_data(kundli_data)
                 chart_json = json.dumps(chart_data) if chart_data else None
                 dasha_json = json.dumps(dasha_info) if dasha_info else None
                 full_raw_json = json.dumps(kundli_data, ensure_ascii=False)
+                dasha_tree_json = json.dumps(dasha_tree, ensure_ascii=False) if dasha_tree else None
 
                 yoga_text = ""
                 if chart_data:
@@ -530,16 +565,21 @@ class ChatService:
                     "yoga_text": yoga_text,
                     "topic_cache": None,
                     "framework_cache": None,
-                    "dasha_tree_raw": None,
+                    "dasha_tree_raw": dasha_tree_json,
                 }
                 db.update_session(session_id, updates)
                 session.update(updates)
-                logger.info("Kundli data fetched and cached (summary + chart + dasha + full raw + yoga)")
+                logger.info(
+                    f"Kundli data fetched and cached (summary + chart + dasha + full raw + yoga); "
+                    f"Dasha tree {'cached in same pass' if dasha_tree_json else 'NOT cached — will fetch on first timing question'}"
+                )
                 return kundli_str
         except Exception as kundli_err:
             logger.error(f"Kundli fetch failed: {kundli_err}")
 
         return "No chart data available."
+    
+    
 
     def _get_rag_context(self, message_text: str, topic: Optional[str] = None):
         try:
@@ -895,12 +935,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     framework_chunks.append(cached_context)
             else:
                 framework_query = self._build_framework_query(message_text, topic, life_area)
+                _fw_vecs = self._get_embeddings_parallel([framework_query, message_text])
                 framework_hits_raw = vector_store.dual_retrieve(
                     topic_query=framework_query,
                     global_query=message_text,
-                    query_vector_topic=self.embeddings_provider.get_embedding(framework_query),
-                    query_vector_global=self.embeddings_provider.get_embedding(message_text),
-                    preferred_sources=preferred_sources,
+                    query_vector_topic=_fw_vecs[0],
+                    query_vector_global=_fw_vecs[1],
                     top_k_each=depth["framework_max"] * 2,
                     final_top_k=depth["framework_max"] * 2,
                     alpha=settings.HYBRID_ALPHA,
@@ -1637,11 +1677,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             db.add_message(session_id, "assistant", response_text)
 
-            try:
-                trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], response_text, ctx["query_understanding"], ctx.get("is_simple_lookup", False))
-                db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
-            except Exception as trace_err:
-                logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
+            self._build_and_save_trace_background(session_id, dict(session), topic, ctx["rag_hits"], ctx["targeted_facts"], response_text, ctx["query_understanding"], ctx.get("is_simple_lookup", False))
             self._update_topic_memory(session_id, session, topic, response_text)
 
             suggestions = []
@@ -1753,13 +1789,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             db.add_message(session_id, "assistant", full_text)
 
-            try:
-                trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], full_text, ctx["query_understanding"], ctx.get("is_simple_lookup", False))
-                db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
-            except Exception as trace_err:
-                logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
+            self._build_and_save_trace_background(session_id, dict(session), topic, ctx["rag_hits"], ctx["targeted_facts"], full_text, ctx["query_understanding"], ctx.get("is_simple_lookup", False))
             self._update_topic_memory(session_id, session, topic, full_text)
-
             suggestions = get_instant_suggestions(topic, language)
 
             yield {"type": "done", "session_id": session_id, "message": full_text,
@@ -1773,7 +1804,29 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             yield {"type": "chunk", "text": fallback}
             yield {"type": "done", "session_id": session_id, "message": fallback,
                    "dob": None, "birth_time": None, "birth_place": None, "language": "Hinglish"}
+    def _build_and_save_trace_background(self, session_id: str, session_snapshot: Dict, topic: Optional[str],
+                                           rag_hits: List[Dict[str, Any]], targeted_facts: str, response_text: str,
+                                           query_understanding: Dict[str, Any], is_simple_lookup: bool):
+        """Runs _build_reasoning_trace + its DB save on a background daemon
+        thread. session_snapshot is a shallow copy taken at call time so the
+        background thread reads a consistent view even if the live session
+        dict is mutated afterward by the calling request. This never blocks
+        the user-visible response — if it fails, only the 'How I Reached
+        This' panel is stale for this turn, nothing else is affected."""
+        def _worker():
+            try:
+                trace = self._build_reasoning_trace(
+                    session_snapshot, topic, rag_hits, targeted_facts, response_text,
+                    query_understanding, is_simple_lookup
+                )
+                db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
+                logger.info(f"[BackgroundTrace] saved {len(trace)}-step trace for session {session_id}")
+            except Exception as e:
+                logger.error(f"[BackgroundTrace] failed: {e}", exc_info=True)
 
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+    
     def _build_reasoning_trace(
         self,
         session: Dict,

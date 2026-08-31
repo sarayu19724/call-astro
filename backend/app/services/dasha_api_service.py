@@ -1,19 +1,25 @@
 import json
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 
 from app.utils.logger import logger
 
 DATE_FORMAT = "%d/%m/%Y %H:%M:%S"
 
-import os
-
 DASHA_LAMBDA_URL = "https://bivrov2febq5ued37psv2hcxyi0wlxet.lambda-url.ap-south-1.on.aws/"
-DASHA_LAMBDA_BEARER_TOKEN = os.environ.get("DASHA_LAMBDA_BEARER_TOKEN", "f83c6105-1731-4cd9-9d94-9543ff01bfe1")
+DASHA_LAMBDA_BEARER_TOKEN = "f83c6105-1731-4cd9-9d94-9543ff01bfe1"
 
-FEATURE = "Mahadasha"
+REQUIREMENTS_CANDIDATES = ["Dasha", "VimshottariDasha", "MahaDasha", "DashaDetails", "all_dasha"]
+FEATURE = "Dasha"  # confirmed-working value, tried first via REQUIREMENTS_CANDIDATES ordering
+
+
+def _profile(label: str, start: float):
+    elapsed = time.perf_counter() - start
+    logger.info(f"[Profile][DashaAPI] {label}: {elapsed:.3f}s")
+    return elapsed
 
 
 def _parse_dt(date_str: str) -> Optional[datetime]:
@@ -24,6 +30,68 @@ def _parse_dt(date_str: str) -> Optional[datetime]:
 
 
 class DashaApiService:
+
+    def _try_fetch(self, payload: Dict, max_retries: int) -> Optional[List[Dict]]:
+        req = urllib.request.Request(
+            DASHA_LAMBDA_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {DASHA_LAMBDA_BEARER_TOKEN}",
+            },
+            method="POST",
+        )
+
+        for attempt in range(1, max_retries + 2):
+            t0 = time.perf_counter()
+            try:
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    response = json.loads(resp.read().decode("utf-8"))
+
+                _profile(f"HTTP call (requirements={payload.get('requirements')}, attempt {attempt})", t0)
+
+                if isinstance(response, list):
+                    return response
+
+                if isinstance(response, dict):
+                    for key in ("mahadasha", "dasha", "vimshottari", "data", "result"):
+                        if key in response and isinstance(response[key], list):
+                            return response[key]
+                    logger.warning(
+                        f"Dasha API returned unexpected keys "
+                        f"(requirements={payload.get('requirements')}): {list(response.keys())}"
+                    )
+                    return None
+
+                return None
+
+            except urllib.error.HTTPError as e:
+                _profile(f"HTTP call FAILED {e.code} (attempt {attempt})", t0)
+                error_body = e.read().decode("utf-8")
+                if 400 <= e.code < 500:
+                    logger.warning(
+                        f"Dasha API rejected requirements={payload.get('requirements')!r} "
+                        f"(HTTP {e.code}): {error_body}"
+                    )
+                    return None
+                logger.warning(
+                    f"Dasha API HTTP error {e.code} on attempt {attempt} "
+                    f"(requirements={payload.get('requirements')}): {error_body}"
+                )
+
+            except Exception as e:
+                _profile(f"HTTP call ERRORED (attempt {attempt})", t0)
+                logger.warning(
+                    f"Dasha API request failed on attempt {attempt} "
+                    f"(requirements={payload.get('requirements')}): {e}"
+                )
+
+        logger.error(
+            f"Dasha API fetch failed after {max_retries + 1} attempts "
+            f"(requirements={payload.get('requirements')})"
+        )
+        return None
+
     def fetch_dasha_tree(
         self,
         date: str,
@@ -35,69 +103,74 @@ class DashaApiService:
         language: str = "english",
         max_retries: int = 2,
     ) -> Optional[List[Dict]]:
-        payload = {
-            "requirements": [FEATURE],
-            "dateOfBirth": date,
-            "time_of_birth": time,
-            "latitude": str(latitude),
-            "longitude": str(longitude),
-            "timezone_name": timezone_name,
-            "language": language,
-            "ascendant_data": ascendant_data,
-        }    
-        
-        req = urllib.request.Request(
-            DASHA_LAMBDA_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {DASHA_LAMBDA_BEARER_TOKEN}",
-            },
-            method="POST",
-        )
-        logger.info(f"Dasha API payload being sent: {json.dumps(payload, default=str)}")
-        for attempt in range(1, max_retries + 2):
-            try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    response = json.loads(resp.read().decode("utf-8"))
+        t_total = time.__class__  # noop guard, real timing below
+        import time as _time
+        t_total = _time.perf_counter()
 
-                logger.info(f"Dasha API response fetched successfully (attempt {attempt})")
+        for req_value in REQUIREMENTS_CANDIDATES:
+            payload = {
+                "requirements": [req_value],
+                "dateOfBirth": date,
+                "time_of_birth": time,
+                "latitude": str(latitude),
+                "longitude": str(longitude),
+                "timezone_name": timezone_name,
+                "language": language,
+                "ascendant_data": ascendant_data,
+            }
 
-                if isinstance(response, dict) and "body" in response:
-                    body_value = response["body"]
-                    response = json.loads(body_value) if isinstance(body_value, str) else body_value
-                
-                if isinstance(response, list):
-                    return response
+            result = self._try_fetch(payload, max_retries)
+            if result is not None:
+                logger.info(f"Dasha API succeeded with requirements=['{req_value}'] — locking this in for future calls")
+                if req_value in REQUIREMENTS_CANDIDATES:
+                    REQUIREMENTS_CANDIDATES.remove(req_value)
+                    REQUIREMENTS_CANDIDATES.insert(0, req_value)
+                _profile(f"fetch_dasha_tree TOTAL (succeeded with '{req_value}')", t_total)
+                return result
 
-                if isinstance(response, dict) and FEATURE in response:
-                    feature_value = response[FEATURE]
-                    if isinstance(feature_value, str):
-                        try:
-                            feature_value = json.loads(feature_value)
-                        except json.JSONDecodeError:
-                            logger.error(f"Dasha API '{FEATURE}' value was an unparseable string: {str(feature_value)[:200]}")
-                            return None
-                    if isinstance(feature_value, list):
-                        return feature_value
-                    logger.warning(f"Dasha API '{FEATURE}' value has unexpected type: {type(feature_value)}")
-                    return None
-
-                logger.warning(f"Dasha API returned unexpected shape: {type(response)}")
-                return None
-                
-            except urllib.error.HTTPError as e:
-                error_body = e.read().decode("utf-8")
-                if 400 <= e.code < 500:
-                    logger.error(f"Dasha API rejected request (HTTP {e.code}): {error_body}")
-                    return None
-                logger.warning(f"Dasha API HTTP error {e.code} on attempt {attempt}: {error_body}")
-
-            except Exception as e:
-                logger.warning(f"Dasha API request failed on attempt {attempt}: {e}")
-
-        logger.error(f"Dasha API fetch failed after {max_retries + 1} attempts")
+        _profile("fetch_dasha_tree TOTAL (all candidates failed)", t_total)
+        logger.error(f"Dasha API failed for all requirements candidates: {REQUIREMENTS_CANDIDATES}")
         return None
+
+    def flatten_periods(self, dasha_tree: List[Dict], level: str = "antardasha") -> List[Dict]:
+        flat = []
+        for maha in dasha_tree:
+            maha_lord = maha.get("mahadasha") or maha.get("mahadasha_display")
+            if level == "mahadasha":
+                flat.append({
+                    "mahadasha": maha_lord,
+                    "antardasha": None,
+                    "start": maha.get("start"),
+                    "end": maha.get("end"),
+                })
+                continue
+            for antar in maha.get("antardasha", []):
+                antar_lord = antar.get("antardasha") or antar.get("antardasha_display")
+                flat.append({
+                    "mahadasha": maha_lord,
+                    "antardasha": antar_lord,
+                    "start": antar.get("start"),
+                    "end": antar.get("end"),
+                })
+        return flat
+
+    def get_upcoming_periods(self, dasha_tree: List[Dict], months_ahead: int = 60) -> List[Dict]:
+        now = datetime.now()
+        cutoff = now.replace(year=now.year + (months_ahead // 12))
+
+        all_periods = self.flatten_periods(dasha_tree, level="antardasha")
+        upcoming = []
+        for period in all_periods:
+            end = _parse_dt(period.get("end", ""))
+            start = _parse_dt(period.get("start", ""))
+            if not start or not end:
+                continue
+            if end < now:
+                continue
+            if start > cutoff:
+                break
+            upcoming.append(period)
+        return upcoming
 
     def find_current_period(self, dasha_tree: List[Dict]) -> Optional[Dict]:
         now = datetime.now()
@@ -115,7 +188,7 @@ class DashaApiService:
             return None
 
         current_antar = None
-        for antar in current_maha.get("antardashas", []):
+        for antar in current_maha.get("antardasha", []):
             antar_start = _parse_dt(antar.get("start", ""))
             antar_end = _parse_dt(antar.get("end", ""))
             if antar_start and antar_end and antar_start <= now <= antar_end:
@@ -152,71 +225,6 @@ class DashaApiService:
             }
 
         return result
-
-    def fetch_tree_and_current_period(
-        self,
-        date: str,
-        time: str,
-        latitude: float,
-        longitude: float,
-        ascendant_data: Dict,
-        timezone_name: str = "Asia/Kolkata",
-        language: str = "english",
-    ) -> Tuple[Optional[List[Dict]], Optional[Dict]]:
-        """PERFORMANCE FIX: single external API call that returns BOTH the
-        full Dasha tree AND the derived current period, so callers never
-        need to hit the Dasha Lambda twice for the same birth data — once
-        for 'what's the current period' and again for 'give me the full
-        upcoming timeline'. Both come from this one fetch. Returns
-        (tree, current_period) — either half may be None on failure."""
-        tree = self.fetch_dasha_tree(
-            date=date, time=time, latitude=latitude, longitude=longitude,
-            ascendant_data=ascendant_data, timezone_name=timezone_name, language=language,
-        )
-        if not tree:
-            return None, None
-        current_period = self.find_current_period(tree)
-        return tree, current_period
-
-    def flatten_periods(self, dasha_tree: List[Dict], level: str = "antardasha") -> List[Dict]:
-        flat = []
-        for maha in dasha_tree:
-            maha_lord = maha.get("mahadasha") or maha.get("mahadasha_display")
-            if level == "mahadasha":
-                flat.append({
-                    "mahadasha": maha_lord,
-                    "antardasha": None,
-                    "start": maha.get("start"),
-                    "end": maha.get("end"),
-                })
-                continue
-            for antar in maha.get("antardashas", []):
-                antar_lord = antar.get("antardasha") or antar.get("antardasha_display")
-                flat.append({
-                    "mahadasha": maha_lord,
-                    "antardasha": antar_lord,
-                    "start": antar.get("start"),
-                    "end": antar.get("end"),
-                })
-        return flat
-
-    def get_upcoming_periods(self, dasha_tree: List[Dict], months_ahead: int = 60) -> List[Dict]:
-        now = datetime.now()
-        cutoff = now.replace(year=now.year + (months_ahead // 12))
-
-        all_periods = self.flatten_periods(dasha_tree, level="antardasha")
-        upcoming = []
-        for period in all_periods:
-            end = _parse_dt(period.get("end", ""))
-            start = _parse_dt(period.get("start", ""))
-            if not start or not end:
-                continue
-            if end < now:
-                continue
-            if start > cutoff:
-                break
-            upcoming.append(period)
-        return upcoming
 
 
 dasha_api_service = DashaApiService()

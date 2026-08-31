@@ -1,11 +1,17 @@
 import os
 import json
-import threading
+import time
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Tuple, Optional
 from app.config.settings import settings
 from app.utils.logger import logger
+
+
+def _profile(label: str, start: float):
+    elapsed = time.perf_counter() - start
+    logger.info(f"[Profile][VectorStore] {label}: {elapsed:.3f}s")
+    return elapsed
+
 
 class LocalVectorStore:
     def __init__(self, data_dir: str = settings.VECTOR_DB_DIR):
@@ -15,55 +21,40 @@ class LocalVectorStore:
 
         self.chunks: List[Dict] = []
         self.vectors: Optional[np.ndarray] = None
-
-        # PERFORMANCE FIX: normalized vectors were previously recomputed
-        # (full matrix norm + divide) on EVERY single hybrid_search() call —
-        # wasted O(N*D) work repeated identically across the several
-        # searches a single question triggers (framework, personalized,
-        # comparison x N, counter-evidence, ...). Now computed once here
-        # and invalidated only when the underlying data actually changes.
-        self._normalized_vectors: Optional[np.ndarray] = None
-        self._norm_lock = threading.Lock()
+        self._chunk_lookup: Dict[Tuple[str, int], int] = {}
 
         self.load()
 
-    def _rebuild_normalized_cache(self):
-        with self._norm_lock:
-            if self.vectors is None or len(self.vectors) == 0:
-                self._normalized_vectors = None
-                return
-            v_norms = np.linalg.norm(self.vectors, axis=1, keepdims=True)
-            v_norms[v_norms == 0] = 1.0
-            self._normalized_vectors = self.vectors / v_norms
+    def _build_chunk_lookup(self):
+        """Maps (source, chunk_index) -> position in self.chunks, so
+        parent-child context expansion can find neighboring chunks in O(1)
+        instead of scanning the whole store per lookup."""
+        t0 = time.perf_counter()
+        self._chunk_lookup = {}
+        for i, chunk in enumerate(self.chunks):
+            meta = chunk.get("metadata", {})
+            source = meta.get("source")
+            idx = meta.get("chunk_index")
+            if source is not None and idx is not None:
+                self._chunk_lookup[(source, idx)] = i
+        _profile("build_chunk_lookup", t0)
 
     def load(self):
-        logger.info(f"[VectorStore] data_dir = {self.data_dir}")
-        logger.info(f"[VectorStore] chunks_path = {self.chunks_path}")
-        logger.info(f"[VectorStore] vectors_path = {self.vectors_path}")
-
         try:
             if os.path.exists(self.chunks_path) and os.path.exists(self.vectors_path):
                 with open(self.chunks_path, "r", encoding="utf-8") as f:
                     self.chunks = json.load(f)
-
                 self.vectors = np.load(self.vectors_path)
-
-                logger.info(
-                    f"[VectorStore] Loaded {len(self.chunks)} chunks and vectors from local cache."
-                )
+                logger.info(f"Loaded {len(self.chunks)} chunks and vectors from local cache.")
             else:
-                logger.warning(
-                    "[VectorStore] VECTOR STORE NOT FOUND — starting with empty store."
-                )
+                logger.info("No vector store found. Initialising an empty store.")
                 self.chunks = []
                 self.vectors = None
-
         except Exception as e:
-            logger.error(f"[VectorStore] Error loading vector store: {e}")
+            logger.error(f"Error loading vector store: {e}. Starting fresh.")
             self.chunks = []
             self.vectors = None
-
-        self._rebuild_normalized_cache()
+        self._build_chunk_lookup()
 
     def save(self):
         try:
@@ -80,7 +71,7 @@ class LocalVectorStore:
     def clear(self):
         self.chunks = []
         self.vectors = None
-        self._normalized_vectors = None
+        self._chunk_lookup = {}
         if os.path.exists(self.chunks_path):
             os.remove(self.chunks_path)
         if os.path.exists(self.vectors_path):
@@ -98,8 +89,8 @@ class LocalVectorStore:
         else:
             self.chunks.extend(new_chunks)
             self.vectors = np.vstack([self.vectors, new_vectors])
-        self._rebuild_normalized_cache()
         self.save()
+        self._build_chunk_lookup()
 
     def _lexical_score(self, text: str, query_tokens: List[str]) -> float:
         if not query_tokens:
@@ -115,33 +106,38 @@ class LocalVectorStore:
     def hybrid_search(self, query: str, query_vector: List[float], top_k: int = 5,
                        alpha: float = 0.5, preferred_sources: Optional[List[str]] = None,
                        boost_factor: float = 1.4) -> List[Dict]:
-        """Combined semantic + lexical search. Uses the PRE-NORMALIZED
-        vector matrix cached at load/add time instead of renormalizing the
-        entire store on every call — this was previously the single most
-        repeated wasted computation across a question's multiple retrieval
-        stages."""
-        if not self.chunks or self.vectors is None or self._normalized_vectors is None:
+        t_total = time.perf_counter()
+
+        if not self.chunks or self.vectors is None:
             return []
 
+        t = time.perf_counter()
         q_vec = np.array(query_vector, dtype=np.float32)
         q_norm = np.linalg.norm(q_vec)
         if q_norm > 0:
             q_vec = q_vec / q_norm
 
-        cosine_scores = np.dot(self._normalized_vectors, q_vec)
+        v_norms = np.linalg.norm(self.vectors, axis=1, keepdims=True)
+        v_norms[v_norms == 0] = 1.0
+        normalized_vectors = self.vectors / v_norms
+        cosine_scores = np.dot(normalized_vectors, q_vec)
 
         min_cos, max_cos = cosine_scores.min(), cosine_scores.max()
         range_cos = max_cos - min_cos
         norm_semantic_scores = (cosine_scores - min_cos) / range_cos if range_cos > 0 else np.ones_like(cosine_scores)
+        _profile("vector_search (semantic)", t)
 
+        t = time.perf_counter()
         stop_words = {"a", "an", "the", "and", "or", "but", "if", "then", "of", "to", "in", "on", "at", "by", "for", "with", "is", "are", "was", "were", "be", "been", "being"}
-        query_tokens = [t.lower() for t in query.split() if t.lower() not in stop_words and len(t) > 1]
+        query_tokens = [tok.lower() for tok in query.split() if tok.lower() not in stop_words and len(tok) > 1]
         lexical_scores = np.array([self._lexical_score(chunk["text"], query_tokens) for chunk in self.chunks])
 
         min_lex, max_lex = lexical_scores.min(), lexical_scores.max()
         range_lex = max_lex - min_lex
         norm_lexical_scores = (lexical_scores - min_lex) / range_lex if range_lex > 0 else np.zeros_like(lexical_scores)
+        _profile("keyword_search (lexical)", t)
 
+        t = time.perf_counter()
         combined_scores = alpha * norm_semantic_scores + (1 - alpha) * norm_lexical_scores
 
         if preferred_sources:
@@ -161,39 +157,31 @@ class LocalVectorStore:
             chunk["semantic_score"] = float(cosine_scores[idx])
             chunk["lexical_score"] = float(lexical_scores[idx])
             results.append(chunk)
+        _profile("reranking (combine+sort+boost)", t)
 
+        _profile(f"hybrid_search TOTAL (query='{query[:40]}...', top_k={top_k})", t_total)
         return results
 
     def dual_retrieve(self, topic_query: str, global_query: str, query_vector_topic: List[float],
                        query_vector_global: List[float], preferred_sources: Optional[List[str]] = None,
                        top_k_each: int = 6, final_top_k: int = 6, alpha: float = 0.5) -> List[Dict]:
-        """Topic-preferred Search + Global Search → Merge + Deduplicate →
-        Rerank → Best Relevant Chunks. The two hybrid_search() calls are
-        independent read-only operations over the same (now pre-normalized)
-        data, so they're run concurrently via a thread pool — this is CPU-
-        bound numpy work, so the win is smaller than for network-bound
-        embedding calls, but it's free given the normalized-vector cache
-        above makes each call itself much cheaper too."""
-        def _run_topic():
-            if not preferred_sources:
-                return []
-            return self.hybrid_search(
-                query=topic_query, query_vector=query_vector_topic,
-                top_k=top_k_each, alpha=alpha, preferred_sources=preferred_sources
-            )
+        t_total = time.perf_counter()
 
-        def _run_global():
-            return self.hybrid_search(
-                query=global_query, query_vector=query_vector_global,
-                top_k=top_k_each, alpha=alpha, preferred_sources=None
-            )
+        t = time.perf_counter()
+        topic_hits = self.hybrid_search(
+            query=topic_query, query_vector=query_vector_topic,
+            top_k=top_k_each, alpha=alpha, preferred_sources=preferred_sources
+        ) if preferred_sources else []
+        _profile("dual_retrieve: topic-preferred pass", t)
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            topic_future = executor.submit(_run_topic)
-            global_future = executor.submit(_run_global)
-            topic_hits = topic_future.result()
-            global_hits = global_future.result()
+        t = time.perf_counter()
+        global_hits = self.hybrid_search(
+            query=global_query, query_vector=query_vector_global,
+            top_k=top_k_each, alpha=alpha, preferred_sources=None
+        )
+        _profile("dual_retrieve: global pass", t)
 
+        t = time.perf_counter()
         merged: Dict[Tuple[str, int], Dict] = {}
         for hit in topic_hits + global_hits:
             source = hit.get("metadata", {}).get("source", "unknown")
@@ -203,6 +191,75 @@ class LocalVectorStore:
                 merged[key] = hit
 
         reranked = sorted(merged.values(), key=lambda h: h["score"], reverse=True)
-        return reranked[:final_top_k]
+        result = reranked[:final_top_k]
+        _profile("dual_retrieve: merge+dedupe+rerank", t)
+
+        _profile(f"dual_retrieve TOTAL (final_top_k={final_top_k})", t_total)
+        return result
+
+    # ------------------------------------------------------------------
+    # PARENT-CHILD / CONTEXT EXPANSION
+    # ------------------------------------------------------------------
+    def expand_with_context(self, hits: List[Dict], window: int = 1, top_n: int = 3) -> List[Dict]:
+        """Adds a 'prompt_text' field to the top_n hits (already ranked and
+        deduped by the CALLER — this must run AFTER dedup, never before, or
+        overlapping neighbor text makes adjacent hits look like near-
+        duplicates and breaks similarity-based dedup) containing the
+        matched chunk plus up to `window` chunks immediately before/after
+        it from the SAME source document. Hits beyond top_n, or hits with
+        no chunk_index/source, are returned unchanged with prompt_text
+        falling back to their original 'text'.
+
+        Expects each hit dict to have "source", "chunk_index", and "text"
+        keys (the caller's own shaped hit format, not the raw vector_store
+        chunk format) — this keeps vector_store's public API decoupled
+        from chat_service's internal hit-dict shape while still allowing
+        lookups against the internal self._chunk_lookup index.
+        """
+        t0 = time.perf_counter()
+        if not hits:
+            return hits
+
+        expanded = []
+        for i, hit in enumerate(hits):
+            if i >= top_n:
+                hit = dict(hit)
+                hit["prompt_text"] = hit.get("text", "")
+                expanded.append(hit)
+                continue
+
+            source = hit.get("source")
+            idx = hit.get("chunk_index")
+
+            if source is None or idx is None:
+                hit = dict(hit)
+                hit["prompt_text"] = hit.get("text", "")
+                expanded.append(hit)
+                continue
+
+            neighbor_texts: List[Tuple[int, str]] = []
+            for offset in range(-window, window + 1):
+                if offset == 0:
+                    continue
+                pos = self._chunk_lookup.get((source, idx + offset))
+                if pos is not None:
+                    neighbor_texts.append((offset, self.chunks[pos]["text"]))
+
+            hit = dict(hit)
+            if neighbor_texts:
+                neighbor_texts.sort(key=lambda x: x[0])
+                before = [text for offset, text in neighbor_texts if offset < 0]
+                after = [text for offset, text in neighbor_texts if offset > 0]
+                combined = before + [hit.get("text", "")] + after
+                hit["prompt_text"] = "\n".join(combined)
+                hit["context_expanded"] = True
+            else:
+                hit["prompt_text"] = hit.get("text", "")
+
+            expanded.append(hit)
+
+        _profile(f"context_expansion (top_n={top_n}, window={window})", t0)
+        return expanded
+
 
 vector_store = LocalVectorStore()

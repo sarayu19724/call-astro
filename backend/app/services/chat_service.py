@@ -3,6 +3,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 import json
 import re
+import time as _time
 from app.memory.database import db
 from app.services.llm_service import llm_service
 from app.services.geocoding_service import geocoding_service
@@ -82,16 +83,51 @@ SIMPLE_LOOKUP_PATTERNS = [
 ]
 
 
+def _profile(label: str, start_time: float):
+    """Lightweight timing instrumentation — logs how long a labeled block
+    took, so slow stages (a specific embedding call, generation, or the
+    overall context-prep pipeline) can be identified from logs without
+    attaching a profiler. Intentionally simple: one log line per call,
+    no aggregation — meant for diagnosing latency during dev/testing."""
+    elapsed = _time.perf_counter() - start_time
+    logger.info(f"[PROFILE] {label}: {elapsed:.3f}s")
+
+
 class ChatService:
     def __init__(self):
         self.embeddings_provider = EmbeddingsProvider()
-    
+
     def _get_embeddings_parallel(self, texts: List[str]) -> List[List[float]]:
         """Thin wrapper over EmbeddingsProvider.get_embeddings_parallel —
         used wherever this service needs 2+ INDEPENDENT embeddings for a
         single request (e.g. framework_query + raw message_text) so they
         fire concurrently instead of one-after-another."""
         return self.embeddings_provider.get_embeddings_parallel(texts)
+
+    def _expand_and_build_chunks(self, hits: List[Dict[str, Any]], label: str, show_branch: bool = False) -> List[str]:
+        """Centralized chunk-string formatting — every call site
+        (context/framework/personalized/comparison/follow-up) previously
+        duplicated its own '--- Label N [Source: ...] ---\\ntext\\n' loop.
+        Consolidating here means chunk formatting stays identical
+        everywhere, and gives a single point to plug in parent-child
+        context expansion later without touching every call site."""
+        chunks = []
+        for i, hit in enumerate(hits):
+            source = hit.get("source", "Unknown")
+            page = hit.get("page")
+            page_label = f", Page: {page}" if page is not None else ""
+            type_label = self._format_hit_label(hit) if "evidence_type" in hit else ""
+            branch_label = f" ({hit['branch']})" if show_branch and hit.get("branch") else ""
+            score = hit.get("score", 0.0)
+            try:
+                score_str = f"{float(score):.2f}"
+            except (TypeError, ValueError):
+                score_str = "0.00"
+            chunks.append(
+                f"--- {label}{branch_label} {i+1} [Source: {source}{page_label}, relevance: {score_str}{type_label}] ---\n{hit.get('text', '')}\n"
+            )
+        return chunks
+
     def _format_history_for_llm(self, history: List[Dict[str, str]]) -> str:
         formatted = []
         for msg in history:
@@ -198,13 +234,6 @@ class ChatService:
 
     # ------------------------------------------------------------------
     # LEARNED CORRECTION RULES
-    #
-    # Instead of a generic "be careful" instruction on retry, every actual
-    # validation failure is converted into a short, specific, reusable
-    # rule string — then persisted per-topic on the session, and injected
-    # into every future prompt on that topic (proactively, before
-    # generation even happens), so the same concrete mistake doesn't get
-    # made twice in one session.
     # ------------------------------------------------------------------
     def _get_correction_rules(self, session: Dict, topic: Optional[str]) -> List[str]:
         if not topic:
@@ -228,7 +257,6 @@ class ChatService:
             for r in new_rules:
                 if r and r not in existing:
                     existing.append(r)
-            # FIFO cap — keep only the most recent N, drop oldest first.
             existing = existing[-CORRECTION_RULES_MAX_PER_TOPIC:]
             rules_map[topic] = existing
             rules_json = json.dumps(rules_map, ensure_ascii=False)
@@ -250,8 +278,6 @@ class ChatService:
         )
 
     def _extract_failure_text(self, failure: Any) -> str:
-        """Normalizes a claim_failures entry (str or dict, unknown exact
-        shape from validate_claims) into plain text."""
         if isinstance(failure, dict):
             return str(
                 failure.get("detail") or failure.get("message") or
@@ -494,7 +520,7 @@ class ChatService:
     def _is_simple_chart_lookup(self, message_text: str) -> bool:
         text = message_text.strip().lower()
         return any(re.search(p, text) for p in SIMPLE_LOOKUP_PATTERNS)
-    
+
     def _fetch_and_cache_kundli(self, session_id: str, session: Dict) -> str:
         try:
             coords = geocoding_service.geocode(session.get("birth_place"))
@@ -531,14 +557,10 @@ class ChatService:
                     logger.warning(f"[DashaSingleFetch] direct tree fetch failed, falling back: {tree_err}")
 
                 if not dasha_info:
-                    # Fallback to existing kundli_service logic (calculated
-                    # Vimshottari fallback lives there) — only hit when the
-                    # direct single fetch above didn't produce a usable
-                    # current period.
                     dasha_info = kundli_service.get_real_or_calculated_dasha(
                         kundli_data, session.get("dob"), time_24h, lat, lon
                     )
-                    dasha_tree = None  # unknown provenance — don't cache as authoritative tree
+                    dasha_tree = None
 
                 kundli_str = kundli_service.summarize_kundli(kundli_data, dob=session.get("dob"))
                 chart_data = kundli_service.extract_chart_data(kundli_data)
@@ -578,8 +600,6 @@ class ChatService:
             logger.error(f"Kundli fetch failed: {kundli_err}")
 
         return "No chart data available."
-    
-    
 
     def _get_rag_context(self, message_text: str, topic: Optional[str] = None):
         try:
@@ -592,12 +612,19 @@ class ChatService:
                     search_query = f"{search_query} {bias}"
             preferred_sources = TOPIC_RELEVANT_BOOKS.get(topic) if topic else None
 
+            _t0 = _time.perf_counter()
             query_vector = self.embeddings_provider.get_embedding(search_query)
+            _profile("embedding:generic_search_query", _t0)
+
+            _t0 = _time.perf_counter()
+            global_vector = self.embeddings_provider.get_embedding(message_text)
+            _profile("embedding:generic_global_query", _t0)
+
             hits = vector_store.dual_retrieve(
                 topic_query=search_query,
                 global_query=message_text,
                 query_vector_topic=query_vector,
-                query_vector_global=self.embeddings_provider.get_embedding(message_text),
+                query_vector_global=global_vector,
                 preferred_sources=preferred_sources,
                 top_k_each=6,
                 final_top_k=settings.TOP_K_RETRIEVAL,
@@ -608,18 +635,15 @@ class ChatService:
             if not relevant_hits:
                 return "No reference available.", []
 
-            context_chunks, rag_hits = [], []
-            for i, hit in enumerate(relevant_hits):
+            rag_hits = []
+            for hit in relevant_hits:
                 source = hit["metadata"].get("source", "Unknown")
                 page = hit["metadata"].get("page")
-                page_label = f", Page: {page}" if page is not None else ""
-                context_chunks.append(
-                    f"--- Context {i+1} [Source: {source}{page_label}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
-                )
                 rag_hits.append({
                     "source": source, "page": page,
                     "score": hit["score"], "text": hit["text"]
                 })
+            context_chunks = self._expand_and_build_chunks(rag_hits, "Context")
 
             logger.info(f"[RAG] generic retrieval hits={len(rag_hits)} query='{search_query}'")
             return "\n".join(context_chunks), rag_hits
@@ -935,7 +959,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     framework_chunks.append(cached_context)
             else:
                 framework_query = self._build_framework_query(message_text, topic, life_area)
+
+                _t0 = _time.perf_counter()
                 _fw_vecs = self._get_embeddings_parallel([framework_query, message_text])
+                _profile("embedding:framework_query+global (parallel)", _t0)
+
                 framework_hits_raw = vector_store.dual_retrieve(
                     topic_query=framework_query,
                     global_query=message_text,
@@ -964,13 +992,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
                     framework_rag_hits = self._process_evidence(pre_process_hits, message_text, depth["framework_max"])
 
-                    for i, hit in enumerate(framework_rag_hits):
+                    for hit in framework_rag_hits:
                         seen_keys.add((hit["source"], hit["page"]))
-                        page_label = f", Page: {hit['page']}" if hit["page"] is not None else ""
-                        type_label = self._format_hit_label(hit)
-                        framework_chunks.append(
-                            f"--- Classical Principle {i+1} [Source: {hit['source']}{page_label}, relevance: {hit['score']:.2f}{type_label}] ---\n{hit['text']}\n"
-                        )
+                    framework_chunks = self._expand_and_build_chunks(framework_rag_hits, "Classical Principle")
 
                     referenced = self._extract_referenced_factors(framework_rag_hits)
                     targeted_facts = self._build_targeted_kundli_facts(referenced, session)
@@ -992,7 +1016,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 for branch in comparison:
                     branch_query = f"{branch} {life_area} astrology classical rules houses planets significance".strip()
                     try:
+                        _t0 = _time.perf_counter()
                         branch_vector = self.embeddings_provider.get_embedding(branch_query)
+                        _profile(f"embedding:comparison_branch:{branch}", _t0)
+
                         branch_results = vector_store.hybrid_search(
                             query=branch_query, query_vector=branch_vector,
                             top_k=(depth["comparison_max_per_branch"] * 2) + 1,
@@ -1037,7 +1064,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     targeted_facts = f"{targeted_facts}\n{comparison_instruction}" if targeted_facts else comparison_instruction
 
             personalized_query = self._build_personalized_rag_query(message_text, topic, targeted_facts, life_area)
+
+            _t0 = _time.perf_counter()
             personalized_vector = self.embeddings_provider.get_embedding(personalized_query)
+            _profile("embedding:personalized_query", _t0)
 
             personalized_hits_raw = vector_store.dual_retrieve(
                 topic_query=personalized_query,
@@ -1064,23 +1094,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 })
 
             personalized_rag_hits = self._process_evidence(pre_process_personalized, message_text, depth["personalized_max"])
-
-            personalized_chunks = []
-            for i, hit in enumerate(personalized_rag_hits):
+            for hit in personalized_rag_hits:
                 seen_keys.add((hit["source"], hit["page"]))
-                page_label = f", Page: {hit['page']}" if hit["page"] is not None else ""
-                type_label = self._format_hit_label(hit)
-                personalized_chunks.append(
-                    f"--- Personalized Evidence {i+1} [Source: {hit['source']}{page_label}, relevance: {hit['score']:.2f}{type_label}] ---\n{hit['text']}\n"
-                )
+            personalized_chunks = self._expand_and_build_chunks(personalized_rag_hits, "Personalized Evidence")
 
-            comparison_chunks = []
-            for hit in comparison_hits:
-                page_label = f", Page: {hit['page']}" if hit.get("page") is not None else ""
-                type_label = self._format_hit_label(hit)
-                comparison_chunks.append(
-                    f"--- Comparison Evidence ({hit['branch']}) [Source: {hit['source']}{page_label}, relevance: {hit['score']:.2f}{type_label}] ---\n{hit['text']}\n"
-                )
+            comparison_chunks = self._expand_and_build_chunks(comparison_hits, "Comparison Evidence", show_branch=True)
 
             all_hits = framework_rag_hits + comparison_hits + personalized_rag_hits
 
@@ -1138,11 +1156,15 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             preferred_sources = TOPIC_RELEVANT_BOOKS.get(topic) if topic else None
 
+            _t0 = _time.perf_counter()
+            _fu_vecs = self._get_embeddings_parallel([query, message_text])
+            _profile("embedding:followup_query+global (parallel)", _t0)
+
             hits = vector_store.dual_retrieve(
                 topic_query=query,
                 global_query=message_text,
-                query_vector_topic=self.embeddings_provider.get_embedding(query),
-                query_vector_global=self.embeddings_provider.get_embedding(message_text),
+                query_vector_topic=_fu_vecs[0],
+                query_vector_global=_fu_vecs[1],
                 preferred_sources=preferred_sources,
                 top_k_each=12,
                 final_top_k=12,
@@ -1161,14 +1183,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 })
 
             rag_hits = self._process_evidence(pre_process, message_text, settings.TOP_K_RETRIEVAL)
-
-            chunks = []
-            for i, hit in enumerate(rag_hits):
-                page_label = f", Page: {hit['page']}" if hit["page"] is not None else ""
-                type_label = self._format_hit_label(hit)
-                chunks.append(
-                    f"--- Follow-up Evidence {i+1} [Source: {hit['source']}{page_label}, relevance: {hit['score']:.2f}{type_label}] ---\n{hit['text']}\n"
-                )
+            chunks = self._expand_and_build_chunks(rag_hits, "Follow-up Evidence")
 
             logger.info(f"[FollowUpRAG] retrieved {len(rag_hits)} supporting chunks")
             return "\n".join(chunks), rag_hits
@@ -1407,6 +1422,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
     def _prepare_common_context(self, session_id: str, message_text: str, history: List[Dict[str, str]],
                                   history_text: str, session: Dict, language: str):
+        t_total = _time.perf_counter()
+
         query_understanding = self._get_query_understanding_cached(session_id, message_text, history_text, session)
         logger.info(
             f"[QueryUnderstanding] life_area='{query_understanding['life_area']}' "
@@ -1469,7 +1486,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         repeat_hint = self._get_repeat_topic_hint(session, topic)
         learned_rules_block = self._build_learned_rules_block(session, topic)
 
-        return {
+        result = {
             "query_understanding": query_understanding,
             "topic": topic,
             "response_contract": response_contract,
@@ -1485,6 +1502,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             "is_simple_lookup": is_simple_lookup,
             "learned_rules_block": learned_rules_block,
         }
+
+        _profile("prepare_common_context TOTAL", t_total)
+        return result
 
     def _build_astrologer_prompt(self, session: Dict, language: str, history_text: str,
                                    message_text: str, ctx: Dict[str, Any]) -> str:
@@ -1511,7 +1531,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
     def _generate_and_validate(self, session_id: str, session: Dict, astrologer_prompt: str,
                                  dasha_timeline_str: str, evidence_vote, topic: Optional[str]) -> str:
+        _t0 = _time.perf_counter()
         response_text = llm_service.generate(prompt=astrologer_prompt, temperature=0.6)
+        _profile("llm_generate:initial", _t0)
 
         recent_texts = self._get_recent_assistant_texts(session_id)
         similar_to = self._is_too_similar(response_text, recent_texts)
@@ -1540,10 +1562,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         if temporal_correction:
             logger.info("[TemporalCheck] response flagged a past date/period presented as upcoming")
 
-        # Convert every actual failure into a specific, reusable rule —
-        # never a generic "be careful" message — and persist it for this
-        # topic BEFORE regenerating, so even if regeneration also fails,
-        # the next turn on this topic already carries the lesson.
         new_rules: List[str] = []
         if claim_failures:
             new_rules.extend(self._derive_rules_from_claim_failures(claim_failures))
@@ -1580,7 +1598,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             if temporal_correction:
                 retry_prompt += "\n\n" + temporal_correction
 
+            _t0 = _time.perf_counter()
             response_text = llm_service.generate(prompt=retry_prompt, temperature=0.75)
+            _profile("llm_generate:regenerated", _t0)
 
             remaining_claims = validate_claims(
                 response_text, dasha_timeline_str, evidence_vote,
@@ -1804,6 +1824,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             yield {"type": "chunk", "text": fallback}
             yield {"type": "done", "session_id": session_id, "message": fallback,
                    "dob": None, "birth_time": None, "birth_place": None, "language": "Hinglish"}
+
     def _build_and_save_trace_background(self, session_id: str, session_snapshot: Dict, topic: Optional[str],
                                            rag_hits: List[Dict[str, Any]], targeted_facts: str, response_text: str,
                                            query_understanding: Dict[str, Any], is_simple_lookup: bool):
@@ -1826,7 +1847,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
-    
+
     def _build_reasoning_trace(
         self,
         session: Dict,
@@ -2172,7 +2193,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             except Exception:
                 return None
         return None
-    
-    
+
 
 chat_service = ChatService()

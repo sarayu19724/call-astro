@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import {  useState } from 'react';
 import { ChevronDown, ChevronUp, Sparkles, Home, Search, Clock, BookOpen, Scale, GitBranch, CheckCircle2, ListChecks } from 'lucide-react';
 
 interface ReasoningStep {

@@ -29,6 +29,15 @@ from app.services.yoga_service import detect_yogas, format_yogas_for_prompt
 TOPIC_BUNDLE_LOGIC_VERSION = 3
 FRAMEWORK_CACHE_VERSION = 1
 
+# ------------------------------------------------------------------
+# EVIDENCE ITEM ARCHITECTURE — version tag for the explicit
+# RAG rule -> Kundli fact -> applicability -> evidence classification
+# objects built by _build_evidence_items(). Bumped whenever the shape
+# of an evidence item changes, so any future caching layer around this
+# can invalidate cleanly.
+# ------------------------------------------------------------------
+EVIDENCE_ITEM_LOGIC_VERSION = 1
+
 DEDUP_SIMILARITY_THRESHOLD = 0.90
 INTRA_RESPONSE_DEDUP_THRESHOLD = 0.85
 
@@ -317,8 +326,9 @@ class ChatService:
     # facts. Every hit is tagged MATCH / NO_MATCH / UNKNOWN, and — this is
     # the piece that was previously missing — a corresponding evidence_role
     # (SUPPORTING / REJECTED / UNVERIFIED) that every downstream consumer
-    # (buckets, structured table, sufficiency, coverage) must respect.
-    # A REJECTED hit can never again be counted as supporting evidence.
+    # (buckets, structured table, sufficiency, coverage, evidence items)
+    # must respect. A REJECTED hit can never again be counted as
+    # supporting evidence.
     # ------------------------------------------------------------------
     def _evaluate_rule_applicability(self, rag_hits: List[Dict[str, Any]], session: Dict) -> List[Dict[str, Any]]:
         chart = self._get_verified_planet_house_map(session)
@@ -414,6 +424,150 @@ class ChatService:
             )
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------
+    # EVIDENCE ITEM ARCHITECTURE
+    #
+    # This implements the explicit chain:
+    #   RAG rule -> required factors -> verified Kundli fact ->
+    #   applicability -> evidence classification -> (later) claim mapping.
+    #
+    # It sits ON TOP OF the Rule Applicability Engine above — it never
+    # re-derives MATCH/NO_MATCH itself, it only formalizes what that
+    # engine already decided into an explicit, ID-tagged, inspectable
+    # object per rule, in the exact shape from the design notes:
+    #   { id, rule, source, required_factors, kundli_facts,
+    #     applicable, evidence_type, reason }
+    # ------------------------------------------------------------------
+    def _extract_rule_required_factors(self, text: str) -> Dict[str, Any]:
+        """Parses a retrieved rule chunk into what it actually REQUIRES —
+        which houses, planets, and lord-relationships the rule's stated
+        condition names. This is deliberately separate from whether the
+        chart satisfies it (that's the applicability step)."""
+        required_factors: Dict[str, Any] = {"houses": [], "planets": [], "relationships": []}
+
+        for match in re.finditer(r"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+lord\b", text, re.IGNORECASE):
+            house = match.group(1)
+            label = f"{house}th"
+            if label not in required_factors["houses"]:
+                required_factors["houses"].append(label)
+            rel = f"{house}th_lord"
+            if rel not in required_factors["relationships"]:
+                required_factors["relationships"].append(rel)
+
+        for match in re.finditer(r"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+house\b", text, re.IGNORECASE):
+            house = match.group(1)
+            label = f"{house}th"
+            if label not in required_factors["houses"]:
+                required_factors["houses"].append(label)
+
+        for planet in PLANET_NAMES:
+            if re.search(rf"\b{planet}\b", text, re.IGNORECASE):
+                if planet not in required_factors["planets"]:
+                    required_factors["planets"].append(planet)
+
+        return required_factors
+
+    def _build_evidence_items(self, rag_hits: List[Dict[str, Any]], session: Dict) -> List[Dict[str, Any]]:
+        """Builds one explicit evidence object per rule that already went
+        through _evaluate_rule_applicability (i.e. has applicability ==
+        MATCH or NO_MATCH — UNKNOWN/uncheckable rules are skipped since
+        there is nothing verified to report). Each object combines:
+          - what the rule requires (required_factors)
+          - the actual verified Kundli facts relevant to that requirement
+          - whether the condition holds (applicable / evidence_type)
+          - a plain-language reason (reused from the applicability engine)
+
+        This is a formalization layer — it never overrides or re-derives
+        applicability; it only makes the existing verdict explicit and
+        traceable by a stable id (R1, R2, ...) that claim mapping and the
+        reasoning trace can both reference directly."""
+        chart = self._get_verified_planet_house_map(session)
+        items: List[Dict[str, Any]] = []
+        counter = 0
+
+        for hit in rag_hits:
+            applicability = hit.get("applicability")
+            if applicability not in ("MATCH", "NO_MATCH"):
+                continue
+
+            counter += 1
+            evidence_id = f"R{counter}"
+            text = hit.get("text", "") or ""
+            required_factors = self._extract_rule_required_factors(text)
+
+            kundli_facts: Dict[str, Any] = {}
+            if chart:
+                for planet_name in required_factors["planets"]:
+                    info = chart["planets"].get(planet_name)
+                    if info:
+                        kundli_facts[f"{planet_name.lower()}_sign"] = info["sign"]
+                        kundli_facts[f"{planet_name.lower()}_house"] = info["house"]
+
+                for rel in required_factors["relationships"]:
+                    if not rel.endswith("_lord"):
+                        continue
+                    house_str = rel.split("th_lord")[0]
+                    try:
+                        house_num = int(house_str)
+                    except ValueError:
+                        continue
+                    lord = chart["house_lords"].get(house_num)
+                    if lord:
+                        kundli_facts[f"{house_num}th_lord"] = lord
+                        lord_info = chart["planets"].get(lord)
+                        if lord_info:
+                            kundli_facts[f"{lord.lower()}_house"] = lord_info["house"]
+                            kundli_facts[f"{lord.lower()}_sign"] = lord_info["sign"]
+
+            applicable = applicability == "MATCH"
+            evidence_type = "supporting" if applicable else "rejected"
+            reason = hit.get("applicability_reason", "")
+
+            rule_snippet = text.strip()
+            if len(rule_snippet) > 220:
+                rule_snippet = rule_snippet[:220].rsplit(" ", 1)[0] + "..."
+
+            items.append({
+                "id": evidence_id,
+                "rule": rule_snippet,
+                "source": hit.get("source", "Unknown"),
+                "page": hit.get("page"),
+                "required_factors": required_factors,
+                "kundli_facts": kundli_facts,
+                "applicable": applicable,
+                "evidence_type": evidence_type,
+                "reason": reason,
+            })
+
+        return items
+
+    def _format_evidence_items_for_prompt(self, evidence_items: List[Dict[str, Any]]) -> str:
+        """Renders the evidence items as an explicit, ID-tagged block for
+        the LLM prompt. This is what lets the model (and the claim
+        validator / reasoning trace downstream) refer to a SPECIFIC piece
+        of verified evidence by id rather than a vague 'the chart shows'."""
+        if not evidence_items:
+            return ""
+
+        supporting = [i for i in evidence_items if i["applicable"]]
+        rejected = [i for i in evidence_items if not i["applicable"]]
+
+        lines = [
+            "VERIFIED EVIDENCE OBJECTS (each retrieved rule mapped to its exact required factors, "
+            "the real Kundli facts checked against it, and the verdict — a REJECTED object must "
+            "NEVER be used to support a claim, only a SUPPORTING object may ground a specific claim):"
+        ]
+        for item in supporting + rejected:
+            tag = "SUPPORTING" if item["applicable"] else "REJECTED"
+            facts_str = ", ".join(f"{k}={v}" for k, v in item["kundli_facts"].items() if v is not None)
+            if not facts_str:
+                facts_str = "no matching chart facts extracted"
+            lines.append(f"[{item['id']}] [{tag}] Rule (from {item['source']}): {item['rule']}")
+            lines.append(f"    Verified Kundli facts checked: {facts_str}")
+            lines.append(f"    Verdict reason: {item['reason']}")
+
+        return "\n".join(lines)
+
     def _build_structured_evidence_table(self, rag_hits: List[Dict[str, Any]], session: Dict,
                                            referenced: Dict[str, Set[str]]) -> str:
         chart = self._get_verified_planet_house_map(session)
@@ -478,7 +632,8 @@ class ChatService:
                                         session: Dict) -> Dict[str, Any]:
         # Rule Applicability -> Sufficiency: only SUPPORTING/UNVERIFIED hits
         # ever count. REJECTED (NO_MATCH) hits are excluded here — this is
-        # the actual fix for "NO_MATCH but confidence=100%".
+        # the actual fix for "NO_MATCH but confidence=100%". Left
+        # deliberately untouched by the Evidence Item layer above.
         supporting, rejected, unverified = self._partition_evidence_by_role(rag_hits)
         usable_hits = supporting + unverified
 
@@ -551,7 +706,8 @@ class ChatService:
 
     # ------------------------------------------------------------------
     # EVIDENCE ROLE PARTITIONING — the single authoritative split every
-    # downstream consumer (buckets, table, sufficiency, coverage) reads.
+    # downstream consumer (buckets, table, sufficiency, coverage, evidence
+    # items) reads.
     # ------------------------------------------------------------------
     def _partition_evidence_by_role(
         self, rag_hits: List[Dict[str, Any]]
@@ -718,7 +874,16 @@ class ChatService:
         )
 
     def _map_evidence_to_claims(self, response_text: str, session: Dict,
-                                  rag_hits: List[Dict[str, Any]], evidence_table: str) -> List[Dict[str, str]]:
+                                  rag_hits: List[Dict[str, Any]], evidence_table: str,
+                                  evidence_items: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, str]]:
+        """Maps each sentence of the response to what actually grounds it.
+        Beyond the original chart/rule/Dasha term overlap, this now also
+        checks each sentence against the explicit Evidence Items (see
+        _build_evidence_items): a sentence that overlaps a SUPPORTING
+        item's verified Kundli facts gets that item's id attached; a
+        sentence that overlaps a REJECTED item's facts (and nothing
+        supporting) is explicitly flagged rather than silently labeled
+        'interpretive'."""
         if not response_text:
             return []
 
@@ -756,6 +921,8 @@ class ChatService:
             except Exception:
                 pass
 
+        evidence_items = evidence_items or []
+
         sentences = re.split(r'(?<=[.!?])\s+', response_text.strip())
         sentences = [s.strip() for s in sentences if s.strip()]
 
@@ -766,7 +933,26 @@ class ChatService:
             matched_rule = [t for t in rule_terms if t in s_lower]
             matched_dasha = [t for t in dasha_terms if t in s_lower]
 
-            if matched_chart or matched_rule or matched_dasha:
+            matched_evidence_ids: List[str] = []
+            conflicting_evidence_ids: List[str] = []
+            for item in evidence_items:
+                item_terms: Set[str] = set()
+                for v in item.get("kundli_facts", {}).values():
+                    if v:
+                        item_terms.add(str(v).lower())
+                for planet_name in item.get("required_factors", {}).get("planets", []):
+                    item_terms.add(planet_name.lower())
+                if not item_terms:
+                    continue
+                if any(t in s_lower for t in item_terms):
+                    if item["applicable"]:
+                        matched_evidence_ids.append(item["id"])
+                    else:
+                        conflicting_evidence_ids.append(item["id"])
+
+            has_any_grounding = matched_chart or matched_rule or matched_dasha or matched_evidence_ids
+
+            if has_any_grounding:
                 basis_parts = []
                 if matched_chart:
                     basis_parts.append(f"chart fact ({', '.join(sorted(set(matched_chart))[:3])})")
@@ -774,7 +960,18 @@ class ChatService:
                     basis_parts.append(f"retrieved rule mentions ({', '.join(sorted(set(matched_rule))[:3])})")
                 if matched_dasha:
                     basis_parts.append(f"Dasha data ({', '.join(sorted(set(matched_dasha))[:3])})")
+                if matched_evidence_ids:
+                    basis_parts.append(f"verified evidence objects ({', '.join(sorted(set(matched_evidence_ids)))})")
                 mapped.append({"sentence": sentence, "label": "grounded", "basis": "; ".join(basis_parts)})
+            elif conflicting_evidence_ids:
+                mapped.append({
+                    "sentence": sentence,
+                    "label": "flagged",
+                    "basis": (
+                        f"overlaps REJECTED evidence object(s) ({', '.join(sorted(set(conflicting_evidence_ids)))}) "
+                        f"and no supporting evidence — should not be stated as fact"
+                    ),
+                })
             else:
                 mapped.append({
                     "sentence": sentence, "label": "interpretive",
@@ -788,10 +985,19 @@ class ChatService:
             return "No response text was available to map."
 
         grounded_count = sum(1 for m in mapping if m["label"] == "grounded")
+        flagged_count = sum(1 for m in mapping if m["label"] == "flagged")
         total = len(mapping)
-        lines = [f"{grounded_count} of {total} sentence(s) are directly grounded in retrieved evidence or verified chart facts.\n"]
+        lines = [f"{grounded_count} of {total} sentence(s) are directly grounded in retrieved evidence or verified chart facts."]
+        if flagged_count:
+            lines.append(f"{flagged_count} sentence(s) overlap REJECTED evidence and were flagged for review.")
+        lines.append("")
         for m in mapping:
-            tag = "✓ GROUNDED" if m["label"] == "grounded" else "○ INTERPRETIVE"
+            if m["label"] == "grounded":
+                tag = "✓ GROUNDED"
+            elif m["label"] == "flagged":
+                tag = "⚠ FLAGGED"
+            else:
+                tag = "○ INTERPRETIVE"
             lines.append(f"[{tag}] \"{m['sentence']}\"")
             lines.append(f"   basis: {m['basis']}")
         return "\n".join(lines)
@@ -1888,6 +2094,24 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         applicability_block = self._build_rule_applicability_block(rag_hits)
         evidence_table = self._build_structured_evidence_table(rag_hits, session, referenced)
 
+        # ------------------------------------------------------------
+        # EVIDENCE ITEM ARCHITECTURE — build the explicit
+        # rule -> required_factors -> kundli_facts -> applicability ->
+        # evidence classification objects (R1, R2, ...) from the same
+        # already-evaluated rag_hits. This is a formalization layer on
+        # top of the Rule Applicability Engine — it changes nothing about
+        # MATCH/NO_MATCH, it just makes each verdict an explicit,
+        # ID-tagged, inspectable record that claim mapping and the
+        # reasoning trace can reference directly.
+        # ------------------------------------------------------------
+        evidence_items = self._build_evidence_items(rag_hits, session)
+        evidence_items_block = self._format_evidence_items_for_prompt(evidence_items)
+        logger.info(
+            f"[EvidenceItems] built={len(evidence_items)} "
+            f"supporting={sum(1 for i in evidence_items if i['applicable'])} "
+            f"rejected={sum(1 for i in evidence_items if not i['applicable'])}"
+        )
+
         dasha_timeline_str = ""
         requires_timing = bool(query_understanding.get("requires_timing"))
         if topic and requires_timing:
@@ -1964,6 +2188,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         if applicability_block:
             final_kundli_data = f"{final_kundli_data}\n\n{applicability_block}" if final_kundli_data else applicability_block
 
+        # --- Evidence Item objects (explicit rule->fact->verdict chain) ---
+        if evidence_items_block:
+            final_kundli_data = f"{final_kundli_data}\n\n{evidence_items_block}" if final_kundli_data else evidence_items_block
+
         # --- Rejected Evidence (excluded, shown for transparency only) ---
         _, rejected_hits, _ = self._partition_evidence_by_role(rag_hits)
         rejected_notice = self._build_rejected_evidence_notice(rejected_hits)
@@ -2010,6 +2238,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             "evidence_table": evidence_table,
             "bucketed_evidence": bucketed_evidence,
             "applicability_block": applicability_block,
+            "evidence_items": evidence_items,
+            "evidence_items_block": evidence_items_block,
             "rejected_hits": rejected_hits,
             "sufficiency": sufficiency,
             "coverage": coverage,
@@ -2199,13 +2429,15 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             db.add_message(session_id, "assistant", response_text)
 
-            claim_mapping = self._map_evidence_to_claims(response_text, session, ctx["rag_hits"], ctx["evidence_table"])
+            claim_mapping = self._map_evidence_to_claims(
+                response_text, session, ctx["rag_hits"], ctx["evidence_table"], ctx.get("evidence_items")
+            )
 
             try:
                 trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], response_text,
                                                      ctx["query_understanding"], ctx.get("evidence_table", ""), ctx.get("bucketed_evidence", ""),
                                                      ctx.get("sufficiency"), claim_mapping, ctx.get("contradiction"), ctx.get("applicability_block", ""),
-                                                     ctx.get("coverage"), ctx.get("consensus_label"))
+                                                     ctx.get("coverage"), ctx.get("consensus_label"), ctx.get("evidence_items"))
                 db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
             except Exception as trace_err:
                 logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
@@ -2320,13 +2552,15 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             db.add_message(session_id, "assistant", full_text)
 
-            claim_mapping = self._map_evidence_to_claims(full_text, session, ctx["rag_hits"], ctx["evidence_table"])
+            claim_mapping = self._map_evidence_to_claims(
+                full_text, session, ctx["rag_hits"], ctx["evidence_table"], ctx.get("evidence_items")
+            )
 
             try:
                 trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], full_text,
                                                      ctx["query_understanding"], ctx.get("evidence_table", ""), ctx.get("bucketed_evidence", ""),
                                                      ctx.get("sufficiency"), claim_mapping, ctx.get("contradiction"), ctx.get("applicability_block", ""),
-                                                     ctx.get("coverage"), ctx.get("consensus_label"))
+                                                     ctx.get("coverage"), ctx.get("consensus_label"), ctx.get("evidence_items"))
                 db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
             except Exception as trace_err:
                 logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
@@ -2362,12 +2596,14 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         applicability_block: str = "",
         coverage: Optional[Dict[str, Any]] = None,
         consensus_label_override: Optional[str] = None,
+        evidence_items: Optional[List[Dict[str, Any]]] = None,
     ) -> list:
         if not topic and not rag_hits and not (query_understanding and query_understanding.get("restated_intent")):
             return []
 
         try:
             rag_hits = rag_hits or []
+            evidence_items = evidence_items or []
             referenced = self._extract_referenced_factors(rag_hits)
 
             houses = sorted(referenced.get("houses", set()), key=lambda x: int(x))
@@ -2441,10 +2677,31 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             bucket_detail = bucketed_evidence if bucketed_evidence else "No bucketed evidence categories were populated for this question."
             steps.append({"step": 4, "title": "Evidence Bucketed by Type", "detail": bucket_detail, "type": "buckets"})
 
-            # STEP 5 — STRUCTURED FACT -> RULE TABLE (includes Rule Applicability)
+            # STEP 5 — STRUCTURED FACT -> RULE TABLE + EVIDENCE OBJECTS
+            # (includes Rule Applicability AND the explicit Evidence Item
+            # chain: rule -> required_factors -> kundli_facts -> verdict)
             table_parts = []
             if applicability_block:
                 table_parts.append(applicability_block)
+            if evidence_items:
+                item_lines = ["EVIDENCE OBJECTS (rule -> required factors -> verified Kundli facts -> verdict):"]
+                for item in evidence_items:
+                    tag = "SUPPORTING" if item["applicable"] else "REJECTED"
+                    req = item.get("required_factors", {})
+                    req_str_parts = []
+                    if req.get("houses"):
+                        req_str_parts.append(f"houses={req['houses']}")
+                    if req.get("planets"):
+                        req_str_parts.append(f"planets={req['planets']}")
+                    if req.get("relationships"):
+                        req_str_parts.append(f"relationships={req['relationships']}")
+                    req_str = ", ".join(req_str_parts) or "none extracted"
+                    facts_str = ", ".join(f"{k}={v}" for k, v in item.get("kundli_facts", {}).items() if v is not None) or "none matched"
+                    item_lines.append(f"[{item['id']}] [{tag}] {item['source']}")
+                    item_lines.append(f"    requires: {req_str}")
+                    item_lines.append(f"    verified facts: {facts_str}")
+                    item_lines.append(f"    reason: {item['reason']}")
+                table_parts.append("\n".join(item_lines))
             if evidence_table:
                 table_parts.append(evidence_table)
             table_detail = "\n\n".join(table_parts) if table_parts else "No structured fact-to-rule pairing was produced (no matching retrieved rule text for the verified placements checked)."
@@ -2644,14 +2901,16 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             synthesis_detail = (
                 "The final interpretation combines the bucketed evidence (classical rule / Dasha timing / "
                 "Yoga, kept as distinct categories), the Rule Applicability Engine's MATCH/NO_MATCH checks "
-                "with hard exclusion of NO_MATCH rules, the Evidence Coverage percentage derived from that "
-                "same check, reconciliation of the independent Dasha/Chart/Yoga confidence vote against that "
-                "coverage, the structured Fact→Rule table, the Evidence Sufficiency Gate's confidence "
-                "calibration, the Evidence Contradiction resolution, Yoga-claim verification, response-"
-                "contract length compliance, verified chart placements (re-derived fresh from the raw Kundli "
-                "API response on every check), comparative branch analysis, timing-gated Dasha data (sourced "
-                "exclusively from the real Dasha API, with no local fallback calculation), current-date "
-                "temporal filtering, and intra-response duplicate suppression."
+                "with hard exclusion of NO_MATCH rules, the explicit Evidence Item objects (rule -> required "
+                "factors -> verified Kundli facts -> supporting/rejected verdict, each with a stable id), the "
+                "Evidence Coverage percentage derived from that same check, reconciliation of the independent "
+                "Dasha/Chart/Yoga confidence vote against that coverage, the structured Fact→Rule table, the "
+                "Evidence Sufficiency Gate's confidence calibration, the Evidence Contradiction resolution, "
+                "Yoga-claim verification, response-contract length compliance, verified chart placements "
+                "(re-derived fresh from the raw Kundli API response on every check), comparative branch "
+                "analysis, timing-gated Dasha data (sourced exclusively from the real Dasha API, with no "
+                "local fallback calculation), current-date temporal filtering, and intra-response duplicate "
+                "suppression."
             )
             steps.append({"step": 12, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 
@@ -2674,7 +2933,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps.append({"step": 13, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
 
-            # STEP 14 — EVIDENCE-TO-CLAIM MAPPING
+            # STEP 14 — EVIDENCE-TO-CLAIM MAPPING (now includes Evidence Item IDs)
             mapping_detail = self._format_claim_mapping_for_trace(claim_mapping or [])
             steps.append({"step": 14, "title": "Evidence-to-Claim Mapping", "detail": mapping_detail, "type": "claim_mapping"})
 

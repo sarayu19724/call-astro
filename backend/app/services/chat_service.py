@@ -493,12 +493,6 @@ class ChatService:
 
     # ------------------------------------------------------------------
     # EVIDENCE CONTRADICTION ANALYSIS
-    # Uses the already-computed evidence_vote (supportive/challenging/
-    # neutral per-source votes) to build a human-readable RESOLUTION —
-    # not just "3 supportive, 2 challenging", but WHY they disagree and
-    # how to hold both truths at once (e.g. "supported, but timing may be
-    # delayed"). Pure post-hoc synthesis over data already computed —
-    # no new LLM call.
     # ------------------------------------------------------------------
     def _analyze_evidence_contradiction(self, evidence_vote: Optional[Dict]) -> Dict[str, Any]:
         if not isinstance(evidence_vote, dict):
@@ -524,11 +518,6 @@ class ChatService:
         support_str = "; ".join(support_reasons[:3])
         challenge_str = "; ".join(challenge_reasons[:3])
 
-        # Heuristic resolution: supportive signals establish the baseline
-        # outcome, challenging signals qualify HOW/WHEN it plays out —
-        # this mirrors the standard classical-astrology reading convention
-        # (a supportive yoga/placement isn't negated by a delay-indicating
-        # factor; it's qualified by it).
         resolution = (
             f"The supportive evidence ({support_str}) establishes a favorable underlying signal, "
             f"while the challenging evidence ({challenge_str}) does not cancel that signal out — "
@@ -784,6 +773,39 @@ class ChatService:
             logger.info(f"[EvidenceDedup] {len(hits)} hits -> {len(kept)} after semantic dedup (max={max_hits})")
         return kept
 
+    # ------------------------------------------------------------------
+    # DASHA — fetched exactly ONCE per Kundli fetch.
+    # Both the current period (for kundli_dasha) and the full upcoming
+    # tree (for dasha_tree_raw) come from the same API call, so
+    # _get_dasha_timeline never needs a second network round-trip unless
+    # the real API failed here and we're on the calculated fallback.
+    # ------------------------------------------------------------------
+    def _fetch_dasha_bundle(self, session: Dict, kundli_data: Dict, lat: float, lon: float,
+                              time_24h: str) -> Tuple[Optional[Dict], Optional[str]]:
+        dob = session.get("dob")
+        try:
+            ascendant_data = kundli_service.get_ascendant_data(kundli_data)
+            if not ascendant_data:
+                logger.warning("No ascendant_data available — skipping real dasha API, using calculated fallback")
+            elif not dob:
+                logger.warning("No dob available — skipping real dasha API, using calculated fallback")
+            else:
+                dasha_tree = dasha_api_service.fetch_dasha_tree(
+                    date=dob, time=time_24h, latitude=lat, longitude=lon,
+                    ascendant_data=ascendant_data,
+                )
+                if dasha_tree:
+                    current_period = dasha_api_service.find_current_period(dasha_tree)
+                    if current_period:
+                        logger.info("Dasha fetched once from REAL API — current period + full tree both cached")
+                        return current_period, json.dumps(dasha_tree, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"Real dasha API failed, falling back to calculated dasha: {e}")
+
+        logger.info("Falling back to calculated Vimshottari dasha (years-from-birth) — no tree to cache")
+        calculated = kundli_service._get_dasha_for_kundli(kundli_data)
+        return calculated, None
+
     def _fetch_and_cache_kundli(self, session_id: str, session: Dict) -> str:
         try:
             coords = geocoding_service.geocode(session.get("birth_place"))
@@ -799,9 +821,7 @@ class ChatService:
                 date=session.get("dob"), time=time_24h, latitude=lat, longitude=lon,
             )
             if kundli_data:
-                dasha_info = kundli_service.get_real_or_calculated_dasha(
-                    kundli_data, session.get("dob"), time_24h, lat, lon
-                )
+                dasha_info, dasha_tree_json = self._fetch_dasha_bundle(session, kundli_data, lat, lon, time_24h)
                 kundli_str = kundli_service.summarize_kundli(kundli_data, dob=session.get("dob"))
                 chart_data = kundli_service.extract_chart_data(kundli_data)
                 chart_json = json.dumps(chart_data) if chart_data else None
@@ -826,11 +846,14 @@ class ChatService:
                     "yoga_text": yoga_text,
                     "topic_cache": None,
                     "framework_cache": None,
-                    "dasha_tree_raw": None,
+                    "dasha_tree_raw": dasha_tree_json,
                 }
                 db.update_session(session_id, updates)
                 session.update(updates)
-                logger.info("Kundli data fetched and cached (summary + chart + dasha + full raw + yoga)")
+                logger.info(
+                    "Kundli data fetched and cached (summary + chart + dasha + full raw + yoga"
+                    f"{' + dasha tree' if dasha_tree_json else ''})"
+                )
                 return kundli_str
         except Exception as kundli_err:
             logger.error(f"Kundli fetch failed: {kundli_err}")
@@ -1332,8 +1355,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             all_hits = framework_rag_hits + comparison_hits + personalized_rag_hits
 
-            # Rule Applicability Engine — evaluate BEFORE building context,
-            # so the applicability tag is available to the fact->rule table too.
             all_hits = self._evaluate_rule_applicability(all_hits, session)
 
             context_parts = []
@@ -1528,6 +1549,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     dasha_tree = None
 
             if dasha_tree is None:
+                # This only happens if the real Dasha API failed at Kundli-fetch
+                # time (we fell back to calculated Vimshottari and never got a
+                # tree to cache). Try once more here, on-demand, since a timing
+                # question specifically needs it.
                 time_24h = self._to_24h(session.get("birth_time", ""))
                 coords_lat = session.get("latitude")
                 coords_lon = session.get("longitude")
@@ -1551,6 +1576,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 tree_json = json.dumps(dasha_tree, ensure_ascii=False)
                 db.update_session(session_id, {"dasha_tree_raw": tree_json})
                 session["dasha_tree_raw"] = tree_json
+                logger.info("[DashaTimeline] on-demand fetch (tree wasn't cached from Kundli fetch)")
+            else:
+                logger.info("[DashaTimeline] reused cached tree — no network call")
 
             upcoming = dasha_api_service.get_upcoming_periods(dasha_tree, months_ahead=60)
             favorable = rank_favorable_periods(upcoming, topic)
@@ -2296,7 +2324,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps.append({"step": 8, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
 
-            # STEP 9 — EVIDENCE CONTRADICTION ANALYSIS (NEW)
+            # STEP 9 — EVIDENCE CONTRADICTION ANALYSIS
             if contradiction and contradiction.get("has_contradiction"):
                 contradiction_detail = contradiction["detail"]
             elif contradiction:

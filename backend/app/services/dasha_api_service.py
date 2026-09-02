@@ -12,8 +12,15 @@ DATE_FORMAT = "%d/%m/%Y %H:%M:%S"
 DASHA_LAMBDA_URL = "https://bivrov2febq5ued37psv2hcxyi0wlxet.lambda-url.ap-south-1.on.aws/"
 DASHA_LAMBDA_BEARER_TOKEN = "f83c6105-1731-4cd9-9d94-9543ff01bfe1"
 
+# Ordering matters: index 0 is the "known good" candidate — the one that
+# last succeeded in this process. It gets full retries and the normal
+# timeout. Every other candidate is just a cheap, single-shot probe with a
+# short timeout, so a wrong guess costs ~15s instead of ~45s x 3 attempts.
 REQUIREMENTS_CANDIDATES = ["Dasha", "VimshottariDasha", "MahaDasha", "DashaDetails", "all_dasha"]
 FEATURE = "Dasha"  # confirmed-working value, tried first via REQUIREMENTS_CANDIDATES ordering
+
+LEAD_CANDIDATE_TIMEOUT = 45
+PROBE_CANDIDATE_TIMEOUT = 15
 
 
 def _profile(label: str, start: float):
@@ -31,7 +38,7 @@ def _parse_dt(date_str: str) -> Optional[datetime]:
 
 class DashaApiService:
 
-    def _try_fetch(self, payload: Dict, max_retries: int) -> Optional[List[Dict]]:
+    def _try_fetch(self, payload: Dict, max_retries: int, timeout: int) -> Optional[List[Dict]]:
         req = urllib.request.Request(
             DASHA_LAMBDA_URL,
             data=json.dumps(payload).encode("utf-8"),
@@ -45,10 +52,10 @@ class DashaApiService:
         for attempt in range(1, max_retries + 2):
             t0 = time.perf_counter()
             try:
-                with urllib.request.urlopen(req, timeout=45) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     response = json.loads(resp.read().decode("utf-8"))
 
-                _profile(f"HTTP call (requirements={payload.get('requirements')}, attempt {attempt})", t0)
+                _profile(f"HTTP call (requirements={payload.get('requirements')}, attempt {attempt}, timeout={timeout}s)", t0)
 
                 if isinstance(response, list):
                     return response
@@ -66,7 +73,7 @@ class DashaApiService:
                 return None
 
             except urllib.error.HTTPError as e:
-                _profile(f"HTTP call FAILED {e.code} (attempt {attempt})", t0)
+                _profile(f"HTTP call FAILED {e.code} (attempt {attempt}, timeout={timeout}s)", t0)
                 error_body = e.read().decode("utf-8")
                 if 400 <= e.code < 500:
                     logger.warning(
@@ -80,7 +87,7 @@ class DashaApiService:
                 )
 
             except Exception as e:
-                _profile(f"HTTP call ERRORED (attempt {attempt})", t0)
+                _profile(f"HTTP call ERRORED (attempt {attempt}, timeout={timeout}s)", t0)
                 logger.warning(
                     f"Dasha API request failed on attempt {attempt} "
                     f"(requirements={payload.get('requirements')}): {e}"
@@ -103,11 +110,23 @@ class DashaApiService:
         language: str = "english",
         max_retries: int = 2,
     ) -> Optional[List[Dict]]:
-        t_total = time.__class__  # noop guard, real timing below
+        """Deterministic candidate probing:
+        - Candidate at index 0 (the last-known-good requirement value for
+          this process) gets the full retry budget and the normal timeout —
+          this is the expected happy path on every call after the first.
+        - Every other candidate gets exactly ONE attempt with a short
+          timeout, purely to detect whether the API's accepted requirement
+          name has changed. This turns a worst-case "try 5 candidates x 3
+          attempts x 45s" scenario into a bounded, fast fallback path.
+        """
         import time as _time
         t_total = _time.perf_counter()
 
-        for req_value in REQUIREMENTS_CANDIDATES:
+        for idx, req_value in enumerate(REQUIREMENTS_CANDIDATES):
+            is_lead = idx == 0
+            retries_for_this = max_retries if is_lead else 0
+            timeout_for_this = LEAD_CANDIDATE_TIMEOUT if is_lead else PROBE_CANDIDATE_TIMEOUT
+
             payload = {
                 "requirements": [req_value],
                 "dateOfBirth": date,
@@ -119,13 +138,16 @@ class DashaApiService:
                 "ascendant_data": ascendant_data,
             }
 
-            result = self._try_fetch(payload, max_retries)
+            result = self._try_fetch(payload, retries_for_this, timeout_for_this)
             if result is not None:
-                logger.info(f"Dasha API succeeded with requirements=['{req_value}'] — locking this in for future calls")
-                if req_value in REQUIREMENTS_CANDIDATES:
+                if not is_lead:
+                    logger.info(
+                        f"Dasha API succeeded with requirements=['{req_value}'] "
+                        f"(was not the lead candidate) — locking this in for future calls"
+                    )
                     REQUIREMENTS_CANDIDATES.remove(req_value)
                     REQUIREMENTS_CANDIDATES.insert(0, req_value)
-                _profile(f"fetch_dasha_tree TOTAL (succeeded with '{req_value}')", t_total)
+                _profile(f"fetch_dasha_tree TOTAL (succeeded with '{req_value}', lead={is_lead})", t_total)
                 return result
 
         _profile("fetch_dasha_tree TOTAL (all candidates failed)", t_total)

@@ -180,14 +180,6 @@ class ChatService:
 
     # ------------------------------------------------------------------
     # FRESH CHART DATA — single source of truth for chart verification.
-    # Re-derives planets + ascendant DIRECTLY from kundli_full_raw (the
-    # untouched Kundli API response) every time, rather than trusting the
-    # separately cached kundli_raw field. kundli_raw stays cached for cheap
-    # display use elsewhere, but anything that GATES what the LLM may
-    # claim — Rule Applicability, the structured Fact→Rule table, claim
-    # validation — now re-derives from the raw API payload, so a bug or
-    # staleness in the cached extraction can never silently become a
-    # "verified" fact.
     # ------------------------------------------------------------------
     def _get_fresh_chart_data(self, session: Dict) -> Optional[Dict]:
         cached_full_raw = session.get("kundli_full_raw")
@@ -265,6 +257,12 @@ class ChatService:
         buckets: Dict[str, List[str]] = {"classical_rule": [], "dasha_timing": [], "yoga": []}
 
         for hit in rag_hits:
+            # A rule that failed the Rule Applicability check (evidence_role
+            # == "REJECTED") must NEVER appear as usable evidence — it is
+            # surfaced separately (see _build_rejected_evidence_notice) for
+            # transparency only, never bucketed as something to weigh.
+            if hit.get("evidence_role") == "REJECTED":
+                continue
             bucket = STAGE_TO_BUCKET.get(hit.get("stage"), "classical_rule")
             source = hit.get("source", "Unknown")
             page = hit.get("page")
@@ -315,11 +313,12 @@ class ChatService:
     # ------------------------------------------------------------------
     # RULE APPLICABILITY ENGINE
     # For each retrieved chunk of classical text, try to extract a rule
-    # condition (e.g. "7th lord in 10th house", "Saturn in 7th house") and
-    # deterministically check it against the VERIFIED chart facts — before
-    # the LLM ever sees it. Every retrieved chunk gets tagged MATCH /
-    # NO_MATCH / UNKNOWN (no parseable condition found). This replaces
-    # "let the LLM decide if a rule applies" with a hard, checked answer.
+    # condition and deterministically check it against the VERIFIED chart
+    # facts. Every hit is tagged MATCH / NO_MATCH / UNKNOWN, and — this is
+    # the piece that was previously missing — a corresponding evidence_role
+    # (SUPPORTING / REJECTED / UNVERIFIED) that every downstream consumer
+    # (buckets, structured table, sufficiency, coverage) must respect.
+    # A REJECTED hit can never again be counted as supporting evidence.
     # ------------------------------------------------------------------
     def _evaluate_rule_applicability(self, rag_hits: List[Dict[str, Any]], session: Dict) -> List[Dict[str, Any]]:
         chart = self._get_verified_planet_house_map(session)
@@ -327,6 +326,7 @@ class ChatService:
             for hit in rag_hits:
                 hit["applicability"] = "UNKNOWN"
                 hit["applicability_reason"] = "Chart data not available for verification."
+                hit["evidence_role"] = "UNVERIFIED"
             return rag_hits
 
         for hit in rag_hits:
@@ -377,6 +377,13 @@ class ChatService:
             hit["applicability"] = applicability
             hit["applicability_reason"] = reason
 
+            if applicability == "MATCH":
+                hit["evidence_role"] = "SUPPORTING"
+            elif applicability == "NO_MATCH":
+                hit["evidence_role"] = "REJECTED"
+            else:
+                hit["evidence_role"] = "UNVERIFIED"
+
         return rag_hits
 
     def _build_rule_applicability_block(self, evaluated_hits: List[Dict[str, Any]]) -> str:
@@ -401,7 +408,9 @@ class ChatService:
                 f"\nSTRICT RULE: {no_match_count} rule(s) above are marked NO_MATCH — their stated "
                 f"condition does NOT hold for this chart. Do NOT apply, cite, or base any claim on a "
                 f"NO_MATCH rule as if it described this user's chart. Only MATCH rules may be used as "
-                f"grounding for chart-specific claims."
+                f"grounding for chart-specific claims. These {no_match_count} rejected rule(s) have "
+                f"already been excluded from Evidence Sufficiency, Evidence Coverage, and every "
+                f"confidence score below — they contribute ZERO to your certainty in this answer."
             )
         return "\n".join(lines)
 
@@ -430,6 +439,10 @@ class ChatService:
             matched_applicability = None
             house_pattern = re.compile(rf"\b{house}(?:st|nd|rd|th)\s+house\b", re.IGNORECASE)
             for hit in rag_hits:
+                # Never let a rejected (NO_MATCH) rule populate the
+                # structured fact->rule table, even defensively.
+                if hit.get("evidence_role") == "REJECTED":
+                    continue
                 text = hit.get("text", "") or ""
                 if planet_name.lower() not in text.lower():
                     continue
@@ -463,15 +476,24 @@ class ChatService:
     def _compute_evidence_sufficiency(self, rag_hits: List[Dict[str, Any]], evidence_table: str,
                                         dasha_timeline_str: str, evidence_vote: Optional[Dict],
                                         session: Dict) -> Dict[str, Any]:
+        # Rule Applicability -> Sufficiency: only SUPPORTING/UNVERIFIED hits
+        # ever count. REJECTED (NO_MATCH) hits are excluded here — this is
+        # the actual fix for "NO_MATCH but confidence=100%".
+        supporting, rejected, unverified = self._partition_evidence_by_role(rag_hits)
+        usable_hits = supporting + unverified
+
         unique_sources = set()
-        for hit in rag_hits:
+        for hit in usable_hits:
             unique_sources.add((hit.get("source"), hit.get("page")))
 
         matched_rule_rows = 0
         if evidence_table:
             for line in evidence_table.splitlines():
-                if line.startswith("|") and "No retrieved rule matches" not in line and "VERIFIED FACT" not in line and "---" not in line:
-                    matched_rule_rows += 1
+                if not line.startswith("|") or "VERIFIED FACT" in line or "---" in line:
+                    continue
+                if "No retrieved rule matches" in line or "[NO_MATCH]" in line:
+                    continue
+                matched_rule_rows += 1
 
         has_timing = bool(dasha_timeline_str) or bool(session.get("kundli_dasha"))
         has_vote = evidence_vote is not None
@@ -493,20 +515,30 @@ class ChatService:
             "signal_count": signal_count,
             "is_sufficient": is_sufficient,
             "is_strong": is_strong,
+            "supporting_count": len(supporting),
+            "rejected_count": len(rejected),
+            "unverified_count": len(unverified),
         }
 
     def _build_sufficiency_instruction(self, sufficiency: Dict[str, Any]) -> str:
+        rejection_note = ""
+        if sufficiency.get("rejected_count"):
+            rejection_note = (
+                f" Note: {sufficiency['rejected_count']} retrieved rule(s) were checked against this "
+                f"chart and REJECTED (condition not met) — they have already been excluded from every "
+                f"count above and must not be treated as support."
+            )
         if sufficiency["is_strong"]:
             return (
                 "EVIDENCE SUFFICIENCY: Strong — multiple independent sources and a matched chart-to-rule "
-                "pairing are available. You may state the answer with grounded, direct confidence."
+                "pairing are available. You may state the answer with grounded, direct confidence." + rejection_note
             )
         if sufficiency["is_sufficient"]:
             return (
                 "EVIDENCE SUFFICIENCY: Adequate but limited — some independent evidence is available "
                 f"(unique sources: {sufficiency['unique_source_count']}, matched chart facts: "
                 f"{sufficiency['matched_rule_rows']}). State the answer clearly but avoid absolute or "
-                "guaranteed language."
+                "guaranteed language." + rejection_note
             )
         return (
             "EVIDENCE SUFFICIENCY: LOW — only "
@@ -514,8 +546,118 @@ class ChatService:
             f"{sufficiency['matched_rule_rows']} matched chart-to-rule pairing(s) are available for this "
             "specific question. Do NOT present a confident, single-answer verdict. Explicitly acknowledge "
             "the limited evidence, and lean on general classical principles and the verified chart "
-            "placements rather than manufacturing certainty."
+            "placements rather than manufacturing certainty." + rejection_note
         )
+
+    # ------------------------------------------------------------------
+    # EVIDENCE ROLE PARTITIONING — the single authoritative split every
+    # downstream consumer (buckets, table, sufficiency, coverage) reads.
+    # ------------------------------------------------------------------
+    def _partition_evidence_by_role(
+        self, rag_hits: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        supporting, rejected, unverified = [], [], []
+        for hit in rag_hits:
+            role = hit.get("evidence_role", "UNVERIFIED")
+            if role == "SUPPORTING":
+                supporting.append(hit)
+            elif role == "REJECTED":
+                rejected.append(hit)
+            else:
+                unverified.append(hit)
+        return supporting, rejected, unverified
+
+    def _build_rejected_evidence_notice(self, rejected_hits: List[Dict[str, Any]]) -> str:
+        """Rejected rules are still shown to the model — for transparency
+        and so the reasoning trace can explain a mismatch — but framed
+        unambiguously as excluded, never as support."""
+        if not rejected_hits:
+            return ""
+        lines = [f"REJECTED EVIDENCE ({len(rejected_hits)} item(s) excluded — condition does NOT match this chart):"]
+        for hit in rejected_hits:
+            source = hit.get("source", "Unknown")
+            page = hit.get("page")
+            page_label = f", p.{page}" if page is not None else ""
+            lines.append(f"- [{source}{page_label}] {hit.get('applicability_reason', 'condition mismatch')}")
+        lines.append(
+            "These items are shown for transparency only. They must NOT be counted as supporting "
+            "evidence, cited as if they applied to this chart, or used to raise confidence in any way."
+        )
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # EVIDENCE COVERAGE — Pipeline Step 2. Converts the Rule Applicability
+    # split into a plain coverage percentage: of the retrieved rules that
+    # had a CHECKABLE condition for this chart, how many actually matched?
+    # Deliberately independent of raw retrieval count — 11 retrieved
+    # chunks with 1 match and 10 rejections is LOW coverage, not strong
+    # evidence. Returns coverage_pct=None when there was simply nothing
+    # checkable (the common case), so unrelated questions are never
+    # falsely downgraded.
+    # ------------------------------------------------------------------
+    def _compute_evidence_coverage(self, sufficiency: Dict[str, Any]) -> Dict[str, Any]:
+        supporting = sufficiency.get("supporting_count", 0)
+        rejected = sufficiency.get("rejected_count", 0)
+        total = supporting + rejected
+        if total == 0:
+            return {"coverage_pct": None, "label": "NO_CHECKABLE_RULES", "supporting": supporting, "rejected": rejected}
+        pct = round((supporting / total) * 100)
+        if pct >= 80:
+            label = "HIGH"
+        elif pct >= 50:
+            label = "MODERATE"
+        else:
+            label = "LOW"
+        return {"coverage_pct": pct, "label": label, "supporting": supporting, "rejected": rejected}
+
+    def _build_coverage_instruction(self, coverage: Dict[str, Any]) -> str:
+        if coverage.get("coverage_pct") is None:
+            return ""
+        return (
+            f"EVIDENCE COVERAGE: {coverage['coverage_pct']}% of retrieved rules with a checkable "
+            f"condition actually apply to this chart ({coverage['supporting']} matched / "
+            f"{coverage['rejected']} rejected). Coverage: {coverage['label']}. A rejected rule must "
+            f"never be counted toward confidence in your answer."
+        )
+
+    def _reconcile_confidence_with_coverage(self, consensus_label: Optional[str], coverage: Dict[str, Any]) -> Optional[str]:
+        """Evidence Consensus (the Dasha/Chart/Yoga vote) and Evidence
+        Coverage (RAG rule applicability) are computed independently —
+        this is exactly why a NO_MATCH rule could previously coexist with
+        a 100%-favorable verdict. If retrieved classical rules mostly
+        failed the chart check, a HIGH/MEDIUM consensus label is capped
+        so the model never sounds more certain than the verified textual
+        evidence actually supports."""
+        if not consensus_label or coverage.get("coverage_pct") is None:
+            return consensus_label
+        if coverage["label"] == "LOW" and consensus_label in ("HIGH", "MEDIUM"):
+            downgraded = "MEDIUM" if consensus_label == "HIGH" else "LOW"
+            logger.info(
+                f"[ConfidenceReconciliation] consensus {consensus_label} -> {downgraded} "
+                f"due to LOW rule coverage ({coverage['coverage_pct']}%)"
+            )
+            return downgraded
+        return consensus_label
+
+    def _apply_coverage_cap_to_vote(self, evidence_vote: Optional[Dict], coverage: Dict[str, Any]) -> Optional[Dict]:
+        """Caps the numeric confidence_pct that feeds claim_validator's
+        absolute-language check ('will definitely' / '100%' / 'guaranteed').
+        Without this, a favorable Dasha/Chart/Yoga vote could green-light
+        absolute language even when the retrieved classical rules for THIS
+        question mostly didn't apply to the chart."""
+        if not evidence_vote or coverage.get("coverage_pct") is None:
+            return evidence_vote
+        if coverage["label"] != "LOW":
+            return evidence_vote
+        capped = dict(evidence_vote)
+        original = capped.get("confidence_pct", 50)
+        if original > 55:
+            capped["confidence_pct"] = 55
+            if capped.get("verdict") == "favorable":
+                capped["verdict"] = "mixed"
+            capped["_coverage_capped_from"] = original
+            logger.info(f"[ConfidenceReconciliation] evidence_vote confidence capped {original}% -> 55% (LOW rule coverage)")
+        return capped
 
     # ------------------------------------------------------------------
     # EVIDENCE CONTRADICTION ANALYSIS
@@ -799,16 +941,6 @@ class ChatService:
             logger.info(f"[EvidenceDedup] {len(hits)} hits -> {len(kept)} after semantic dedup (max={max_hits})")
         return kept
 
-    # ------------------------------------------------------------------
-    # DASHA — fetched exactly ONCE per Kundli fetch, from the REAL Dasha
-    # API only. The local Vimshottari calculation fallback has been
-    # REMOVED — it silently produced a WRONG Mahadasha/Antardasha lord in
-    # verified testing (calculated Mercury, correct value Venus). No Dasha
-    # data is safer than confidently wrong Dasha data in an astrology
-    # reading, so on any failure this now returns (None, None) and
-    # downstream prompt-building explicitly states "Dasha not available"
-    # rather than fabricating a period.
-    # ------------------------------------------------------------------
     def _fetch_dasha_bundle(self, session: Dict, kundli_data: Dict, lat: float, lon: float,
                               time_24h: str) -> Tuple[Optional[Dict], Optional[str]]:
         dob = session.get("dob")
@@ -1582,12 +1714,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     dasha_tree = None
 
             if dasha_tree is None:
-                # This only happens if the real Dasha API failed at
-                # Kundli-fetch time and never got a tree to cache. Try
-                # once more here, on-demand, since a timing question
-                # specifically needs it. If this also fails, we return ""
-                # and the prompt will note "no timeline data available" —
-                # there is no local-calculation fallback anymore.
                 time_24h = self._to_24h(session.get("birth_time", ""))
                 coords_lat = session.get("latitude")
                 coords_lon = session.get("longitude")
@@ -1750,15 +1876,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
         yoga_text = self._get_yoga_text(session)
 
-        topic_emphasis = divisional_text = consistency_note = missing_evidence = ""
-        evidence_vote = None
-        if topic:
-            bundle = self._get_topic_bundle(session_id, session, topic, language)
-            topic_emphasis = bundle["emphasis"]
-            divisional_text = bundle["divisional"]
-            consistency_note = bundle["consistency"]
-            missing_evidence = bundle["missing_evidence"]
-            evidence_vote = bundle.get("evidence_vote")
+        # ------------------------------------------------------------
+        # PIPELINE STEP 1 -> 2: Rule Applicability -> Evidence Coverage.
+        # rag_hits already carry "applicability"/"evidence_role" from
+        # _evaluate_rule_applicability (called above, or inside
+        # _get_rag_first_context / the followup branch). Build the
+        # applicability block + structured table first, then derive
+        # sufficiency/coverage from them — both now hard-exclude any
+        # hit tagged REJECTED (NO_MATCH).
+        # ------------------------------------------------------------
+        applicability_block = self._build_rule_applicability_block(rag_hits)
+        evidence_table = self._build_structured_evidence_table(rag_hits, session, referenced)
 
         dasha_timeline_str = ""
         requires_timing = bool(query_understanding.get("requires_timing"))
@@ -1767,6 +1895,58 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             logger.info(f"[TimingGate] requires_timing=True — Dasha timeline fetched/reused for topic '{topic}'")
         else:
             logger.info(f"[TimingGate] requires_timing={requires_timing}, topic={topic} — skipping Dasha timeline retrieval")
+
+        # First pass sufficiency (evidence_vote not known yet) just to
+        # derive the supporting/rejected split needed for coverage.
+        sufficiency = self._compute_evidence_sufficiency(rag_hits, evidence_table, dasha_timeline_str, None, session)
+        coverage = self._compute_evidence_coverage(sufficiency)
+        logger.info(
+            f"[EvidenceCoverage] supporting={coverage.get('supporting')} rejected={coverage.get('rejected')} "
+            f"coverage_pct={coverage.get('coverage_pct')} label={coverage.get('label')}"
+        )
+
+        # ------------------------------------------------------------
+        # PIPELINE STEP 2 -> 3: Evidence Coverage -> Evidence Consensus.
+        # The Dasha/Chart/Yoga vote (evidence_vote) is computed
+        # independently of the RAG rule check above — this independence
+        # is exactly why "NO_MATCH but confidence=100%" could happen.
+        # Reconcile them here: a favorable vote must never outrank what
+        # the retrieved classical text actually supports for THIS
+        # specific question.
+        # ------------------------------------------------------------
+        topic_emphasis = divisional_text = consistency_note = missing_evidence = ""
+        evidence_vote = None
+        consensus_label = None
+        if topic:
+            bundle = self._get_topic_bundle(session_id, session, topic, language)
+            topic_emphasis = bundle["emphasis"]
+            divisional_text = bundle["divisional"]
+            consistency_note = bundle["consistency"]
+            missing_evidence = bundle["missing_evidence"]
+            evidence_vote = bundle.get("evidence_vote")
+            consensus_label = bundle.get("consensus_label")
+
+            reconciled_label = self._reconcile_confidence_with_coverage(consensus_label, coverage)
+            if reconciled_label != consensus_label:
+                consistency_note = (
+                    f"{consistency_note}\n\nCONFIDENCE OVERRIDE: The Dasha/Chart/Yoga evidence vote alone "
+                    f"suggested {consensus_label} confidence, but the retrieved classical rule text for "
+                    f"THIS question had only {coverage['coverage_pct']}% coverage — most retrieved rules "
+                    f"did not actually match this chart ({coverage['rejected']} rejected vs "
+                    f"{coverage['supporting']} matched). Treat the overall confidence as {reconciled_label}, "
+                    f"not {consensus_label} — do not use absolute or guaranteed language on this basis."
+                )
+                consensus_label = reconciled_label
+
+            # PIPELINE STEP 3 -> 4: Evidence Consensus -> Claim Validation.
+            # Cap the numeric vote used by claim_validator's absolute-
+            # language check, so a favorable vote can't license "will
+            # definitely" / "100%" language when rule coverage is LOW.
+            evidence_vote = self._apply_coverage_cap_to_vote(evidence_vote, coverage)
+
+        # Recompute sufficiency now that evidence_vote (post-cap) is known,
+        # so has_vote/signal_count reflect the final, reconciled vote.
+        sufficiency = self._compute_evidence_sufficiency(rag_hits, evidence_table, dasha_timeline_str, evidence_vote, session)
 
         final_kundli_data = self._build_final_kundli_data(kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence)
         if targeted_facts:
@@ -1781,21 +1961,31 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             final_kundli_data = f"{final_kundli_data}\n\n{bucketed_evidence}" if final_kundli_data else bucketed_evidence
 
         # --- Rule Applicability Engine block ---
-        applicability_block = self._build_rule_applicability_block(rag_hits)
         if applicability_block:
             final_kundli_data = f"{final_kundli_data}\n\n{applicability_block}" if final_kundli_data else applicability_block
 
-        evidence_table = self._build_structured_evidence_table(rag_hits, session, referenced)
+        # --- Rejected Evidence (excluded, shown for transparency only) ---
+        _, rejected_hits, _ = self._partition_evidence_by_role(rag_hits)
+        rejected_notice = self._build_rejected_evidence_notice(rejected_hits)
+        if rejected_notice:
+            final_kundli_data = f"{final_kundli_data}\n\n{rejected_notice}" if final_kundli_data else rejected_notice
+
         if evidence_table:
             final_kundli_data = f"{final_kundli_data}\n\n{evidence_table}" if final_kundli_data else evidence_table
 
-        sufficiency = self._compute_evidence_sufficiency(rag_hits, evidence_table, dasha_timeline_str, evidence_vote, session)
         sufficiency_instruction = self._build_sufficiency_instruction(sufficiency)
         final_kundli_data = f"{final_kundli_data}\n\n{sufficiency_instruction}" if final_kundli_data else sufficiency_instruction
+
+        # --- Evidence Coverage instruction ---
+        coverage_instruction = self._build_coverage_instruction(coverage)
+        if coverage_instruction:
+            final_kundli_data = f"{final_kundli_data}\n\n{coverage_instruction}"
+
         logger.info(
             f"[SufficiencyGate] sources={sufficiency['unique_source_count']} "
             f"matched_rows={sufficiency['matched_rule_rows']} signals={sufficiency['signal_count']} "
-            f"sufficient={sufficiency['is_sufficient']} strong={sufficiency['is_strong']}"
+            f"sufficient={sufficiency['is_sufficient']} strong={sufficiency['is_strong']} "
+            f"rejected={sufficiency['rejected_count']}"
         )
 
         # --- Evidence Contradiction Analysis ---
@@ -1820,7 +2010,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             "evidence_table": evidence_table,
             "bucketed_evidence": bucketed_evidence,
             "applicability_block": applicability_block,
+            "rejected_hits": rejected_hits,
             "sufficiency": sufficiency,
+            "coverage": coverage,
+            "consensus_label": consensus_label,
             "contradiction": contradiction,
             "final_kundli_data": final_kundli_data,
             "user_memory": user_memory,
@@ -1856,8 +2049,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         recent_texts = self._get_recent_assistant_texts(session_id)
         similar_to = self._is_too_similar(response_text, recent_texts)
 
-        # Verification now always re-derives from kundli_full_raw (the raw
-        # API payload) via _get_fresh_chart_data — see that method for why.
         verify_planets, verify_ascendant = [], None
         fresh_chart_for_verify = self._get_fresh_chart_data(session)
         if fresh_chart_for_verify:
@@ -2013,7 +2204,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             try:
                 trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], response_text,
                                                      ctx["query_understanding"], ctx.get("evidence_table", ""), ctx.get("bucketed_evidence", ""),
-                                                     ctx.get("sufficiency"), claim_mapping, ctx.get("contradiction"), ctx.get("applicability_block", ""))
+                                                     ctx.get("sufficiency"), claim_mapping, ctx.get("contradiction"), ctx.get("applicability_block", ""),
+                                                     ctx.get("coverage"), ctx.get("consensus_label"))
                 db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
             except Exception as trace_err:
                 logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
@@ -2133,7 +2325,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             try:
                 trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], full_text,
                                                      ctx["query_understanding"], ctx.get("evidence_table", ""), ctx.get("bucketed_evidence", ""),
-                                                     ctx.get("sufficiency"), claim_mapping, ctx.get("contradiction"), ctx.get("applicability_block", ""))
+                                                     ctx.get("sufficiency"), claim_mapping, ctx.get("contradiction"), ctx.get("applicability_block", ""),
+                                                     ctx.get("coverage"), ctx.get("consensus_label"))
                 db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
             except Exception as trace_err:
                 logger.error(f"Reasoning trace caching failed: {trace_err}", exc_info=True)
@@ -2167,6 +2360,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         claim_mapping: Optional[List[Dict[str, str]]] = None,
         contradiction: Optional[Dict[str, Any]] = None,
         applicability_block: str = "",
+        coverage: Optional[Dict[str, Any]] = None,
+        consensus_label_override: Optional[str] = None,
     ) -> list:
         if not topic and not rag_hits and not (query_understanding and query_understanding.get("restated_intent")):
             return []
@@ -2246,7 +2441,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             bucket_detail = bucketed_evidence if bucketed_evidence else "No bucketed evidence categories were populated for this question."
             steps.append({"step": 4, "title": "Evidence Bucketed by Type", "detail": bucket_detail, "type": "buckets"})
 
-            # STEP 5 — STRUCTURED FACT -> RULE TABLE (now includes Rule Applicability)
+            # STEP 5 — STRUCTURED FACT -> RULE TABLE (includes Rule Applicability)
             table_parts = []
             if applicability_block:
                 table_parts.append(applicability_block)
@@ -2255,23 +2450,29 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             table_detail = "\n\n".join(table_parts) if table_parts else "No structured fact-to-rule pairing was produced (no matching retrieved rule text for the verified placements checked)."
             steps.append({"step": 5, "title": "Structured Fact → Rule Table", "detail": table_detail, "type": "fact_rule_table"})
 
-            # STEP 6 — EVIDENCE SUFFICIENCY GATE
+            # STEP 6 — EVIDENCE SUFFICIENCY + COVERAGE GATE
             if sufficiency:
                 sufficiency_lines = [
-                    f"Unique retrieved sources: {sufficiency['unique_source_count']}",
+                    f"Unique retrieved sources (usable, non-rejected): {sufficiency['unique_source_count']}",
                     f"Matched chart-fact-to-rule pairings: {sufficiency['matched_rule_rows']}",
                     f"Dasha/timing data available: {'Yes' if sufficiency['has_timing'] else 'No'}",
                     f"Evidence vote available: {'Yes' if sufficiency['has_vote'] else 'No'}",
                     f"Total independent signal count: {sufficiency['signal_count']}",
-                    "",
+                    f"Rule Applicability — Supporting (MATCH): {sufficiency.get('supporting_count', 0)}",
+                    f"Rule Applicability — Rejected (NO_MATCH, excluded): {sufficiency.get('rejected_count', 0)}",
+                ]
+                if coverage and coverage.get("coverage_pct") is not None:
+                    sufficiency_lines.append(f"Evidence Coverage: {coverage['coverage_pct']}% ({coverage['label']})")
+                sufficiency_lines.append("")
+                sufficiency_lines.append(
                     "Verdict: " + ("STRONG — confident language permitted" if sufficiency['is_strong']
                                     else "SUFFICIENT — clear but non-absolute language" if sufficiency['is_sufficient']
-                                    else "LOW — model was instructed to hedge explicitly"),
-                ]
+                                    else "LOW — model was instructed to hedge explicitly")
+                )
                 sufficiency_detail = "\n".join(sufficiency_lines)
             else:
                 sufficiency_detail = "Evidence sufficiency was not computed for this response."
-            steps.append({"step": 6, "title": "Evidence Sufficiency Gate", "detail": sufficiency_detail, "type": "sufficiency"})
+            steps.append({"step": 6, "title": "Evidence Sufficiency + Coverage Gate", "detail": sufficiency_detail, "type": "sufficiency"})
 
             # STEP 7 — PERSONALIZED + COMPARATIVE EVIDENCE RETRIEVED
             personalized_hits = [hit for hit in rag_hits if hit.get("stage") == "personalized"]
@@ -2310,7 +2511,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             evidence_detail_step7 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or comparative evidence was retrieved."
             steps.append({"step": 7, "title": "Personalized + Comparative Evidence Retrieved", "detail": evidence_detail_step7, "type": "personalized_rag"})
 
-            # STEP 8 — EVIDENCE CONSENSUS
+            # STEP 8 — EVIDENCE CONSENSUS (raw vote vs. coverage-reconciled)
             consensus_label = None
             evidence_vote = None
             consistency = ""
@@ -2327,9 +2528,15 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             consensus_lines = []
             if consensus_label:
-                consensus_lines.append(f"Evidence confidence: {consensus_label}")
+                consensus_lines.append(f"Evidence confidence (Dasha/Chart/Yoga vote, raw): {consensus_label}")
             else:
                 consensus_lines.append("Evidence confidence: Not available (no life-area topic classified)")
+
+            if consensus_label_override and consensus_label_override != consensus_label:
+                consensus_lines.append(
+                    f"Evidence confidence (after Evidence Coverage reconciliation): {consensus_label_override} "
+                    f"— downgraded because the retrieved classical rules had low coverage for this specific question."
+                )
 
             if isinstance(evidence_vote, dict):
                 votes = evidence_vote.get("votes", [])
@@ -2426,6 +2633,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     reference += f" (option: {hit['branch']})"
                 if hit.get("applicability"):
                     reference += f" [{hit['applicability']}]"
+                if hit.get("evidence_role") == "REJECTED":
+                    reference += " — EXCLUDED FROM CONFIDENCE"
                 reference_lines.append(f"• {reference}")
 
             evidence_detail_step11 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
@@ -2434,13 +2643,15 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             # STEP 12 — EVIDENCE SYNTHESIS
             synthesis_detail = (
                 "The final interpretation combines the bucketed evidence (classical rule / Dasha timing / "
-                "Yoga, kept as distinct categories), the Rule Applicability Engine's MATCH/NO_MATCH checks, "
-                "the structured Fact→Rule table, the Evidence Sufficiency Gate's confidence calibration, "
-                "the Evidence Contradiction resolution, Yoga-claim verification, response-contract length "
-                "compliance, verified chart placements (re-derived fresh from the raw Kundli API response "
-                "on every check), comparative branch analysis, timing-gated Dasha data (sourced exclusively "
-                "from the real Dasha API, with no local fallback calculation), current-date temporal "
-                "filtering, and intra-response duplicate suppression."
+                "Yoga, kept as distinct categories), the Rule Applicability Engine's MATCH/NO_MATCH checks "
+                "with hard exclusion of NO_MATCH rules, the Evidence Coverage percentage derived from that "
+                "same check, reconciliation of the independent Dasha/Chart/Yoga confidence vote against that "
+                "coverage, the structured Fact→Rule table, the Evidence Sufficiency Gate's confidence "
+                "calibration, the Evidence Contradiction resolution, Yoga-claim verification, response-"
+                "contract length compliance, verified chart placements (re-derived fresh from the raw Kundli "
+                "API response on every check), comparative branch analysis, timing-gated Dasha data (sourced "
+                "exclusively from the real Dasha API, with no local fallback calculation), current-date "
+                "temporal filtering, and intra-response duplicate suppression."
             )
             steps.append({"step": 12, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 

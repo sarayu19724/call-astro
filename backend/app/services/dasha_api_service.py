@@ -13,8 +13,6 @@ DASHA_LAMBDA_URL = "https://bivrov2febq5ued37psv2hcxyi0wlxet.lambda-url.ap-south
 DASHA_LAMBDA_BEARER_TOKEN = "f83c6105-1731-4cd9-9d94-9543ff01bfe1"
 
 REQUIREMENTS_CANDIDATES = ["Dasha", "VimshottariDasha", "MahaDasha", "DashaDetails", "all_dasha"]
-FEATURE = "Dasha"  # confirmed-working value, tried first via REQUIREMENTS_CANDIDATES ordering
-
 
 def _profile(label: str, start: float):
     elapsed = time.perf_counter() - start

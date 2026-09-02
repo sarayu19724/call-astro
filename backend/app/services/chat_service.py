@@ -954,7 +954,7 @@ class ChatService:
                 return None, None
 
             dasha_tree = dasha_api_service.fetch_dasha_tree(
-                date=dob, time=time_24h, latitude=lat, longitude=lon,
+                date=dob, birth_time=time_24h, latitude=lat, longitude=lon,
                 ascendant_data=ascendant_data,
             )
             if dasha_tree:
@@ -1727,7 +1727,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     return ""
 
                 dasha_tree = dasha_api_service.fetch_dasha_tree(
-                    date=session.get("dob"), time=time_24h,
+                    date=session.get("dob"), birth_time=time_24h,
                     latitude=coords_lat, longitude=coords_lon,
                     ascendant_data=ascendant_data,
                 )

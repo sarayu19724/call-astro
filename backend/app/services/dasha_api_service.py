@@ -134,7 +134,11 @@ class DashaApiService:
                     response = json.loads(
                         resp.read().decode("utf-8")
                     )
-
+                logger.info(f"[DashaAPI] RAW RESPONSE TYPE: {type(response).__name__}")
+                logger.info(
+    f"[DashaAPI] RAW RESPONSE: "
+    f"{json.dumps(response, ensure_ascii=False)}"
+)
                 _profile(
                     f"HTTP call "
                     f"(requirements={requirements}, attempt {attempt})",

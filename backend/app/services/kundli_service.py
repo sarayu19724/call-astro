@@ -6,15 +6,6 @@ from app.utils.logger import logger
 
 FUNCTION_URL = "https://vutgjzjv7ilckzs7ooeh5gnnyy0xnkdz.lambda-url.ap-south-1.on.aws/"
 
-DASHA_SEQUENCE = ["Ketu", "Venus", "Sun", "Moon", "Mars", "Rahu", "Jupiter", "Saturn", "Mercury"]
-DASHA_YEARS = {
-    "Ketu": 7, "Venus": 20, "Sun": 6, "Moon": 10, "Mars": 7,
-    "Rahu": 18, "Jupiter": 16, "Saturn": 19, "Mercury": 17
-}
-NAKSHATRA_LORDS = (
-    ["Ketu", "Venus", "Sun", "Moon", "Mars", "Rahu", "Jupiter", "Saturn", "Mercury"] * 3
-)
-
 SIGN_LORDS = {
     "Aries": "Mars", "Taurus": "Venus", "Gemini": "Mercury", "Cancer": "Moon",
     "Leo": "Sun", "Virgo": "Mercury", "Libra": "Venus", "Scorpio": "Mars",
@@ -34,109 +25,6 @@ def get_house_lord(house_number: int, ascendant_sign: str) -> Optional[str]:
         return SIGN_LORDS.get(house_sign)
     except (ValueError, KeyError):
         return None
-
-
-def calculate_vimshottari_dasha(moon_degree: float, moon_star_lord: str, moon_pada: int) -> Optional[Dict]:
-    try:
-        NAKSHATRA_ARC = 13.333333
-
-        nakshatra_num = int(moon_degree / NAKSHATRA_ARC) + 1
-        nakshatra_lord = NAKSHATRA_LORDS[nakshatra_num - 1]
-
-        if nakshatra_lord != moon_star_lord:
-            logger.warning(f"Dasha lord mismatch: calculated {nakshatra_lord} vs API {moon_star_lord} — using API value")
-            nakshatra_lord = moon_star_lord
-
-        position_in_nakshatra = moon_degree % NAKSHATRA_ARC
-        fraction_passed = position_in_nakshatra / NAKSHATRA_ARC
-
-        start_lord_idx = DASHA_SEQUENCE.index(nakshatra_lord)
-        start_dasha_years = DASHA_YEARS[nakshatra_lord]
-        balance_years = start_dasha_years * (1 - fraction_passed)
-
-        dasha_timeline = []
-        current_year = 0.0
-        for i in range(9):
-            lord_idx = (start_lord_idx + i) % 9
-            lord = DASHA_SEQUENCE[lord_idx]
-            years = balance_years if i == 0 else DASHA_YEARS[lord]
-
-            dasha_timeline.append({
-                "lord": lord,
-                "years": round(years, 2),
-                "start_year": round(current_year, 2),
-                "end_year": round(current_year + years, 2),
-            })
-            current_year += years
-
-        return {
-            "birth_nakshatra": nakshatra_num,
-            "nakshatra_lord": nakshatra_lord,
-            "moon_pada": moon_pada,
-            "balance_of_dasha_at_birth": round(balance_years, 2),
-            "dasha_sequence": dasha_timeline,
-            "current_mahadasha": dasha_timeline[0],
-        }
-    except Exception as e:
-        logger.error(f"Dasha calculation failed: {e}")
-        return None
-
-
-def calculate_full_dasha_periods(moon_degree: float, moon_star_lord: str, moon_pada: int) -> Optional[Dict]:
-    mahadasha_info = calculate_vimshottari_dasha(moon_degree, moon_star_lord, moon_pada)
-    if not mahadasha_info:
-        return None
-
-    try:
-        current_maha = mahadasha_info["current_mahadasha"]
-        maha_lord = current_maha["lord"]
-        maha_start_year = current_maha["start_year"]
-        maha_total_years = DASHA_YEARS[maha_lord]
-        maha_lord_idx = DASHA_SEQUENCE.index(maha_lord)
-
-        antardasha_sequence = []
-        elapsed = maha_start_year
-        for i in range(9):
-            antar_lord_idx = (maha_lord_idx + i) % 9
-            antar_lord = DASHA_SEQUENCE[antar_lord_idx]
-            antar_years = (maha_total_years * DASHA_YEARS[antar_lord]) / 120
-            antardasha_sequence.append({
-                "lord": antar_lord,
-                "years": round(antar_years, 3),
-                "start_year": round(elapsed, 3),
-                "end_year": round(elapsed + antar_years, 3),
-            })
-            elapsed += antar_years
-
-        mahadasha_info["antardasha_sequence"] = antardasha_sequence
-        mahadasha_info["current_antardasha"] = antardasha_sequence[0]
-
-        first_antar = antardasha_sequence[0]
-        antar_lord = first_antar["lord"]
-        antar_total_years = first_antar["years"]
-        antar_lord_idx2 = DASHA_SEQUENCE.index(antar_lord)
-
-        pratyantar_sequence = []
-        elapsed2 = first_antar["start_year"]
-        for i in range(9):
-            praty_lord_idx = (antar_lord_idx2 + i) % 9
-            praty_lord = DASHA_SEQUENCE[praty_lord_idx]
-            praty_years = (antar_total_years * DASHA_YEARS[praty_lord]) / 120
-            pratyantar_sequence.append({
-                "lord": praty_lord,
-                "years": round(praty_years, 4),
-                "start_year": round(elapsed2, 4),
-                "end_year": round(elapsed2 + praty_years, 4),
-            })
-            elapsed2 += praty_years
-
-        mahadasha_info["pratyantardasha_sequence"] = pratyantar_sequence
-        mahadasha_info["current_pratyantardasha"] = pratyantar_sequence[0]
-
-        return mahadasha_info
-    except Exception as e:
-        logger.error(f"Antardasha/Pratyantardasha calculation failed: {e}")
-        return mahadasha_info
 
 
 class KundliService:
@@ -184,23 +72,15 @@ class KundliService:
             logger.error(f"Failed to extract ascendant_data: {e}")
         return None
 
-    def _get_dasha_for_kundli(self, kundli_data: Dict) -> Optional[Dict]:
-        try:
-            moon_lord_data = kundli_data.get("planet_lords", {}).get("Moon", {})
-            moon_degree = moon_lord_data.get("degree")
-            moon_star_lord = moon_lord_data.get("star_lord")
-            moon_pada = moon_lord_data.get("pada")
-
-            if moon_degree is None or not moon_star_lord or moon_pada is None:
-                logger.warning("Missing Moon degree/star_lord/pada — cannot calculate dasha")
-                return None
-
-            return calculate_full_dasha_periods(float(moon_degree), moon_star_lord, int(moon_pada))
-        except Exception as e:
-            logger.error(f"Failed to derive dasha inputs: {e}")
-            return None
-
-    def summarize_kundli(self, kundli_data: Dict, dob: Optional[str] = None) -> str:
+    def summarize_kundli(self, kundli_data: Dict, dob: Optional[str] = None,
+                          dasha_info: Optional[Dict] = None) -> str:
+        """dasha_info now comes EXCLUSIVELY from the real Dasha API
+        (dasha_api_service), fetched once in chat_service._fetch_dasha_bundle
+        and passed in here. The local Vimshottari calculation has been
+        REMOVED — it silently produced an incorrect Mahadasha/Antardasha
+        lord (Mercury, when the verified correct value is Venus). It's far
+        safer to say 'not available' than to state a confidently wrong
+        Dasha in an astrology reading."""
         try:
             lines = []
             positions = kundli_data.get("planetary_positions", [])
@@ -235,29 +115,24 @@ class KundliService:
             if d9_asc:
                 lines.append(f"Navamsa (D9) Ascendant: {d9_asc}")
 
-            dasha_info = self._get_dasha_for_kundli(kundli_data)
-            if dasha_info:
+            if dasha_info and dasha_info.get("current_mahadasha", {}).get("lord"):
                 maha = dasha_info["current_mahadasha"]
                 antar = dasha_info.get("current_antardasha")
                 praty = dasha_info.get("current_pratyantardasha")
 
-                dasha_line = f"Current Dasha Period (approximate, calculated): Mahadasha={maha['lord']}"
+                dasha_line = f"Current Dasha Period (REAL, from Dasha API — actual calendar dates): Mahadasha={maha['lord']}"
                 if antar:
-                    dasha_line += f", Antardasha={antar['lord']}"
+                    dasha_line += f", Antardasha={antar.get('lord')}"
                 if praty:
-                    dasha_line += f", Pratyantardasha={praty['lord']}"
+                    dasha_line += f", Pratyantardasha={praty.get('lord')}"
                 lines.append(dasha_line)
-
-                if len(dasha_info["dasha_sequence"]) > 1:
-                    nxt = dasha_info["dasha_sequence"][1]
-                    if dob:
-                        try:
-                            from datetime import datetime as _dt
-                            birth_year = _dt.strptime(dob.strip(), "%d-%m-%Y").year
-                            approx_year = birth_year + int(nxt["start_year"])
-                            lines.append(f"Next Mahadasha: {nxt['lord']} (approx. begins around {approx_year})")
-                        except (ValueError, TypeError):
-                            pass
+                if maha.get("start") and maha.get("end"):
+                    lines.append(f"Current Mahadasha runs from {maha['start']} to {maha['end']}")
+            else:
+                lines.append(
+                    "Current Dasha Period: NOT AVAILABLE right now. Do not state a specific "
+                    "Mahadasha or Antardasha lord — speak about the chart placements instead."
+                )
 
             ascendant_pred = kundli_data.get("ascendant_sign_prediction", "")
             if ascendant_pred:
@@ -276,6 +151,10 @@ class KundliService:
             return "No structured chart data available."
 
     def extract_chart_data(self, kundli_data: Dict) -> Optional[Dict]:
+        """This is the SINGLE source of truth for planet/ascendant
+        extraction. Call it fresh off kundli_full_raw every time you need
+        verified chart facts — do not trust a separately cached copy that
+        could drift from the raw API payload."""
         if not kundli_data:
             return None
         try:
@@ -334,11 +213,11 @@ class KundliService:
             logger.error(f"Failed to extract moon sign: {e}")
         return None
 
-    def get_full_chart_bundle(self, kundli_data: Dict) -> Dict:
+    def get_full_chart_bundle(self, kundli_data: Dict, dasha_info: Optional[Dict] = None) -> Dict:
         return {
-            "summary": self.summarize_kundli(kundli_data),
+            "summary": self.summarize_kundli(kundli_data, dasha_info=dasha_info),
             "chart": self.extract_chart_data(kundli_data),
-            "dasha": self._get_dasha_for_kundli(kundli_data),
+            "dasha": dasha_info,
             "divisional": {
                 "D9": self.extract_divisional_chart(kundli_data, "D9"),
                 "D10": self.extract_divisional_chart(kundli_data, "D10"),
@@ -346,35 +225,13 @@ class KundliService:
             },
         }
 
-    def get_real_or_calculated_dasha(self, kundli_data: Dict, dob: str, birth_time_24h: str,
-                                       latitude: float, longitude: float) -> Optional[Dict]:
-        """Try the REAL dasha API first (actual calendar dates, authoritative).
-        Falls back to the hand-calculated Vimshottari math only if the real
-        API is unavailable, misconfigured, or missing required data."""
-        from app.services.dasha_api_service import dasha_api_service
+    # NOTE: get_real_or_calculated_dasha(), calculate_vimshottari_dasha(),
+    # calculate_full_dasha_periods(), and _get_dasha_for_kundli() have been
+    # REMOVED. Dasha data now comes exclusively from
+    # app.services.dasha_api_service (the real API) via
+    # chat_service._fetch_dasha_bundle(). If the real API fails, the
+    # correct behavior is "Dasha not available" — never a locally
+    # calculated guess.
 
-        try:
-            ascendant_data = self.get_ascendant_data(kundli_data)
-            if not ascendant_data:
-                logger.warning("No ascendant_data available — skipping real dasha API, using calculated fallback")
-            elif dob:
-                # dob is already DD-MM-YYYY — exactly what this Lambda's
-                # dateOfBirth field expects. DO NOT convert to slashes here;
-                # that was the bug that caused this to silently fail before.
-                dasha_tree = dasha_api_service.fetch_dasha_tree(
-                    date=dob, time=birth_time_24h,
-                    latitude=latitude, longitude=longitude,
-                    ascendant_data=ascendant_data,
-                )
-                if dasha_tree:
-                    current_period = dasha_api_service.find_current_period(dasha_tree)
-                    if current_period:
-                        logger.info("Using REAL dasha API data (with actual calendar dates)")
-                        return current_period
-        except Exception as e:
-            logger.warning(f"Real dasha API failed, falling back to calculated dasha: {e}")
-
-        logger.info("Falling back to calculated Vimshottari dasha (years-from-birth)")
-        return self._get_dasha_for_kundli(kundli_data)
 
 kundli_service = KundliService()

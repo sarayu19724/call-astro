@@ -12,15 +12,20 @@ DATE_FORMAT = "%d/%m/%Y %H:%M:%S"
 DASHA_LAMBDA_URL = "https://bivrov2febq5ued37psv2hcxyi0wlxet.lambda-url.ap-south-1.on.aws/"
 DASHA_LAMBDA_BEARER_TOKEN = "f83c6105-1731-4cd9-9d94-9543ff01bfe1"
 
-# "Dasha" is the confirmed-working requirement value — kept first so the
-# happy path never has to fall through. The others are kept only as a
-# last-resort fallback in case a specific chart ever rejects "Dasha".
-REQUIREMENTS_CANDIDATES = ["Dasha", "VimshottariDasha", "MahaDasha", "DashaDetails", "all_dasha"]
-FEATURE = "Dasha"  # confirmed-working value, tried first via REQUIREMENTS_CANDIDATES ordering
+# CONFIRMED: the API returns the Dasha tree under a key that matches the
+# requirement value EXACTLY as sent — "Dasha" (capital D). The previous
+# probing loop tried 5 different requirement values on EVERY call because
+# the response-parsing code only checked for the lowercase key "dasha",
+# which never matched the real "Dasha" key. Every successful response was
+# being silently discarded and treated as a failure, which then:
+#   1. wasted 4 extra HTTP round-trips (~3+s each) probing other candidates
+#   2. fell through to the local Vimshottari calculation, which produced a
+#      WRONG Mahadasha/Antardasha lord (Mercury instead of the correct Venus)
+#
+# Only one requirement value is needed now that the parsing bug is fixed.
+REQUIREMENTS_CANDIDATES = ["Dasha"]
 
-# Generic fallback keys, checked only if the response doesn't echo back the
-# exact requirement name we sent (kept for robustness against API changes).
-GENERIC_LIST_KEYS = ("mahadasha", "dasha", "vimshottari", "data", "result")
+REQUEST_TIMEOUT = 45
 
 
 def _profile(label: str, start: float):
@@ -36,41 +41,9 @@ def _parse_dt(date_str: str) -> Optional[datetime]:
         return None
 
 
-def _extract_list_from_response(response, requirements: List[str]) -> Optional[List[Dict]]:
-    """The API echoes the requirement name back as the response key, e.g.
-    requirements=["Dasha"] -> {"Dasha": [...]}. Match case-insensitively
-    against whatever requirement value we actually sent BEFORE falling back
-    to a generic key list — this was previously missed because the code
-    only checked lowercase keys like "dasha", never the capitalized "Dasha"
-    the API actually returns, causing every call to spuriously fail and
-    fall through all 5 candidates on every single request."""
-    if isinstance(response, list):
-        return response
-
-    if not isinstance(response, dict):
-        return None
-
-    # 1) Exact (case-insensitive) match against the requirement(s) we sent.
-    lower_map = {k.lower(): k for k in response.keys()}
-    for req_val in requirements:
-        match_key = lower_map.get(req_val.lower())
-        if match_key is not None and isinstance(response[match_key], list):
-            return response[match_key]
-
-    # 2) Generic fallback keys.
-    for key in GENERIC_LIST_KEYS:
-        if key in response and isinstance(response[key], list):
-            return response[key]
-
-    logger.warning(
-        f"Dasha API returned unexpected keys (requirements={requirements}): {list(response.keys())}"
-    )
-    return None
-
-
 class DashaApiService:
 
-    def _try_fetch(self, payload: Dict, max_retries: int) -> Optional[List[Dict]]:
+    def _try_fetch(self, payload: Dict, max_retries: int, timeout: int) -> Optional[List[Dict]]:
         req = urllib.request.Request(
             DASHA_LAMBDA_URL,
             data=json.dumps(payload).encode("utf-8"),
@@ -81,48 +54,58 @@ class DashaApiService:
             method="POST",
         )
 
-        requirements = payload.get("requirements", [])
-
         for attempt in range(1, max_retries + 2):
             t0 = time.perf_counter()
             try:
-                with urllib.request.urlopen(req, timeout=45) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     response = json.loads(resp.read().decode("utf-8"))
 
-                _profile(f"HTTP call (requirements={requirements}, attempt {attempt})", t0)
+                _profile(f"HTTP call (requirements={payload.get('requirements')}, attempt {attempt}, timeout={timeout}s)", t0)
 
-                result = _extract_list_from_response(response, requirements)
-                if result is not None:
-                    return result
-                # Response came back 200 but had no usable list under any
-                # known key — treat as a hard miss, don't retry (retrying
-                # won't change the response shape).
+                if isinstance(response, list):
+                    return response
+
+                if isinstance(response, dict):
+                    # THE FIX: case-insensitive match against every key
+                    # actually present in the response, instead of a
+                    # hardcoded lowercase-only list. "Dasha" (as the API
+                    # returns it) now matches, instead of silently failing.
+                    for key, value in response.items():
+                        if key.lower() in ("mahadasha", "dasha", "vimshottari", "data", "result") and isinstance(value, list):
+                            logger.info(f"Dasha API response parsed successfully via key '{key}'")
+                            return value
+                    logger.warning(
+                        f"Dasha API returned unexpected keys "
+                        f"(requirements={payload.get('requirements')}): {list(response.keys())}"
+                    )
+                    return None
+
                 return None
 
             except urllib.error.HTTPError as e:
-                _profile(f"HTTP call FAILED {e.code} (attempt {attempt})", t0)
+                _profile(f"HTTP call FAILED {e.code} (attempt {attempt}, timeout={timeout}s)", t0)
                 error_body = e.read().decode("utf-8")
                 if 400 <= e.code < 500:
                     logger.warning(
-                        f"Dasha API rejected requirements={requirements!r} "
+                        f"Dasha API rejected requirements={payload.get('requirements')!r} "
                         f"(HTTP {e.code}): {error_body}"
                     )
                     return None
                 logger.warning(
                     f"Dasha API HTTP error {e.code} on attempt {attempt} "
-                    f"(requirements={requirements}): {error_body}"
+                    f"(requirements={payload.get('requirements')}): {error_body}"
                 )
 
             except Exception as e:
-                _profile(f"HTTP call ERRORED (attempt {attempt})", t0)
+                _profile(f"HTTP call ERRORED (attempt {attempt}, timeout={timeout}s)", t0)
                 logger.warning(
                     f"Dasha API request failed on attempt {attempt} "
-                    f"(requirements={requirements}): {e}"
+                    f"(requirements={payload.get('requirements')}): {e}"
                 )
 
         logger.error(
             f"Dasha API fetch failed after {max_retries + 1} attempts "
-            f"(requirements={requirements})"
+            f"(requirements={payload.get('requirements')})"
         )
         return None
 
@@ -137,34 +120,29 @@ class DashaApiService:
         language: str = "english",
         max_retries: int = 2,
     ) -> Optional[List[Dict]]:
-        import time as _time
-        t_total = _time.perf_counter()
+        """Single confirmed requirement value ("Dasha"), full retry budget.
+        No more multi-candidate probing — that was only ever masking the
+        parsing bug above, at a real latency cost (4 extra wasted probes
+        x ~3-4s each on every single call)."""
+        t_total = time.perf_counter()
 
-        for req_value in REQUIREMENTS_CANDIDATES:
-            payload = {
-                "requirements": [req_value],
-                "dateOfBirth": date,
-                "time_of_birth": time,
-                "latitude": str(latitude),
-                "longitude": str(longitude),
-                "timezone_name": timezone_name,
-                "language": language,
-                "ascendant_data": ascendant_data,
-            }
+        payload = {
+            "requirements": REQUIREMENTS_CANDIDATES,
+            "dateOfBirth": date,
+            "time_of_birth": time,
+            "latitude": str(latitude),
+            "longitude": str(longitude),
+            "timezone_name": timezone_name,
+            "language": language,
+            "ascendant_data": ascendant_data,
+        }
 
-            result = self._try_fetch(payload, max_retries)
-            if result is not None:
-                if req_value != REQUIREMENTS_CANDIDATES[0]:
-                    logger.info(f"Dasha API succeeded with requirements=['{req_value}'] — locking this in for future calls")
-                    if req_value in REQUIREMENTS_CANDIDATES:
-                        REQUIREMENTS_CANDIDATES.remove(req_value)
-                        REQUIREMENTS_CANDIDATES.insert(0, req_value)
-                _profile(f"fetch_dasha_tree TOTAL (succeeded with '{req_value}')", t_total)
-                return result
+        result = self._try_fetch(payload, max_retries, REQUEST_TIMEOUT)
+        _profile(f"fetch_dasha_tree TOTAL (requirements={REQUIREMENTS_CANDIDATES})", t_total)
 
-        _profile("fetch_dasha_tree TOTAL (all candidates failed)", t_total)
-        logger.error(f"Dasha API failed for all requirements candidates: {REQUIREMENTS_CANDIDATES}")
-        return None
+        if result is None:
+            logger.error("Dasha API fetch failed — no real dasha tree available for this request.")
+        return result
 
     def flatten_periods(self, dasha_tree: List[Dict], level: str = "antardasha") -> List[Dict]:
         flat = []

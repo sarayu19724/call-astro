@@ -178,16 +178,42 @@ class ChatService:
             "present periods starting after the current date as genuine future predictions."
         )
 
-    def _get_verified_planet_house_map(self, session: Dict) -> Optional[Dict[str, Any]]:
+    # ------------------------------------------------------------------
+    # FRESH CHART DATA — single source of truth for chart verification.
+    # Re-derives planets + ascendant DIRECTLY from kundli_full_raw (the
+    # untouched Kundli API response) every time, rather than trusting the
+    # separately cached kundli_raw field. kundli_raw stays cached for cheap
+    # display use elsewhere, but anything that GATES what the LLM may
+    # claim — Rule Applicability, the structured Fact→Rule table, claim
+    # validation — now re-derives from the raw API payload, so a bug or
+    # staleness in the cached extraction can never silently become a
+    # "verified" fact.
+    # ------------------------------------------------------------------
+    def _get_fresh_chart_data(self, session: Dict) -> Optional[Dict]:
+        cached_full_raw = session.get("kundli_full_raw")
+        if cached_full_raw:
+            try:
+                full_raw = json.loads(cached_full_raw)
+                fresh = kundli_service.extract_chart_data(full_raw)
+                if fresh and fresh.get("planets") and fresh.get("ascendant_sign"):
+                    return fresh
+            except Exception as e:
+                logger.error(f"Failed to derive fresh chart data from kundli_full_raw: {e}")
+
         cached_raw = session.get("kundli_raw")
-        if not cached_raw:
+        if cached_raw:
+            try:
+                return json.loads(cached_raw)
+            except Exception:
+                return None
+        return None
+
+    def _get_verified_planet_house_map(self, session: Dict) -> Optional[Dict[str, Any]]:
+        parsed = self._get_fresh_chart_data(session)
+        if not parsed:
             return None
-        try:
-            parsed = json.loads(cached_raw)
-            planets = parsed.get("planets", []) or []
-            ascendant_sign = parsed.get("ascendant_sign")
-        except Exception:
-            return None
+        planets = parsed.get("planets", []) or []
+        ascendant_sign = parsed.get("ascendant_sign")
         if not ascendant_sign or not planets:
             return None
 
@@ -774,11 +800,14 @@ class ChatService:
         return kept
 
     # ------------------------------------------------------------------
-    # DASHA — fetched exactly ONCE per Kundli fetch.
-    # Both the current period (for kundli_dasha) and the full upcoming
-    # tree (for dasha_tree_raw) come from the same API call, so
-    # _get_dasha_timeline never needs a second network round-trip unless
-    # the real API failed here and we're on the calculated fallback.
+    # DASHA — fetched exactly ONCE per Kundli fetch, from the REAL Dasha
+    # API only. The local Vimshottari calculation fallback has been
+    # REMOVED — it silently produced a WRONG Mahadasha/Antardasha lord in
+    # verified testing (calculated Mercury, correct value Venus). No Dasha
+    # data is safer than confidently wrong Dasha data in an astrology
+    # reading, so on any failure this now returns (None, None) and
+    # downstream prompt-building explicitly states "Dasha not available"
+    # rather than fabricating a period.
     # ------------------------------------------------------------------
     def _fetch_dasha_bundle(self, session: Dict, kundli_data: Dict, lat: float, lon: float,
                               time_24h: str) -> Tuple[Optional[Dict], Optional[str]]:
@@ -786,25 +815,29 @@ class ChatService:
         try:
             ascendant_data = kundli_service.get_ascendant_data(kundli_data)
             if not ascendant_data:
-                logger.warning("No ascendant_data available — skipping real dasha API, using calculated fallback")
-            elif not dob:
-                logger.warning("No dob available — skipping real dasha API, using calculated fallback")
-            else:
-                dasha_tree = dasha_api_service.fetch_dasha_tree(
-                    date=dob, time=time_24h, latitude=lat, longitude=lon,
-                    ascendant_data=ascendant_data,
-                )
-                if dasha_tree:
-                    current_period = dasha_api_service.find_current_period(dasha_tree)
-                    if current_period:
-                        logger.info("Dasha fetched once from REAL API — current period + full tree both cached")
-                        return current_period, json.dumps(dasha_tree, ensure_ascii=False)
-        except Exception as e:
-            logger.warning(f"Real dasha API failed, falling back to calculated dasha: {e}")
+                logger.warning("No ascendant_data available — cannot fetch real dasha")
+                return None, None
+            if not dob:
+                logger.warning("No dob available — cannot fetch real dasha")
+                return None, None
 
-        logger.info("Falling back to calculated Vimshottari dasha (years-from-birth) — no tree to cache")
-        calculated = kundli_service._get_dasha_for_kundli(kundli_data)
-        return calculated, None
+            dasha_tree = dasha_api_service.fetch_dasha_tree(
+                date=dob, time=time_24h, latitude=lat, longitude=lon,
+                ascendant_data=ascendant_data,
+            )
+            if dasha_tree:
+                current_period = dasha_api_service.find_current_period(dasha_tree)
+                if current_period:
+                    logger.info("Dasha fetched once from REAL API — current period + full tree both cached")
+                    return current_period, json.dumps(dasha_tree, ensure_ascii=False)
+                logger.error("Dasha tree fetched but no period matched today's date")
+            else:
+                logger.error("Real Dasha API returned no data")
+        except Exception as e:
+            logger.error(f"Real dasha API failed: {e}")
+
+        logger.warning("No real Dasha data available for this session — Dasha content will note 'not available'")
+        return None, None
 
     def _fetch_and_cache_kundli(self, session_id: str, session: Dict) -> str:
         try:
@@ -822,7 +855,7 @@ class ChatService:
             )
             if kundli_data:
                 dasha_info, dasha_tree_json = self._fetch_dasha_bundle(session, kundli_data, lat, lon, time_24h)
-                kundli_str = kundli_service.summarize_kundli(kundli_data, dob=session.get("dob"))
+                kundli_str = kundli_service.summarize_kundli(kundli_data, dob=session.get("dob"), dasha_info=dasha_info)
                 chart_data = kundli_service.extract_chart_data(kundli_data)
                 chart_json = json.dumps(chart_data) if chart_data else None
                 dasha_json = json.dumps(dasha_info) if dasha_info else None
@@ -1549,10 +1582,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     dasha_tree = None
 
             if dasha_tree is None:
-                # This only happens if the real Dasha API failed at Kundli-fetch
-                # time (we fell back to calculated Vimshottari and never got a
-                # tree to cache). Try once more here, on-demand, since a timing
-                # question specifically needs it.
+                # This only happens if the real Dasha API failed at
+                # Kundli-fetch time and never got a tree to cache. Try
+                # once more here, on-demand, since a timing question
+                # specifically needs it. If this also fails, we return ""
+                # and the prompt will note "no timeline data available" —
+                # there is no local-calculation fallback anymore.
                 time_24h = self._to_24h(session.get("birth_time", ""))
                 coords_lat = session.get("latitude")
                 coords_lon = session.get("longitude")
@@ -1821,15 +1856,13 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         recent_texts = self._get_recent_assistant_texts(session_id)
         similar_to = self._is_too_similar(response_text, recent_texts)
 
+        # Verification now always re-derives from kundli_full_raw (the raw
+        # API payload) via _get_fresh_chart_data — see that method for why.
         verify_planets, verify_ascendant = [], None
-        cached_raw_for_verify = session.get("kundli_raw")
-        if cached_raw_for_verify:
-            try:
-                parsed_verify = json.loads(cached_raw_for_verify)
-                verify_planets = parsed_verify.get("planets", [])
-                verify_ascendant = parsed_verify.get("ascendant_sign")
-            except Exception:
-                pass
+        fresh_chart_for_verify = self._get_fresh_chart_data(session)
+        if fresh_chart_for_verify:
+            verify_planets = fresh_chart_for_verify.get("planets", [])
+            verify_ascendant = fresh_chart_for_verify.get("ascendant_sign")
 
         claim_failures = validate_claims(
             response_text, dasha_timeline_str, evidence_vote,
@@ -2347,11 +2380,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         dasha_detail = f"Mahadasha: {maha_lord}"
                     if antar_lord:
                         dasha_detail += f"\nAntardasha: {antar_lord}"
+                    if maha.get("start") and maha.get("end"):
+                        dasha_detail += f"\n(Real Dasha API — Mahadasha runs {maha['start']} to {maha['end']})"
             except Exception as dasha_err:
                 logger.warning(f"Could not build Dasha reasoning trace: {dasha_err}")
 
             if not dasha_detail:
-                dasha_detail = "Current Dasha information was not available in the cached chart data."
+                dasha_detail = (
+                    "Current Dasha information was NOT available for this response — the real Dasha "
+                    "API did not return usable data, and no local fallback calculation was used "
+                    "(a prior local calculation was found to be unreliable, so it was removed)."
+                )
 
             timeline_note = (
                 "\n\n(Timing-Gated Retrieval: the full upcoming Dasha timeline was fetched because this "
@@ -2398,8 +2437,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 "Yoga, kept as distinct categories), the Rule Applicability Engine's MATCH/NO_MATCH checks, "
                 "the structured Fact→Rule table, the Evidence Sufficiency Gate's confidence calibration, "
                 "the Evidence Contradiction resolution, Yoga-claim verification, response-contract length "
-                "compliance, verified chart placements, comparative branch analysis, timing-gated Dasha "
-                "data, current-date temporal filtering, and intra-response duplicate suppression."
+                "compliance, verified chart placements (re-derived fresh from the raw Kundli API response "
+                "on every check), comparative branch analysis, timing-gated Dasha data (sourced exclusively "
+                "from the real Dasha API, with no local fallback calculation), current-date temporal "
+                "filtering, and intra-response duplicate suppression."
             )
             steps.append({"step": 12, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 

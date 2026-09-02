@@ -1,6 +1,7 @@
 # Direct chart-fact answering — bypasses RAG and LLM generation entirely
 import json
 from typing import Optional, Dict
+from app.services.kundli_service import kundli_service
 
 PLANET_NAME_MAP = {
     "sun": "Sun", "moon": "Moon", "mars": "Mars", "mercury": "Mercury",
@@ -9,7 +10,7 @@ PLANET_NAME_MAP = {
 }
 
 RESPONSE_TEMPLATES = {
-   
+
     "birth_details": {
         "English": "Your birth details: {dob}, {birth_time}, {birth_place}.",
         "Hindi": "आपका जन्म विवरण: {dob}, {birth_time}, {birth_place}।",
@@ -26,6 +27,29 @@ def _extract_planet_from_message(message: str) -> Optional[str]:
     return None
 
 
+def _get_fresh_chart(session: Dict) -> Optional[Dict]:
+    """Re-derive planets/ascendant DIRECTLY from kundli_full_raw (the
+    untouched Kundli API response) rather than trusting the separately
+    cached kundli_raw field, which can drift from the raw payload."""
+    cached_full_raw = session.get("kundli_full_raw")
+    if cached_full_raw:
+        try:
+            full_raw = json.loads(cached_full_raw)
+            fresh = kundli_service.extract_chart_data(full_raw)
+            if fresh and fresh.get("ascendant_sign"):
+                return fresh
+        except Exception:
+            pass
+
+    cached_raw = session.get("kundli_raw")
+    if cached_raw:
+        try:
+            return json.loads(cached_raw)
+        except Exception:
+            return None
+    return None
+
+
 def answer_chart_fact(fact_type: str, message_text: str, session: Dict, language: str = "Hinglish") -> Optional[str]:
     # Returns a direct answer string, or None to fall back to the normal pipeline
     templates = RESPONSE_TEMPLATES.get(fact_type, {})
@@ -35,10 +59,9 @@ def answer_chart_fact(fact_type: str, message_text: str, session: Dict, language
 
     try:
         if fact_type in ("ascendant", "moon_sign", "sun_sign"):
-            cached_raw = session.get("kundli_raw")
-            if not cached_raw:
+            parsed = _get_fresh_chart(session)
+            if not parsed:
                 return None
-            parsed = json.loads(cached_raw)
 
             if fact_type == "ascendant":
                 sign = parsed.get("ascendant_sign")
@@ -52,10 +75,9 @@ def answer_chart_fact(fact_type: str, message_text: str, session: Dict, language
             return template.format(sign=sign)
 
         if fact_type == "planet_position":
-            cached_raw = session.get("kundli_raw")
-            if not cached_raw:
+            parsed = _get_fresh_chart(session)
+            if not parsed:
                 return None
-            parsed = json.loads(cached_raw)
             planet = _extract_planet_from_message(message_text)
             if not planet:
                 return None

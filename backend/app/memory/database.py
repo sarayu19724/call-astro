@@ -46,6 +46,7 @@ class MemoryDatabase:
                     yoga_text TEXT,
                     dasha_tree_raw TEXT,
                     topic_cache TEXT,
+                    house_insights_cache TEXT,
                     kundli_fetch_status TEXT,
                     kundli_fetch_error TEXT,
                     kundli_fetch_started_at TEXT,
@@ -76,6 +77,7 @@ class MemoryDatabase:
                 ("yoga_text", "TEXT"),
                 ("dasha_tree_raw", "TEXT"),
                 ("topic_cache", "TEXT"),
+                ("house_insights_cache", "TEXT"),
                 ("kundli_fetch_status", "TEXT"),
                 ("kundli_fetch_error", "TEXT"),
                 ("kundli_fetch_started_at", "TEXT"),
@@ -111,12 +113,13 @@ class MemoryDatabase:
                                        pending_field, kundli_data, kundli_raw, kundli_dasha, kundli_divisional,
                                        kundli_full_raw, topic_memory, last_reasoning_trace, dashboard_prediction,
                                        dashboard_lucky_color, dashboard_date, yoga_text, dasha_tree_raw, topic_cache,
+                                       house_insights_cache,
                                        kundli_fetch_status, kundli_fetch_error, kundli_fetch_started_at,
                                        latitude, longitude, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (session_id, None, None, None, 'Hinglish', None, None, None, None, None,
-                 None, None, None, None, None, None, None, None, None,
+                 None, None, None, None, None, None, None, None, None, None,
                  "idle", None, None, None, None, now_str)
             )
             conn.commit()
@@ -129,6 +132,7 @@ class MemoryDatabase:
                 "topic_memory": None, "last_reasoning_trace": None,
                 "dashboard_prediction": None, "dashboard_lucky_color": None, "dashboard_date": None,
                 "yoga_text": None, "dasha_tree_raw": None, "topic_cache": None,
+                "house_insights_cache": None,
                 "kundli_fetch_status": "idle", "kundli_fetch_error": None, "kundli_fetch_started_at": None,
                 "latitude": None, "longitude": None, "updated_at": now_str
             }
@@ -143,6 +147,7 @@ class MemoryDatabase:
             "kundli_divisional", "kundli_full_raw", "topic_memory", "last_reasoning_trace",
             "dashboard_prediction", "dashboard_lucky_color", "dashboard_date",
             "weekly_guidance", "weekly_week_start", "yoga_text", "dasha_tree_raw", "topic_cache",
+            "house_insights_cache",
             "kundli_fetch_status", "kundli_fetch_error", "kundli_fetch_started_at"
         }
         nullable_ok = {
@@ -150,6 +155,7 @@ class MemoryDatabase:
             "kundli_full_raw", "topic_memory", "last_reasoning_trace",
             "dashboard_prediction", "dashboard_lucky_color", "dashboard_date",
             "weekly_guidance", "weekly_week_start", "yoga_text", "dasha_tree_raw", "topic_cache",
+            "house_insights_cache",
             "kundli_fetch_status", "kundli_fetch_error", "kundli_fetch_started_at"
         }
         fields_to_update = {

@@ -3,6 +3,15 @@ House Insight Service — powers the "tap a house to understand it" feature.
 Deliberately self-contained: reuses kundli_service, vector_store, embeddings,
 topic_service, and llm_service exactly as they already exist. No changes
 required to any of those modules.
+
+CACHING: previously this called the LLM fresh on EVERY click, even for the
+same house in the same session. Now each house's generated insight is
+cached in the session (session["house_insights_cache"], keyed by house
+number) the first time it's computed, and served instantly from cache on
+every subsequent click — no LLM call, no RAG retrieval, no delay. The
+cache is invalidated automatically whenever birth details change and the
+chart is recalculated (see session.py's update_session_info, which clears
+house_insights_cache alongside the other chart-derived caches).
 """
 import json
 from typing import Dict, Any, Optional, List
@@ -17,6 +26,10 @@ from app.config.settings import settings
 from app.utils.logger import logger
 
 _embeddings_provider = EmbeddingsProvider()
+
+# Bump this if the shape/logic of a cached entry changes, so old cached
+# entries are treated as a miss instead of served in a stale shape.
+HOUSE_INSIGHT_CACHE_VERSION = 1
 
 HOUSE_THEMES = {
     1: "self, personality, physical body, overall vitality",
@@ -203,13 +216,63 @@ def build_evidence_context(rag_hits: List[Dict[str, Any]]) -> str:
     return "\n".join(chunks)
 
 
+# ------------------------------------------------------------------
+# CACHE HELPERS
+# ------------------------------------------------------------------
+def _get_house_cache_store(session: Dict) -> Dict[str, Any]:
+    raw = session.get("house_insights_cache")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _get_cached_house_insight(session: Dict, house_number: int) -> Optional[Dict[str, Any]]:
+    store = _get_house_cache_store(session)
+    entry = store.get(str(house_number))
+    if not entry:
+        return None
+    if entry.get("_version") != HOUSE_INSIGHT_CACHE_VERSION:
+        return None
+    result = dict(entry)
+    result.pop("_version", None)
+    return result
+
+
+def _save_house_insight_cache(session_id: str, session: Dict, house_number: int, result: Dict[str, Any]):
+    try:
+        store = _get_house_cache_store(session)
+        entry_to_store = dict(result)
+        entry_to_store["_version"] = HOUSE_INSIGHT_CACHE_VERSION
+        store[str(house_number)] = entry_to_store
+        store_json = json.dumps(store, ensure_ascii=False)
+        db.update_session(session_id, {"house_insights_cache": store_json})
+        session["house_insights_cache"] = store_json
+        logger.info(f"[HouseInsightCache] cached house {house_number} for session {session_id}")
+    except Exception as e:
+        logger.error(f"Failed to save house insight cache for house {house_number}: {e}")
+
+
 def generate_house_insight(session_id: str, house_number: int) -> Dict[str, Any]:
     if house_number < 1 or house_number > 12:
         return {"available": False, "reason": "invalid_house"}
 
     session = db.get_or_create_session(session_id)
+
+    # --- CACHE CHECK: if this house was already explained for this chart,
+    # return it instantly — no LLM call, no RAG retrieval. ---
+    cached_result = _get_cached_house_insight(session, house_number)
+    if cached_result is not None:
+        logger.info(f"[HouseInsightCache] HIT for house {house_number}, session {session_id} — LLM skipped")
+        return cached_result
+
+    logger.info(f"[HouseInsightCache] MISS for house {house_number}, session {session_id} — generating fresh")
+
     chart = _get_verified_chart(session)
     if not chart:
+        # Not cached — a missing chart is a transient state, not worth caching.
         return {"available": False, "reason": "no_chart_data"}
 
     facts = build_house_facts(house_number, chart)
@@ -231,11 +294,13 @@ def generate_house_insight(session_id: str, house_number: int) -> Dict[str, Any]
         "Hinglish": "Abhi is bhaav ke baare mein jaankari generate nahi ho payi — kripya dobara koshish karein.",
     }.get(language, "Kripya dobara koshish karein.")
 
+    generation_failed = False
     try:
         explanation = llm_service.generate(prompt=prompt, temperature=0.6).strip() or fallback_text
     except Exception as e:
         logger.error(f"[HouseInsight] LLM generation failed for house {house_number}: {e}")
         explanation = fallback_text
+        generation_failed = True
 
     dasha_summary = None
     cached_dasha = session.get("kundli_dasha")
@@ -260,7 +325,7 @@ def generate_house_insight(session_id: str, house_number: int) -> Dict[str, Any]
         seen.add(key)
         sources.append({"source": hit["source"], "page": hit["page"]})
 
-    return {
+    result = {
         "available": True,
         "house_number": house_number,
         "sign": facts["sign"],
@@ -271,3 +336,11 @@ def generate_house_insight(session_id: str, house_number: int) -> Dict[str, Any]
         "explanation": explanation,
         "sources": sources,
     }
+
+    # Only cache a SUCCESSFUL generation — if the LLM failed and we fell
+    # back to the generic "please try again" text, don't lock that in;
+    # let the next click retry the real generation instead.
+    if not generation_failed:
+        _save_house_insight_cache(session_id, session, house_number, result)
+
+    return result

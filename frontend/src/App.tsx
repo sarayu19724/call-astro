@@ -1,8 +1,8 @@
-import  { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { ChatWindow } from './components/ChatWindow';
 import { ChatInput } from './components/ChatInput';
 import { ProfileCard } from './components/ProfileCard';
-import { Sparkles, Database, CheckCircle, ArrowLeft, Download, Trash2 } from 'lucide-react';
+import { Sparkles, Database, CheckCircle, ArrowLeft, Download, Trash2, RotateCcw } from 'lucide-react';
 import OnboardingForm from './components/OnboardingForm';
 import KundliChartToggle from './components/KundliChartToggle';
 import LifeDashboard from './components/LifeDashboard';
@@ -22,6 +22,11 @@ const GREETINGS: Record<string, (name: string) => string> = {
   Hindi: (name) => `नमस्ते ${name}!`,
   Hinglish: (name) => `Hey ${name}!`,
 };
+
+// Chart-loading tuning: poll fast at first (kundli fetch is usually a
+// couple seconds), back off, and give up with a manual retry after ~90s
+// total instead of spinning forever.
+const CHART_POLL_INTERVALS_MS = [1500, 1500, 2000, 2000, 3000, 3000, 5000, 5000, 5000, 5000, 8000, 8000];
 
 function App() {
   const [sessionId, setSessionId] = useState<string>('');
@@ -45,6 +50,12 @@ function App() {
   const [showEditModal, setShowEditModal] = useState(false);
   const [traceRefreshKey, setTraceRefreshKey] = useState(0);
   const [ingestStatus, setIngestStatus] = useState<IngestStatus>({ indexing_completed: false, total_chunks: 0, loading: true });
+
+  // --- Chart loading state ---
+  const [chartStatus, setChartStatus] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle');
+  const chartPollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const chartPollAttempt = useRef(0);
+  const chartPollingFor = useRef<string | null>(null); // guards against stale timers after session reset
 
   useEffect(() => {
     let sid = localStorage.getItem('call-astro_session_id');
@@ -85,18 +96,112 @@ function App() {
     checkIngestStatus();
   }, [sessionId]);
 
+  // ------------------------------------------------------------------
+  // CHART LOADING — replaces the old "fetch once on mount / messages
+  // change" effect. Two entry points feed into the same poll loop:
+  //   1. Onboarding just completed -> we kick off a backend fetch AND
+  //      start polling for the result.
+  //   2. Dashboard mounts with an already-onboarded session that has no
+  //      chart yet (e.g. user closed the tab before it finished last
+  //      time) -> we also kick off a fetch and start polling.
+  // The backend call (recalculate-kundli) is idempotent and safe to
+  // fire even if a fetch is already in flight elsewhere.
+  // ------------------------------------------------------------------
+  const stopChartPolling = useCallback(() => {
+    if (chartPollTimer.current) {
+      clearTimeout(chartPollTimer.current);
+      chartPollTimer.current = null;
+    }
+  }, []);
+
+  const fetchChartOnce = useCallback(async (sid: string): Promise<boolean> => {
+    try {
+      const res = await fetch(`${API_BASE}/session/${sid}/kundli-chart`);
+      if (!res.ok) return false;
+      const data = await res.json();
+      if (data.available && data.planets && data.ascendant_sign) {
+        setKundliPlanets(data.planets);
+        setAscendantSign(data.ascendant_sign);
+        return true;
+      }
+      return false;
+    } catch (err) {
+      console.error('Failed to load kundli chart:', err);
+      return false;
+    }
+  }, []);
+
+  const pollForChart = useCallback((sid: string) => {
+    stopChartPolling();
+    chartPollingFor.current = sid;
+    chartPollAttempt.current = 0;
+    setChartStatus('loading');
+
+    const tick = async () => {
+      if (chartPollingFor.current !== sid) return; // session changed under us, abandon
+      const ready = await fetchChartOnce(sid);
+      if (chartPollingFor.current !== sid) return;
+
+      if (ready) {
+        setChartStatus('ready');
+        return;
+      }
+
+      const idx = chartPollAttempt.current;
+      if (idx >= CHART_POLL_INTERVALS_MS.length) {
+        setChartStatus('failed');
+        return;
+      }
+      const delay = CHART_POLL_INTERVALS_MS[idx];
+      chartPollAttempt.current += 1;
+      chartPollTimer.current = setTimeout(tick, delay);
+    };
+
+    tick();
+  }, [fetchChartOnce, stopChartPolling]);
+
+  // Kick the backend to actually compute the chart (fire-and-forget —
+  // the poll loop above is what picks up the result once it's ready).
+  const triggerKundliFetch = useCallback((sid: string) => {
+    fetch(`${API_BASE}/session/${sid}/recalculate-kundli`, { method: 'POST' }).catch((err) => {
+      console.error('Failed to trigger kundli fetch:', err);
+    });
+  }, []);
+
+  // Entry point 2: dashboard mounts / session becomes known and profile
+  // is complete but we don't have a chart yet — start the same flow.
   useEffect(() => {
+    if (!sessionId || !onboarded) return;
+    if (kundliPlanets && ascendantSign) return; // already have it
+    if (chartStatus === 'loading' || chartStatus === 'ready') return;
+
+    triggerKundliFetch(sessionId);
+    pollForChart(sessionId);
+
+    return () => stopChartPolling();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, onboarded]);
+
+  // Re-check the chart right after a NEW assistant message lands too —
+  // cheap safety net, and it's a single fetch (not a full poll restart)
+  // since by then the backend has almost certainly already computed it.
+  useEffect(() => {
+    if (!sessionId || chartStatus === 'ready') return;
+    if (messages.length === 0) return;
+    fetchChartOnce(sessionId).then((ready) => {
+      if (ready) {
+        stopChartPolling();
+        setChartStatus('ready');
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages.length]);
+
+  const retryChartLoad = () => {
     if (!sessionId) return;
-    fetch(`${API_BASE}/session/${sessionId}/kundli-chart`)
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.available) {
-          setKundliPlanets(data.planets);
-          setAscendantSign(data.ascendant_sign);
-        }
-      })
-      .catch((err) => console.error('Failed to load kundli chart:', err));
-  }, [sessionId, messages.length]);
+    triggerKundliFetch(sessionId);
+    pollForChart(sessionId);
+  };
 
   const checkIngestStatus = async () => {
     try {
@@ -184,6 +289,8 @@ function App() {
     try {
       const res = await fetch(`${API_BASE}/session/${sessionId}`, { method: 'DELETE' });
       if (res.ok) {
+        stopChartPolling();
+        chartPollingFor.current = null;
         const newSid = 'session_' + Math.random().toString(36).substring(2, 15);
         localStorage.setItem('call-astro_session_id', newSid);
         setSessionId(newSid);
@@ -195,6 +302,9 @@ function App() {
         setLanguage('Hinglish');
         setOnboarded(false);
         setView('dashboard');
+        setKundliPlanets(null);
+        setAscendantSign(null);
+        setChartStatus('idle');
       }
     } catch (err) {
       console.error('Reset failed:', err);
@@ -212,6 +322,14 @@ function App() {
     setLanguage(profile.language);
     setOnboarded(true);
     setView('dashboard');
+
+    // Entry point 1 — fire the fetch immediately instead of waiting for
+    // the first chat message. The dashboard-mount effect below will also
+    // start polling once `onboarded` flips true.
+    if (sessionId) {
+      triggerKundliFetch(sessionId);
+      pollForChart(sessionId);
+    }
   };
 
   if (checkingProfile) {
@@ -255,6 +373,34 @@ function App() {
     }
   };
 
+  // --- Chart panel renderer (replaces the old ternary inline in JSX) ---
+  const renderChartPanel = () => {
+    if (kundliPlanets && ascendantSign) {
+      return <KundliChartToggle planets={kundliPlanets} ascendantSign={ascendantSign} language={language} sessionId={sessionId} />;
+    }
+
+    if (chartStatus === 'failed') {
+      return (
+        <div className="w-full bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col items-center justify-center gap-3 text-sm text-slate-400 h-full">
+          <span>Couldn't load your chart right now.</span>
+          <button
+            onClick={retryChartLoad}
+            className="flex items-center gap-1.5 text-xs font-medium text-slate-600 hover:text-slate-800 bg-slate-50 hover:bg-slate-100 px-3 py-1.5 rounded-lg transition"
+          >
+            <RotateCcw size={12} /> Retry
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div className="w-full bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col items-center justify-center gap-2 text-sm text-slate-400 h-full">
+        <div className="w-5 h-5 border-2 border-slate-300 border-t-amber-500 rounded-full animate-spin" />
+        <span>Preparing your chart...</span>
+      </div>
+    );
+  };
+
   if (view === 'dashboard') {
     const greetingFn = GREETINGS[language] || GREETINGS.Hinglish;
     const greeting = name ? greetingFn(name) : '';
@@ -278,13 +424,7 @@ function App() {
                 dob={dob} birthTime={birthTime} birthPlace={birthPlace} language={language}
                 onReset={handleResetSession} onEdit={() => setShowEditModal(true)} isResetting={isResetting}
               />
-              {kundliPlanets && ascendantSign ? (
-                <KundliChartToggle planets={kundliPlanets} ascendantSign={ascendantSign} language={language} sessionId={sessionId} />
-              ) : (
-                <div className="w-full bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex items-center justify-center text-sm text-slate-400 h-full">
-                  Chart loading...
-                </div>
-              )}
+              {renderChartPanel()}
               <LifeDashboard sessionId={sessionId} language={language} />
             </div>
 
@@ -305,19 +445,15 @@ function App() {
               setLanguage(profile.language);
               setKundliPlanets(null);
               setAscendantSign(null);
+              setChartStatus('loading');
               const historyRes = await fetch(`${API_BASE}/chat/history/${sessionId}`);
               if (historyRes.ok) {
                 const history = await historyRes.json();
                 setMessages(history.messages);
               }
-              const chartRes = await fetch(`${API_BASE}/session/${sessionId}/kundli-chart`);
-              if (chartRes.ok) {
-                const chartData = await chartRes.json();
-                if (chartData.available) {
-                  setKundliPlanets(chartData.planets);
-                  setAscendantSign(chartData.ascendant_sign);
-                }
-              }
+              // EditDetailsModal already calls recalculate-kundli itself —
+              // we just need to start polling for the result here.
+              pollForChart(sessionId);
             }}
           />
         )}
@@ -378,9 +514,8 @@ function App() {
         </main>
         <aside className="hidden lg:block w-72 border-l border-slate-200 bg-slate-50 p-4 overflow-y-auto shrink-0">
           <WeeklyGuidance sessionId={sessionId} language={language} />
-         <ReasoningTrace sessionId={sessionId} key={traceRefreshKey}  />
+          <ReasoningTrace sessionId={sessionId} key={traceRefreshKey} />
         </aside>
-
       </div>
     </div>
   );

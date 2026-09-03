@@ -1,4 +1,3 @@
-
 interface Planet {
   name: string;
   sign_name: string;
@@ -9,12 +8,18 @@ interface SouthIndianChartProps {
   planets: Planet[];
   ascendantSign: string;
   language: string;
+  onHouseClick?: (houseNumber: number) => void;
 }
 
 const PLANET_ABBR: Record<string, string> = {
   Sun: 'Su', Moon: 'Mo', Mars: 'Ma', Mercury: 'Me', Jupiter: 'Ju',
   Venus: 'Ve', Saturn: 'Sa', Rahu: 'Ra', Ketu: 'Ke',
 };
+
+const ZODIAC_SIGNS = [
+  'Aries', 'Taurus', 'Gemini', 'Cancer', 'Leo', 'Virgo',
+  'Libra', 'Scorpio', 'Sagittarius', 'Capricorn', 'Aquarius', 'Pisces'
+];
 
 const GRID_SIGNS: (string | null)[][] = [
   ['Pisces', 'Aries', 'Taurus', 'Gemini'],
@@ -44,7 +49,14 @@ const STRINGS: Record<string, { title: string; asc: string; centerLabel: string;
   },
 };
 
-export default function SouthIndianChart({ planets, ascendantSign, language }: SouthIndianChartProps) {
+function getHouseForSign(sign: string, ascendantSign: string): number | null {
+  const ascIdx = ZODIAC_SIGNS.indexOf(ascendantSign);
+  const signIdx = ZODIAC_SIGNS.indexOf(sign);
+  if (ascIdx === -1 || signIdx === -1) return null;
+  return ((signIdx - ascIdx + 12) % 12) + 1;
+}
+
+export default function SouthIndianChart({ planets, ascendantSign, language, onHouseClick }: SouthIndianChartProps) {
   const t = STRINGS[language] || STRINGS.Hinglish;
 
   const planetsForSign = (sign: string): Planet[] =>
@@ -71,11 +83,14 @@ export default function SouthIndianChart({ planets, ascendantSign, language }: S
 
           const cellPlanets = planetsForSign(sign);
           const isAscendant = sign.toLowerCase() === ascendantSign?.toLowerCase();
+          const houseNumber = getHouseForSign(sign, ascendantSign);
 
           return (
             <div
               key={sign}
+              onClick={() => houseNumber && onHouseClick?.(houseNumber)}
               className="border border-slate-200 flex flex-col items-center justify-center p-1 relative"
+              style={{ cursor: onHouseClick && houseNumber ? 'pointer' : 'default' }}
             >
               <span className="text-[8px] text-slate-400 absolute top-1 left-1">
                 {sign.slice(0, 3)}

@@ -225,13 +225,7 @@ class KundliService:
             },
         }
 
-    # NOTE: get_real_or_calculated_dasha(), calculate_vimshottari_dasha(),
-    # calculate_full_dasha_periods(), and _get_dasha_for_kundli() have been
-    # REMOVED. Dasha data now comes exclusively from
-    # app.services.dasha_api_service (the real API) via
-    # chat_service._fetch_dasha_bundle(). If the real API fails, the
-    # correct behavior is "Dasha not available" — never a locally
-    # calculated guess.
+   
 
 
 kundli_service = KundliService()

@@ -250,7 +250,7 @@ def build_topic_emphasis(topic: str, planets: List[dict], ascendant_sign: str, d
     if not config:
         return ""
 
-    lines = [f"--- Key factors for this {topic} question ---"]
+    lines = [f" Key factors for this {topic} question "]
 
     house_num = config["house"]
     house_sign = get_sign_for_house(house_num, ascendant_sign)

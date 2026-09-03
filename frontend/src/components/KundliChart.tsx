@@ -1,4 +1,3 @@
-
 interface Planet {
   name: string;
   sign_name: string;
@@ -9,6 +8,7 @@ interface KundliChartProps {
   planets: Planet[];
   ascendantSign: string;
   language: string;
+  onHouseClick?: (houseNumber: number) => void;
 }
 
 const ZODIAC_SIGNS = [
@@ -48,7 +48,7 @@ const STRINGS: Record<string, { title: string; asc: string; centerLabel: string;
   },
 };
 
-export default function KundliChart({ planets, ascendantSign, language }: KundliChartProps) {
+export default function KundliChart({ planets, ascendantSign, language, onHouseClick }: KundliChartProps) {
   const ascIndex = ZODIAC_SIGNS.indexOf(ascendantSign);
   const safeAscIndex = ascIndex === -1 ? 0 : ascIndex;
 
@@ -85,7 +85,13 @@ export default function KundliChart({ planets, ascendantSign, language }: Kundli
           const housePlanets = planetsByHouse[houseNumber] || [];
 
           return (
-            <g key={houseNumber}>
+            <g
+              key={houseNumber}
+              onClick={() => onHouseClick?.(houseNumber)}
+              style={{ cursor: onHouseClick ? 'pointer' : 'default' }}
+            >
+              {/* invisible hit target so the whole label area is tappable */}
+              <circle cx={pos.x} cy={pos.y} r={26} fill="transparent" />
               <text x={pos.x} y={pos.y - 8} textAnchor="middle" fontSize="8" fill="#94a3b8" fontWeight="500">
                 {sign.slice(0, 3)}
               </text>

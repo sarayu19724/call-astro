@@ -279,7 +279,7 @@ function App() {
                 onReset={handleResetSession} onEdit={() => setShowEditModal(true)} isResetting={isResetting}
               />
               {kundliPlanets && ascendantSign ? (
-                <KundliChartToggle planets={kundliPlanets} ascendantSign={ascendantSign} language={language} />
+                <KundliChartToggle planets={kundliPlanets} ascendantSign={ascendantSign} language={language} sessionId={sessionId} />
               ) : (
                 <div className="w-full bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex items-center justify-center text-sm text-slate-400 h-full">
                   Chart loading...
@@ -378,7 +378,7 @@ function App() {
         </main>
         <aside className="hidden lg:block w-72 border-l border-slate-200 bg-slate-50 p-4 overflow-y-auto shrink-0">
           <WeeklyGuidance sessionId={sessionId} language={language} />
-         <ReasoningTrace sessionId={sessionId} refreshKey={traceRefreshKey} language={language} />
+         <ReasoningTrace sessionId={sessionId} key={traceRefreshKey}  />
         </aside>
 
       </div>

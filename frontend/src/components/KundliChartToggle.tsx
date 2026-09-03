@@ -1,6 +1,7 @@
-import  { useState } from 'react';
+import { useState } from 'react';
 import KundliChart from './KundliChart';
 import SouthIndianChart from './SouthIndianChart';
+import HouseInsightPanel from './HouseInsightPanel';
 
 interface Planet {
   name: string;
@@ -12,6 +13,7 @@ interface KundliChartToggleProps {
   planets: Planet[];
   ascendantSign: string;
   language: string;
+  sessionId: string;
 }
 
 const STRINGS: Record<string, { north: string; south: string; ascendant: string; title: string }> = {
@@ -35,8 +37,9 @@ const STRINGS: Record<string, { north: string; south: string; ascendant: string;
   },
 };
 
-export default function KundliChartToggle({ planets, ascendantSign, language }: KundliChartToggleProps) {
+export default function KundliChartToggle({ planets, ascendantSign, language, sessionId }: KundliChartToggleProps) {
   const [style, setStyle] = useState<'north' | 'south'>('north');
+  const [selectedHouse, setSelectedHouse] = useState<number | null>(null);
   const t = STRINGS[language] || STRINGS.Hinglish;
 
   return (
@@ -65,10 +68,27 @@ export default function KundliChartToggle({ planets, ascendantSign, language }: 
       </div>
 
       {style === 'north' ? (
-        <KundliChart planets={planets} ascendantSign={ascendantSign} language={language} />
+        <KundliChart
+          planets={planets}
+          ascendantSign={ascendantSign}
+          language={language}
+          onHouseClick={setSelectedHouse}
+        />
       ) : (
-        <SouthIndianChart planets={planets} ascendantSign={ascendantSign} language={language} />
+        <SouthIndianChart
+          planets={planets}
+          ascendantSign={ascendantSign}
+          language={language}
+          onHouseClick={setSelectedHouse}
+        />
       )}
+
+      <HouseInsightPanel
+        sessionId={sessionId}
+        houseNumber={selectedHouse}
+        language={language}
+        onClose={() => setSelectedHouse(null)}
+      />
     </div>
   );
 }

@@ -30,10 +30,17 @@ class CoupleDatabase:
                     partner2_name TEXT, partner2_dob TEXT, partner2_time TEXT, partner2_place TEXT,
                     partner2_status TEXT DEFAULT 'idle', partner2_error TEXT, partner2_data TEXT,
                     childbirth_analysis TEXT,
+                    known_outcome TEXT,
                     chat_history TEXT,
                     updated_at TEXT
                 )
             """)
+
+            cursor.execute("PRAGMA table_info(couple_sessions)")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            if "known_outcome" not in existing_cols:
+                cursor.execute("ALTER TABLE couple_sessions ADD COLUMN known_outcome TEXT")
+
             conn.commit()
 
     def get_or_create(self, couple_id: str) -> Dict:
@@ -60,7 +67,7 @@ class CoupleDatabase:
             "partner1_status", "partner1_error", "partner1_data",
             "partner2_name", "partner2_dob", "partner2_time", "partner2_place",
             "partner2_status", "partner2_error", "partner2_data",
-            "childbirth_analysis", "chat_history",
+            "childbirth_analysis", "known_outcome", "chat_history",
         }
         fields = {k: v for k, v in updates.items() if k in allowed}
         if not fields:

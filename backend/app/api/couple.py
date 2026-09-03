@@ -27,6 +27,10 @@ class CoupleChatRequest(BaseModel):
     language: Optional[str] = "Hinglish"
 
 
+class KnownOutcomeRequest(BaseModel):
+    outcome: str
+
+
 def _safe_load(raw: Optional[str]):
     if not raw:
         return None
@@ -76,6 +80,17 @@ async def set_partner(couple_id: str, which: int, profile: PartnerProfile):
     return {"status": "pending"}
 
 
+@router.post("/{couple_id}/known-outcome")
+async def set_known_outcome(couple_id: str, payload: KnownOutcomeRequest):
+    """Lets the person testing a real case tell the system the actual
+    observed outcome (e.g. 'Married ~6 years, no child as of 2026') so the
+    LLM is grounded in fact rather than guessing at something astrology
+    alone can't reliably establish. Clears the cached analysis so the
+    next /childbirth or /chat call picks up the new context."""
+    couple_db.update(couple_id, {"known_outcome": payload.outcome.strip() or None})
+    return {"status": "success"}
+
+
 @router.get("/{couple_id}/status")
 async def get_couple_status(couple_id: str):
     session = couple_db.get_or_create(couple_id)
@@ -100,6 +115,7 @@ async def get_couple_status(couple_id: str):
         "partner1": _partner_view("partner1"),
         "partner2": _partner_view("partner2"),
         "both_ready": session.get("partner1_status") == "ready" and session.get("partner2_status") == "ready",
+        "known_outcome": session.get("known_outcome"),
     }
 
 
@@ -112,7 +128,7 @@ async def get_childbirth_analysis(couple_id: str):
 
     cached = _safe_load(session.get("childbirth_analysis"))
     if cached:
-        return {"available": True, **cached}
+        return {"available": True, "known_outcome": session.get("known_outcome"), **cached}
 
     data1 = _safe_load(session.get("partner1_data"))
     data2 = _safe_load(session.get("partner2_data"))
@@ -139,7 +155,7 @@ async def get_childbirth_analysis(couple_id: str):
     }
 
     couple_db.update(couple_id, {"childbirth_analysis": json.dumps(result, default=str, ensure_ascii=False)})
-    return {"available": True, **result}
+    return {"available": True, "known_outcome": session.get("known_outcome"), **result}
 
 
 COUPLE_CHAT_PROMPT = """You are an experienced, warm Indian Vedic Astrologer, answering a MARRIED COUPLE
@@ -159,6 +175,8 @@ or any technical process. Address both partners by name where natural.
 Joint analysis (already computed — use this, don't recompute):
 {joint_facts}
 
+{known_outcome_block}
+
 Conversation so far:
 {history}
 
@@ -168,6 +186,17 @@ Couple's question:
 Write the answer now:
 """
 
+KNOWN_OUTCOME_WITH_DATA = """OBSERVED REAL-WORLD OUTCOME FOR THIS CASE (treat this as established fact, not
+something to infer from the chart): {outcome}
+Use this as ground truth. Your job is to explain HOW the chart and Dasha support or contextualize this known
+outcome — never contradict it, and never claim to independently "detect" whether a child has arrived when
+this fact already tells you."""
+
+KNOWN_OUTCOME_ABSENT = """No observed real-world outcome has been provided for this case. Do NOT claim to know
+or infer whether a child has or hasn't already arrived — astrology alone cannot reliably establish that.
+Speak only about favorable/challenging timing and periods, and avoid declarative statements about what has
+already happened in real life."""
+
 
 def _format_partner_facts(name: str, report: dict) -> str:
     facts = report["facts"]
@@ -175,12 +204,14 @@ def _format_partner_facts(name: str, report: dict) -> str:
         f"5th House sign: {facts.get('sign')}",
         f"5th House lord: {facts.get('lord')}",
     ]
-    lp = facts.get("lord_placement")
+    lp = facts.get("lord_assessment")
     if lp:
-        lines.append(f"5th lord placed in {lp.get('sign')} (house {lp.get('house')}){' (retrograde)' if lp.get('retro') else ''}")
-    sig = facts.get("significator")
+        lordships = lp.get("lordships") or []
+        lordship_str = f" (rules house{'s' if len(lordships) > 1 else ''} {', '.join(str(h) for h in lordships)})" if lordships else ""
+        lines.append(f"5th lord {lp['planet']}{lordship_str}: {lp['reason']}")
+    sig = facts.get("significator_assessment")
     if sig:
-        lines.append(f"Jupiter (child significator) in {sig.get('sign')} (house {sig.get('house')}){' (retrograde)' if sig.get('retro') else ''}")
+        lines.append(f"Jupiter (child significator): {sig['reason']}")
     if facts.get("occupants"):
         lines.append("Planets in 5th house: " + ", ".join(o["name"] for o in facts["occupants"]))
     if report.get("current_dasha"):
@@ -213,6 +244,11 @@ async def couple_chat(couple_id: str, payload: CoupleChatRequest):
     if not childbirth.get("available"):
         raise HTTPException(status_code=400, detail=childbirth.get("reason", "Childbirth analysis unavailable."))
 
+    known_outcome = session.get("known_outcome")
+    known_outcome_block = (
+        KNOWN_OUTCOME_WITH_DATA.format(outcome=known_outcome) if known_outcome else KNOWN_OUTCOME_ABSENT
+    )
+
     history = _safe_load(session.get("chat_history")) or []
     history_text = "\n".join(f"{h['role']}: {h['content']}" for h in history[-6:])
 
@@ -223,6 +259,7 @@ async def couple_chat(couple_id: str, payload: CoupleChatRequest):
         partner1_facts=_format_partner_facts(childbirth["partner1_name"], childbirth["partner1_report"]),
         partner2_facts=_format_partner_facts(childbirth["partner2_name"], childbirth["partner2_report"]),
         joint_facts=_format_joint_facts(childbirth["joint"]),
+        known_outcome_block=known_outcome_block,
         history=history_text or "None",
         question=payload.message,
     )

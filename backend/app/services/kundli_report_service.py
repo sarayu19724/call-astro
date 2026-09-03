@@ -10,7 +10,7 @@ only uses the LLM for short narrative polish — with a plain-text fallback
 if the LLM call fails, so a slow/unavailable Ollama never breaks the PDF.
 """
 import json
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
 from typing import Dict, List, Optional
 
@@ -318,11 +318,23 @@ def _generate_summary(chart: Dict, dasha_info: Optional[Dict], yoga_text: str, l
     return fallback
 
 
-def generate_kundli_report_pdf(session_id: str, language: str) -> bytes:
+def generate_kundli_report_pdf(session_id: str, language: str, on_progress=None) -> bytes:
+    """on_progress: optional callable(step_key: str) invoked after each
+    major stage completes, so a caller (e.g. the async wrapper below) can
+    surface real progress to the user instead of a blind spinner."""
+
+    def _tick(step_key: str):
+        if on_progress:
+            try:
+                on_progress(step_key)
+            except Exception as cb_err:
+                logger.warning(f"[KundliReport] progress callback failed for '{step_key}': {cb_err}")
+
     session = db.get_or_create_session(session_id)
     chart = _get_verified_chart(session)
     if not chart:
         raise ValueError("No chart data available for this session.")
+    _tick("verify_chart")
 
     L = LABELS.get(language, LABELS["Hinglish"])
     styles = _styles()
@@ -379,6 +391,7 @@ def generate_kundli_report_pdf(session_id: str, language: str) -> bytes:
     ]))
     story.append(planet_table)
     story.append(PageBreak())
+    _tick("planetary_positions")
 
     # ---------------- PAGE 2 — LIFE ANALYSIS ----------------
     story.append(Paragraph(L["life_analysis"], styles["SectionHeading"]))
@@ -393,6 +406,7 @@ def generate_kundli_report_pdf(session_id: str, language: str) -> bytes:
             story.append(Paragraph(f"→ {L['explore']} ({house_list})", styles["Explore"]))
         story.append(Spacer(1, 6))
     story.append(PageBreak())
+    _tick("life_analysis")
 
     # ---------------- PAGE 3 — DASHA + SUMMARY ----------------
     story.append(Paragraph(L["dasha_timeline"], styles["SectionHeading"]))
@@ -431,12 +445,14 @@ def generate_kundli_report_pdf(session_id: str, language: str) -> bytes:
             styles["Body"]
         ))
     story.append(Spacer(1, 14))
+    _tick("dasha_analysis")
 
     story.append(Paragraph(L["summary"], styles["SectionHeading"]))
     summary = _generate_summary(chart, dasha_info, yoga_text, language, L)
     for label, value in summary.items():
         story.append(Paragraph(f"<b>{label}:</b> {value}", styles["Body"]))
         story.append(Spacer(1, 3))
+    _tick("summary")
 
     story.append(Spacer(1, 20))
     story.append(HRFlowable(width="100%", color=colors.HexColor("#e2e8f0"), thickness=0.8, spaceAfter=6))
@@ -446,4 +462,76 @@ def generate_kundli_report_pdf(session_id: str, language: str) -> bytes:
     doc.build(story)
     pdf_bytes = buffer.getvalue()
     buffer.close()
+    _tick("build_pdf")
     return pdf_bytes
+
+# ------------------------------------------------------------------
+# ASYNC REPORT GENERATION — mirrors the async Kundli-chart-fetch pattern
+# already used elsewhere: a background thread runs the (slow, multi-LLM-
+# call) generation while the DB row tracks status/progress/error, so the
+# frontend can poll instead of blocking on one long HTTP request.
+# ------------------------------------------------------------------
+import os
+import json
+import threading
+from app.config.settings import settings
+
+REPORT_STEPS = [
+    {"key": "verify_chart", "label": "Verifying your chart"},
+    {"key": "planetary_positions", "label": "Confirming planetary positions"},
+    {"key": "life_analysis", "label": "Generating life analysis"},
+    {"key": "dasha_analysis", "label": "Preparing Dasha analysis"},
+    {"key": "summary", "label": "Writing your summary"},
+    {"key": "build_pdf", "label": "Creating your PDF"},
+]
+
+
+def _initial_report_progress():
+    return [{"key": s["key"], "label": s["label"], "done": False} for s in REPORT_STEPS]
+
+
+def _report_file_path(session_id: str, language: str) -> str:
+    safe_lang = "".join(c for c in language if c.isalnum()) or "Hinglish"
+    return os.path.join(settings.REPORTS_DIR, f"{session_id}_{safe_lang}.pdf")
+
+
+def run_report_generation(session_id: str, language: str):
+    """Executed on a background thread — see start_report_generation_async."""
+    progress = _initial_report_progress()
+    db.update_session(session_id, {
+        "report_status": "generating",
+        "report_error": None,
+        "report_progress": json.dumps(progress),
+        "report_started_at": datetime.utcnow().isoformat(),
+        "report_file_path": None,
+    })
+
+    def on_progress(step_key: str):
+        for p in progress:
+            if p["key"] == step_key:
+                p["done"] = True
+        db.update_session(session_id, {"report_progress": json.dumps(progress)})
+        logger.info(f"[KundliReport] session {session_id} — step '{step_key}' done")
+
+    try:
+        pdf_bytes = generate_kundli_report_pdf(session_id, language, on_progress=on_progress)
+        os.makedirs(settings.REPORTS_DIR, exist_ok=True)
+        path = _report_file_path(session_id, language)
+        with open(path, "wb") as f:
+            f.write(pdf_bytes)
+        db.update_session(session_id, {
+            "report_status": "ready",
+            "report_file_path": path,
+        })
+        logger.info(f"[KundliReport] report READY for session {session_id} ({language}) -> {path}")
+    except Exception as e:
+        logger.error(f"[KundliReport] generation FAILED for session {session_id}: {e}")
+        db.update_session(session_id, {
+            "report_status": "failed",
+            "report_error": str(e) or "Report generation failed.",
+        })
+
+
+def start_report_generation_async(session_id: str, language: str):
+    thread = threading.Thread(target=run_report_generation, args=(session_id, language), daemon=True)
+    thread.start()

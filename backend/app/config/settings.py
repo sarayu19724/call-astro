@@ -44,7 +44,9 @@ class Settings(BaseSettings):
     # real calculated Mahadasha/Antardasha/Pratyantardasha with actual dates)
     DASHA_LAMBDA_URL: str = "https://bivrov2febq5ued37psv2hcxyi0wlxet.lambda-url.ap-south-1.on.aws/"
     DASHA_LAMBDA_BEARER_TOKEN: str = "f83c6105-1731-4cd9-9d94-9543ff01bfe1"
-
+    
+    # Generated Kundli PDF reports (written to disk, served on download)
+    REPORTS_DIR: str = str(BACKEND_DIR / "generated_reports")
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
@@ -55,3 +57,4 @@ settings = Settings()
 # Ensure directories exist
 os.makedirs(settings.KNOWLEDGE_BASE_DIR, exist_ok=True)
 os.makedirs(settings.VECTOR_DB_DIR, exist_ok=True)
+os.makedirs(settings.REPORTS_DIR, exist_ok=True)

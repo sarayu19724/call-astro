@@ -50,6 +50,11 @@ class MemoryDatabase:
                     kundli_fetch_status TEXT,
                     kundli_fetch_error TEXT,
                     kundli_fetch_started_at TEXT,
+                    report_status TEXT,
+                    report_error TEXT,
+                    report_progress TEXT,
+                    report_started_at TEXT,
+                    report_file_path TEXT,
                     latitude REAL,
                     longitude REAL,
                     updated_at TEXT
@@ -81,6 +86,11 @@ class MemoryDatabase:
                 ("kundli_fetch_status", "TEXT"),
                 ("kundli_fetch_error", "TEXT"),
                 ("kundli_fetch_started_at", "TEXT"),
+                ("report_status", "TEXT"),
+                ("report_error", "TEXT"),
+                ("report_progress", "TEXT"),
+                ("report_started_at", "TEXT"),
+                ("report_file_path", "TEXT"),
             ]:
                 if col_name not in existing_cols:
                     cursor.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}")
@@ -115,12 +125,15 @@ class MemoryDatabase:
                                        dashboard_lucky_color, dashboard_date, yoga_text, dasha_tree_raw, topic_cache,
                                        house_insights_cache,
                                        kundli_fetch_status, kundli_fetch_error, kundli_fetch_started_at,
+                                       report_status, report_error, report_progress, report_started_at, report_file_path,
                                        latitude, longitude, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (session_id, None, None, None, 'Hinglish', None, None, None, None, None,
                  None, None, None, None, None, None, None, None, None, None,
-                 "idle", None, None, None, None, now_str)
+                 "idle", None, None,
+                 "idle", None, None, None, None,
+                 None, None, now_str)
             )
             conn.commit()
 
@@ -134,6 +147,8 @@ class MemoryDatabase:
                 "yoga_text": None, "dasha_tree_raw": None, "topic_cache": None,
                 "house_insights_cache": None,
                 "kundli_fetch_status": "idle", "kundli_fetch_error": None, "kundli_fetch_started_at": None,
+                "report_status": "idle", "report_error": None, "report_progress": None,
+                "report_started_at": None, "report_file_path": None,
                 "latitude": None, "longitude": None, "updated_at": now_str
             }
 
@@ -148,7 +163,8 @@ class MemoryDatabase:
             "dashboard_prediction", "dashboard_lucky_color", "dashboard_date",
             "weekly_guidance", "weekly_week_start", "yoga_text", "dasha_tree_raw", "topic_cache",
             "house_insights_cache",
-            "kundli_fetch_status", "kundli_fetch_error", "kundli_fetch_started_at"
+            "kundli_fetch_status", "kundli_fetch_error", "kundli_fetch_started_at",
+            "report_status", "report_error", "report_progress", "report_started_at", "report_file_path",
         }
         nullable_ok = {
             "pending_field", "kundli_data", "kundli_raw", "kundli_dasha", "kundli_divisional",
@@ -156,7 +172,8 @@ class MemoryDatabase:
             "dashboard_prediction", "dashboard_lucky_color", "dashboard_date",
             "weekly_guidance", "weekly_week_start", "yoga_text", "dasha_tree_raw", "topic_cache",
             "house_insights_cache",
-            "kundli_fetch_status", "kundli_fetch_error", "kundli_fetch_started_at"
+            "kundli_fetch_status", "kundli_fetch_error", "kundli_fetch_started_at",
+            "report_status", "report_error", "report_progress", "report_started_at", "report_file_path",
         }
         fields_to_update = {
             k: v for k, v in updates.items()

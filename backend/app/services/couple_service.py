@@ -22,10 +22,12 @@ def _to_24h(time_str: str) -> str:
 
 
 def fetch_partner_chart_bundle(name: str, dob: str, birth_time: str, birth_place: str) -> Dict:
-    """Synchronously fetches Kundli + Dasha for one partner. Raises on an
-    unrecoverable failure (bad location/chart); a Dasha-only failure is
-    tolerated and returned as dasha_info=None — same 'no Dasha is safer
-    than a wrong Dasha' philosophy as the single-user pipeline."""
+    """Synchronously fetches Kundli + Dasha for one partner. IMPORTANT: this
+    only fetches the raw Dasha TREE once (an expensive API call). It does
+    NOT compute or cache a 'current period' snapshot — 'current' changes
+    every day, so nothing time-sensitive is decided here. Every caller
+    that needs 'what's current right now' must recompute it fresh from
+    the cached dasha_tree at read time (see childbirth_service.compute_partner_timing)."""
     coords = geocoding_service.geocode(birth_place)
     if not coords:
         raise ValueError(f"Could not find location: {birth_place}")
@@ -42,7 +44,6 @@ def fetch_partner_chart_bundle(name: str, dob: str, birth_time: str, birth_place
     if not chart_data or not chart_data.get("ascendant_sign"):
         raise ValueError("Could not extract chart data from response.")
 
-    dasha_info = None
     dasha_tree = None
     try:
         ascendant_data = kundli_service.get_ascendant_data(kundli_data)
@@ -51,22 +52,16 @@ def fetch_partner_chart_bundle(name: str, dob: str, birth_time: str, birth_place
                 date=dob, time=time_24h, latitude=lat, longitude=lon,
                 ascendant_data=ascendant_data,
             )
-            if dasha_tree:
-                dasha_info = dasha_api_service.find_current_period(dasha_tree)
     except Exception as e:
-        logger.warning(f"[CoupleService] Dasha fetch failed for {name}: {e}")
-
-    upcoming_periods = []
-    if dasha_tree:
-        try:
-            upcoming_periods = dasha_api_service.get_upcoming_periods(dasha_tree, months_ahead=84)
-        except Exception as e:
-            logger.warning(f"[CoupleService] upcoming periods failed for {name}: {e}")
+        logger.warning(f"[CoupleService] Dasha tree fetch failed for {name}: {e}")
 
     return {
         "name": name, "dob": dob, "birth_time": birth_time, "birth_place": birth_place,
         "latitude": lat, "longitude": lon,
         "chart": chart_data,
-        "dasha_info": dasha_info,
-        "upcoming_periods": upcoming_periods,
+        # RAW tree only — this is the single source of truth for all Dasha
+        # timing. No "current_period" or "upcoming_periods" snapshot is
+        # stored here, because either would go stale the moment real time
+        # moves past when this fetch happened.
+        "dasha_tree": dasha_tree,
     }

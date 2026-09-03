@@ -58,6 +58,8 @@ interface PartnerReport {
   verdict: string;
   current_dasha: string | null;
   favorable_periods: { mahadasha: string; antardasha: string; start: string; end: string }[];
+  window_start?: string;
+  window_end?: string;
 }
 
 interface ChildbirthAnalysis {
@@ -65,14 +67,16 @@ interface ChildbirthAnalysis {
   partner2_name: string;
   partner1_report: PartnerReport;
   partner2_report: PartnerReport;
+  window_start?: string;
+  window_end?: string;
   joint: {
     joint_verdict: string;
     overlapping_windows: { start: string; end: string; partner_a_period: string; partner_b_period: string }[];
     common_factors: string[];
     conflicting_factors: string[];
+    window_evidence?: string | null;
   };
 }
-
 interface ChatMsg {
   role: string;
   content: string;
@@ -404,6 +408,22 @@ const renderPartnerFactsCard = (name: string, report: PartnerReport) => (
         </span>
       </div>
       <div className="flex justify-between text-xs">
+        <span className="text-slate-400">Current Dasha (as of today)</span>
+        <span className="font-medium text-slate-800">{report.current_dasha || '—'}</span>
+      </div> 
+      {report.favorable_periods.length > 0 && (
+       <div className="mt-3 pt-3 border-t border-slate-100">
+        <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-1.5">
+           Future Favorable Periods {report.window_start ? `(${report.window_start} – ${report.window_end})` : ''}
+        </p>
+        {report.favorable_periods.slice(0, 3).map((p, i) => (
+          <p key={i} className="text-xs text-slate-600">
+            {p.mahadasha}/{p.antardasha}: {p.start.split(' ')[0]} – {p.end.split(' ')[0]}
+          </p>
+        ))}
+       </div>
+)}
+      <div className="flex justify-between text-xs">
         <span className="text-slate-400">Current Dasha</span>
         <span className="font-medium text-slate-800">{report.current_dasha || '—'}</span>
       </div>
@@ -578,6 +598,16 @@ const renderPartnerFactsCard = (name: string, report: PartnerReport) => (
                       )}
                       <p className="text-[10px] text-slate-300 mt-1">Only periods starting after today are considered as future predictions.</p>
                     </div>
+                    {childbirth.joint.window_evidence && (
+                     <div className="mt-3 pt-3 border-t border-slate-100">
+                       <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-1.5">
+                        Why This Window — Evidence Chain
+                       </p>
+                       <pre className="text-xs text-slate-600 whitespace-pre-wrap font-sans leading-relaxed">
+                         {childbirth.joint.window_evidence}
+                       </pre>
+                     </div>
+)}
                   </div>
                 </>
               ) : (

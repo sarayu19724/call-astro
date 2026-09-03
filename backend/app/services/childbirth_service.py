@@ -2,10 +2,19 @@
 Childbirth (Santan Yoga) analysis — 5th house, 5th lord, Jupiter (child
 significator), Dasha timing, and joint-couple timing overlap.
 
-Every verdict here now carries an explicit reasoning chain (sign dignity,
-lordship, house placement, retrograde status) rather than a blanket
-strong/weak label — this is what makes the output auditable back to the
-raw Kundli data instead of reading like an opaque AI guess.
+ARCHITECTURE NOTE (fixes the "wrong current Dasha" + "past period shown as
+future" bugs): this module now cleanly separates two kinds of data:
+
+  STATIC facts  — 5th house sign/lord, Jupiter placement, dignity scores.
+                  These never change once the chart is calculated, so they
+                  ARE safe to cache indefinitely.
+
+  TIMING facts  — "current Dasha right now", "favorable periods in the
+                  next N years". These are recomputed FRESH, from the raw
+                  cached dasha_tree, every single time they're requested —
+                  using the real wall-clock "now" at request time. Nothing
+                  Dasha-related is ever cached as a fixed snapshot, because
+                  a snapshot is correct only at the instant it was taken.
 """
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -16,22 +25,16 @@ from app.services.topic_service import (
     NATURAL_BENEFICS, NATURAL_MALEFICS,
 )
 from app.services.yoga_service import EXALTATION, DEBILITATION, OWN_SIGNS
+from app.services.dasha_api_service import dasha_api_service
 
 FIFTH_HOUSE = 5
 CHILD_SIGNIFICATOR = "Jupiter"  # Putra Karaka in classical Vedic astrology
+FUTURE_WINDOW_YEARS = 7  # hard boundary for "future eligible periods"
 
-DIGNITY_SCORES = {
-    "exalted": 2,
-    "own_sign": 1,
-    "neutral": 0,
-    "debilitated": -2,
-}
-
+DIGNITY_SCORES = {"exalted": 2, "own_sign": 1, "neutral": 0, "debilitated": -2}
 DIGNITY_LABELS = {
-    "exalted": "Exalted",
-    "own_sign": "Own sign",
-    "neutral": "Neutral (no special dignity)",
-    "debilitated": "Debilitated",
+    "exalted": "Exalted", "own_sign": "Own sign",
+    "neutral": "Neutral (no special dignity)", "debilitated": "Debilitated",
 }
 
 
@@ -39,12 +42,6 @@ def _find_planet(planets: List[dict], name: str) -> Optional[dict]:
     return next((p for p in planets if p.get("name") == name), None)
 
 
-# ------------------------------------------------------------------
-# SIGN DIGNITY — exaltation / own-sign / debilitation, the piece the
-# previous version skipped entirely. Reuses the same fixed classical
-# tables already used by yoga_service.py, so a planet's dignity is
-# assessed consistently everywhere in the app.
-# ------------------------------------------------------------------
 def get_sign_dignity(planet_name: str, sign: str) -> str:
     if EXALTATION.get(planet_name) == sign:
         return "exalted"
@@ -56,8 +53,6 @@ def get_sign_dignity(planet_name: str, sign: str) -> str:
 
 
 def get_lordships(planet_name: str, ascendant_sign: str) -> List[int]:
-    """Which house number(s) this planet rules from this ascendant —
-    a planet can own 1 or 2 signs, so up to 2 house numbers."""
     houses = []
     for sign, lord in SIGN_LORDS.items():
         if lord == planet_name:
@@ -68,10 +63,6 @@ def get_lordships(planet_name: str, ascendant_sign: str) -> List[int]:
 
 
 def assess_planet_strength(planet_name: str, sign: str, house: Optional[int], retro: bool) -> Dict[str, Any]:
-    """Builds an explicit, auditable strength assessment for one planet
-    placement — sign dignity + house category + retrograde status, each
-    surfaced separately, with a combined score and a plain-language
-    'assessment' string that names WHY, not just strong/weak."""
     dignity = get_sign_dignity(planet_name, sign)
     dignity_score = DIGNITY_SCORES[dignity]
 
@@ -79,24 +70,13 @@ def assess_planet_strength(planet_name: str, sign: str, house: Optional[int], re
     house_score = 0
     if house:
         if house in DUSTHANA_HOUSES:
-            house_category = "dusthana"
-            house_score = -1
+            house_category, house_score = "dusthana", -1
         elif house in KENDRA_TRIKONA_HOUSES:
-            house_category = "kendra_trikona"
-            house_score = 1
+            house_category, house_score = "kendra_trikona", 1
         else:
-            house_category = "neutral_house"
-            house_score = 0
+            house_category, house_score = "neutral_house", 0
 
-    retro_penalty = 0
-    # Retrograde is not automatically bad in classical practice — an
-    # exalted or own-sign planet retrograde is still considered strong
-    # (some traditions treat retrograde exaltation as even stronger).
-    # It only counts against a placement that has no dignity to fall
-    # back on.
-    if retro and dignity in ("neutral", "debilitated"):
-        retro_penalty = -1
-
+    retro_penalty = -1 if (retro and dignity in ("neutral", "debilitated")) else 0
     combined = dignity_score + house_score + retro_penalty
 
     reasons = [f"{DIGNITY_LABELS[dignity]} in {sign}"]
@@ -105,10 +85,8 @@ def assess_planet_strength(planet_name: str, sign: str, house: Optional[int], re
     elif house_category == "dusthana":
         reasons.append(f"placed in a Dusthana house ({house})")
     if retro:
-        if retro_penalty:
-            reasons.append("retrograde, with no dignity to offset it")
-        else:
-            reasons.append("retrograde (does not weaken an exalted/own-sign placement)")
+        reasons.append("retrograde, with no dignity to offset it" if retro_penalty
+                        else "retrograde (does not weaken an exalted/own-sign placement)")
 
     if combined >= 2:
         verdict = "Strong"
@@ -122,16 +100,10 @@ def assess_planet_strength(planet_name: str, sign: str, house: Optional[int], re
         verdict = "Mixed / Moderate"
 
     return {
-        "planet": planet_name,
-        "sign": sign,
-        "house": house,
-        "retro": retro,
-        "dignity": dignity,
-        "dignity_label": DIGNITY_LABELS[dignity],
-        "house_category": house_category,
-        "combined_score": combined,
-        "verdict": verdict,
-        "reason": f"{verdict} — " + ", ".join(reasons) + "." if reasons else verdict,
+        "planet": planet_name, "sign": sign, "house": house, "retro": retro,
+        "dignity": dignity, "dignity_label": DIGNITY_LABELS[dignity],
+        "house_category": house_category, "combined_score": combined, "verdict": verdict,
+        "reason": f"{verdict} — " + ", ".join(reasons) + ".",
     }
 
 
@@ -141,13 +113,9 @@ def build_fifth_house_facts(planets: List[dict], ascendant_sign: str) -> Dict[st
 
     occupants = []
     for p in planets:
-        p_sign = p.get("sign_name", "")
-        house = get_house_for_sign(p_sign, ascendant_sign)
+        house = get_house_for_sign(p.get("sign_name", ""), ascendant_sign)
         if house == FIFTH_HOUSE:
-            occupants.append({
-                "name": p.get("name"),
-                "retro": str(p.get("isRetro", "")).lower() == "true",
-            })
+            occupants.append({"name": p.get("name"), "retro": str(p.get("isRetro", "")).lower() == "true"})
 
     lord_assessment = None
     if lord:
@@ -171,47 +139,37 @@ def build_fifth_house_facts(planets: List[dict], ascendant_sign: str) -> Dict[st
     malefic_occupants = [o["name"] for o in occupants if o["name"] in NATURAL_MALEFICS]
 
     return {
-        "house_number": FIFTH_HOUSE,
-        "sign": sign,
-        "lord": lord,
-        "occupants": occupants,
-        "lord_assessment": lord_assessment,
-        "significator_assessment": significator_assessment,
-        "benefic_occupants": benefic_occupants,
-        "malefic_occupants": malefic_occupants,
+        "house_number": FIFTH_HOUSE, "sign": sign, "lord": lord, "occupants": occupants,
+        "lord_assessment": lord_assessment, "significator_assessment": significator_assessment,
+        "benefic_occupants": benefic_occupants, "malefic_occupants": malefic_occupants,
     }
 
 
 def score_fifth_house_strength(facts: Dict[str, Any]) -> int:
-    """Rolls the two explicit assessments (5th lord, Jupiter) into a single
-    -1/0/+1 chart-level signal, now driven by their real combined_score
-    rather than a crude 'is it in a good house category' check."""
     scores = []
-
     lp = facts.get("lord_assessment")
     if lp:
         scores.append(lp["combined_score"])
-
     sig = facts.get("significator_assessment")
     if sig:
         scores.append(sig["combined_score"])
-
     if facts.get("benefic_occupants"):
         scores.append(1)
     if facts.get("malefic_occupants") and not facts.get("benefic_occupants"):
         scores.append(-1)
-
     if not scores:
         return 0
     total = sum(scores)
     return (total > 0) - (total < 0)
 
 
-def score_dasha_for_children(dasha_info: Optional[dict], fifth_lord: Optional[str]) -> int:
-    if not dasha_info:
+def score_dasha_for_children(current_period: Optional[dict], fifth_lord: Optional[str]) -> int:
+    """current_period is the dict shape returned by
+    dasha_api_service.find_current_period (recomputed fresh, never cached)."""
+    if not current_period:
         return 0
-    maha = dasha_info.get("current_mahadasha", {}) or {}
-    antar = dasha_info.get("current_antardasha", {}) or {}
+    maha = current_period.get("current_mahadasha", {}) or {}
+    antar = current_period.get("current_antardasha", {}) or {}
     relevant = {CHILD_SIGNIFICATOR}
     if fifth_lord:
         relevant.add(fifth_lord)
@@ -237,13 +195,12 @@ def build_verdict(chart_score: int, dasha_score: int) -> str:
     return "mixed"
 
 
-def rank_favorable_child_periods(upcoming_periods: List[dict], fifth_lord: Optional[str], top_n: int = 5) -> List[dict]:
+def rank_favorable_child_periods(periods: List[dict], fifth_lord: Optional[str], top_n: int = 5) -> List[dict]:
     significators = {CHILD_SIGNIFICATOR}
     if fifth_lord:
         significators.add(fifth_lord)
-
     scored = []
-    for period in upcoming_periods:
+    for period in periods:
         score = 0
         if period.get("mahadasha") in significators:
             score += 2
@@ -251,60 +208,124 @@ def rank_favorable_child_periods(upcoming_periods: List[dict], fifth_lord: Optio
             score += 1
         if score > 0:
             scored.append({**period, "favorability_score": score})
-
     scored.sort(key=lambda p: p["favorability_score"], reverse=True)
     return scored[:top_n]
 
 
-def build_partner_childbirth_report(planets: List[dict], ascendant_sign: str,
-                                      dasha_info: Optional[dict],
-                                      upcoming_periods: Optional[List[dict]] = None) -> Dict[str, Any]:
-    facts = build_fifth_house_facts(planets, ascendant_sign)
-    chart_score = score_fifth_house_strength(facts)
-    dasha_score = score_dasha_for_children(dasha_info, facts.get("lord"))
-    verdict = build_verdict(chart_score, dasha_score)
-
-    favorable_periods = []
-    if upcoming_periods:
-        favorable_periods = rank_favorable_child_periods(upcoming_periods, facts.get("lord"))
-
-    current_dasha_str = None
-    if dasha_info:
-        maha = dasha_info.get("current_mahadasha", {}) or {}
-        antar = dasha_info.get("current_antardasha", {}) or {}
-        if maha.get("lord"):
-            current_dasha_str = f"{maha['lord']} Mahadasha"
-            if antar.get("lord"):
-                current_dasha_str += f" – {antar['lord']} Antardasha"
-
-    return {
-        "facts": facts,
-        "chart_score": chart_score,
-        "dasha_score": dasha_score,
-        "verdict": verdict,
-        "current_dasha": current_dasha_str,
-        "favorable_periods": favorable_periods,
-    }
-
-
-def find_overlapping_windows(periods_a: List[dict], periods_b: List[dict]) -> List[Dict[str, Any]]:
-    """Finds calendar overlap between two partners' favorable-period lists."""
-
-    def _parse(d):
-        if not d:
-            return None
+def _parse_period_date(d: Optional[str]) -> Optional[datetime]:
+    if not d:
+        return None
+    try:
+        return datetime.strptime(d, "%d/%m/%Y %H:%M:%S")
+    except Exception:
         try:
             return datetime.strptime(d.split(" ")[0], "%d/%m/%Y")
         except Exception:
             return None
 
+
+# ------------------------------------------------------------------
+# FIX 1 + FIX 2 — fresh "current period" + hard-boundary future window.
+# This is the ONLY place "now" is decided for Dasha purposes, called
+# fresh on every request. It never trusts a snapshot computed earlier.
+# ------------------------------------------------------------------
+def compute_partner_timing(dasha_tree: Optional[List[dict]], fifth_lord: Optional[str],
+                            now: Optional[datetime] = None, years_ahead: int = FUTURE_WINDOW_YEARS) -> Dict[str, Any]:
+    now = now or datetime.now()
+
+    if not dasha_tree:
+        return {
+            "current_dasha_str": None, "current_period": None, "dasha_score": 0,
+            "favorable_future_periods": [], "window_start": now.strftime("%d %b %Y"),
+            "window_end": now.replace(year=now.year + years_ahead).strftime("%d %b %Y"),
+        }
+
+    # Recomputed fresh using the REAL current time — this is FIX 1.
+    current_period = dasha_api_service.find_current_period(dasha_tree)
+
+    current_dasha_str = None
+    if current_period:
+        maha = current_period.get("current_mahadasha", {}) or {}
+        antar = current_period.get("current_antardasha", {}) or {}
+        if maha.get("lord"):
+            current_dasha_str = f"{maha['lord']} Mahadasha"
+            if antar.get("lord"):
+                current_dasha_str += f" – {antar['lord']} Antardasha"
+
+    dasha_score = score_dasha_for_children(current_period, fifth_lord)
+
+    # FIX 2 — a period is a "future candidate" ONLY if it starts strictly
+    # after "now". A period already in progress belongs in current_period
+    # above, never in this list, so the two can never be conflated again.
+    all_periods = dasha_api_service.flatten_periods(dasha_tree, level="antardasha")
+    cutoff = now.replace(year=now.year + years_ahead)
+
+    future_periods = []
+    for period in all_periods:
+        start = _parse_period_date(period.get("start"))
+        end = _parse_period_date(period.get("end"))
+        if not start or not end:
+            continue
+        if start > now and start <= cutoff:
+            future_periods.append(period)
+
+    favorable_future_periods = rank_favorable_child_periods(future_periods, fifth_lord)
+
+    return {
+        "current_dasha_str": current_dasha_str,
+        "current_period": current_period,
+        "dasha_score": dasha_score,
+        "favorable_future_periods": favorable_future_periods,
+        "window_start": now.strftime("%d %b %Y"),
+        "window_end": cutoff.strftime("%d %b %Y"),
+    }
+
+
+def build_partner_childbirth_static(planets: List[dict], ascendant_sign: str) -> Dict[str, Any]:
+    """The part that's safe to cache — never depends on 'now'."""
+    facts = build_fifth_house_facts(planets, ascendant_sign)
+    chart_score = score_fifth_house_strength(facts)
+    return {"facts": facts, "chart_score": chart_score}
+
+
+def attach_timing(static_report: Dict[str, Any], dasha_tree: Optional[List[dict]],
+                   now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Combines a cached static report with FRESHLY computed timing.
+    Call this on every request — never cache its output."""
+    facts = static_report["facts"]
+    chart_score = static_report["chart_score"]
+    timing = compute_partner_timing(dasha_tree, facts.get("lord"), now=now)
+    verdict = build_verdict(chart_score, timing["dasha_score"])
+
+    return {
+        "facts": facts,
+        "chart_score": chart_score,
+        "dasha_score": timing["dasha_score"],
+        "verdict": verdict,
+        "current_dasha": timing["current_dasha_str"],
+        "current_period": timing["current_period"],
+        "favorable_periods": timing["favorable_future_periods"],
+        "window_start": timing["window_start"],
+        "window_end": timing["window_end"],
+    }
+
+
+# Kept for any external caller wanting one-shot static+timing together.
+def build_partner_childbirth_report(planets: List[dict], ascendant_sign: str,
+                                     dasha_tree: Optional[List[dict]] = None,
+                                     now: Optional[datetime] = None) -> Dict[str, Any]:
+    static_report = build_partner_childbirth_static(planets, ascendant_sign)
+    return attach_timing(static_report, dasha_tree, now=now)
+
+
+def find_overlapping_windows(periods_a: List[dict], periods_b: List[dict]) -> List[Dict[str, Any]]:
     overlaps = []
     for pa in periods_a:
-        a_start, a_end = _parse(pa.get("start")), _parse(pa.get("end"))
+        a_start, a_end = _parse_period_date(pa.get("start")), _parse_period_date(pa.get("end"))
         if not a_start or not a_end:
             continue
         for pb in periods_b:
-            b_start, b_end = _parse(pb.get("start")), _parse(pb.get("end"))
+            b_start, b_end = _parse_period_date(pb.get("start")), _parse_period_date(pb.get("end"))
             if not b_start or not b_end:
                 continue
             latest_start = max(a_start, b_start)
@@ -316,24 +337,50 @@ def find_overlapping_windows(periods_a: List[dict], periods_b: List[dict]) -> Li
                     "partner_a_period": f"{pa.get('mahadasha')}/{pa.get('antardasha')}",
                     "partner_b_period": f"{pb.get('mahadasha')}/{pb.get('antardasha')}",
                 })
-
     overlaps.sort(key=lambda w: datetime.strptime(w["start"], "%d/%m/%Y"))
     return overlaps
 
 
-def build_joint_childbirth_analysis(report_a: Dict[str, Any], report_b: Dict[str, Any]) -> Dict[str, Any]:
-    """Now builds common/conflicting factors from the real per-planet
-    assessments (verdict + reason) instead of a binary in_kendra_trikona /
-    in_dusthana check — so a claim like 'Jupiter is weak' can no longer be
-    made for a chart where Jupiter is actually exalted or in its own sign."""
+# ------------------------------------------------------------------
+# FIX 4 — full evidence chain for the top overlapping window, instead
+# of just asserting a date range.
+# ------------------------------------------------------------------
+def format_window_evidence(name_a: str, report_a: Dict[str, Any], name_b: str,
+                            report_b: Dict[str, Any], window: Dict[str, Any]) -> str:
+    def _facts_block(name, facts):
+        lines = [
+            f"{name.upper()}",
+            f"  5th house sign: {facts.get('sign') or 'unknown'}",
+            f"  5th house lord: {facts.get('lord') or 'unknown'}",
+        ]
+        lp = facts.get("lord_assessment")
+        if lp:
+            lines.append(f"  5th lord strength: {lp.get('reason')}")
+        sig = facts.get("significator_assessment")
+        if sig:
+            lines.append(f"  Jupiter (child significator): {sig.get('reason')}")
+        return "\n".join(lines)
+
+    lines = [
+        f"{name_a.upper()} — supporting Dasha: {window['partner_a_period']}",
+        _facts_block(name_a, report_a["facts"]),
+        "",
+        f"{name_b.upper()} — supporting Dasha: {window['partner_b_period']}",
+        _facts_block(name_b, report_b["facts"]),
+        "",
+        f"OVERLAP WINDOW: {window['start']} – {window['end']}",
+    ]
+    return "\n".join(lines)
+
+
+def build_joint_childbirth_analysis(report_a: Dict[str, Any], report_b: Dict[str, Any],
+                                     partner_a_name: str = "Partner A",
+                                     partner_b_name: str = "Partner B") -> Dict[str, Any]:
     overlaps = find_overlapping_windows(
-        report_a.get("favorable_periods", []),
-        report_b.get("favorable_periods", []),
+        report_a.get("favorable_periods", []), report_b.get("favorable_periods", []),
     )
 
-    verdict_a = report_a["verdict"]
-    verdict_b = report_b["verdict"]
-
+    verdict_a, verdict_b = report_a["verdict"], report_b["verdict"]
     if verdict_a == "favorable" and verdict_b == "favorable":
         joint_verdict = "favorable"
     elif verdict_a == "challenging" and verdict_b == "challenging":
@@ -341,53 +388,47 @@ def build_joint_childbirth_analysis(report_a: Dict[str, Any], report_b: Dict[str
     else:
         joint_verdict = "mixed"
 
-    common_factors = []
-    conflicting_factors = []
-
+    common_factors, conflicting_factors = [], []
     sig_a = report_a["facts"].get("significator_assessment") or {}
     sig_b = report_b["facts"].get("significator_assessment") or {}
+    STRONG = {"Strong", "Favorable"}
+    WEAK = {"Weak", "Challenged"}
 
-    STRONG_VERDICTS = {"Strong", "Favorable"}
-    WEAK_VERDICTS = {"Weak", "Challenged"}
-
-    if sig_a.get("verdict") in STRONG_VERDICTS and sig_b.get("verdict") in STRONG_VERDICTS:
+    if sig_a.get("verdict") in STRONG and sig_b.get("verdict") in STRONG:
         common_factors.append(
             f"Jupiter (child significator) is well placed for both — "
-            f"{sig_a.get('reason', '')} for partner A, {sig_b.get('reason', '')} for partner B."
+            f"{sig_a.get('reason', '')} for {partner_a_name}, {sig_b.get('reason', '')} for {partner_b_name}."
         )
     else:
-        if sig_a.get("verdict") in WEAK_VERDICTS:
-            conflicting_factors.append(f"Partner A's Jupiter: {sig_a.get('reason', 'placement not favorable')}")
-        if sig_b.get("verdict") in WEAK_VERDICTS:
-            conflicting_factors.append(f"Partner B's Jupiter: {sig_b.get('reason', 'placement not favorable')}")
-        if sig_a.get("verdict") not in WEAK_VERDICTS and sig_b.get("verdict") not in WEAK_VERDICTS \
-                and not (sig_a.get("verdict") in STRONG_VERDICTS and sig_b.get("verdict") in STRONG_VERDICTS):
-            common_factors.append(
-                f"Jupiter is moderate in both charts — "
-                f"{sig_a.get('reason', 'no strong signal')} for partner A, "
-                f"{sig_b.get('reason', 'no strong signal')} for partner B."
-            )
+        if sig_a.get("verdict") in WEAK:
+            conflicting_factors.append(f"{partner_a_name}'s Jupiter: {sig_a.get('reason', 'placement not favorable')}")
+        if sig_b.get("verdict") in WEAK:
+            conflicting_factors.append(f"{partner_b_name}'s Jupiter: {sig_b.get('reason', 'placement not favorable')}")
 
     lp_a = report_a["facts"].get("lord_assessment") or {}
     lp_b = report_b["facts"].get("lord_assessment") or {}
-
-    if lp_a.get("verdict") in STRONG_VERDICTS and lp_b.get("verdict") in STRONG_VERDICTS:
+    if lp_a.get("verdict") in STRONG and lp_b.get("verdict") in STRONG:
         common_factors.append(
             f"Both 5th house lords are favorably placed — "
-            f"{lp_a.get('reason', '')} for partner A, {lp_b.get('reason', '')} for partner B."
+            f"{lp_a.get('reason', '')} for {partner_a_name}, {lp_b.get('reason', '')} for {partner_b_name}."
         )
-    elif (lp_a.get("verdict") in STRONG_VERDICTS) != (lp_b.get("verdict") in STRONG_VERDICTS):
+    elif (lp_a.get("verdict") in STRONG) != (lp_b.get("verdict") in STRONG):
         conflicting_factors.append(
-            "The two charts' 5th lords differ in strength — "
-            f"partner A: {lp_a.get('reason', 'not assessed')}; partner B: {lp_b.get('reason', 'not assessed')}."
+            f"The two charts' 5th lords differ in strength — "
+            f"{partner_a_name}: {lp_a.get('reason', 'not assessed')}; {partner_b_name}: {lp_b.get('reason', 'not assessed')}."
         )
 
     if not common_factors and not conflicting_factors:
         common_factors.append("No strongly differentiating factor found — both charts show a broadly comparable baseline.")
+
+    window_evidence = None
+    if overlaps:
+        window_evidence = format_window_evidence(partner_a_name, report_a, partner_b_name, report_b, overlaps[0])
 
     return {
         "joint_verdict": joint_verdict,
         "overlapping_windows": overlaps,
         "common_factors": common_factors,
         "conflicting_factors": conflicting_factors,
+        "window_evidence": window_evidence,
     }

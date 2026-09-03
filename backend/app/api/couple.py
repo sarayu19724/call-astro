@@ -8,11 +8,16 @@ from typing import Optional
 
 from app.memory.couple_database import couple_db
 from app.services.couple_service import fetch_partner_chart_bundle
-from app.services.childbirth_service import build_partner_childbirth_report, build_joint_childbirth_analysis
+from app.services.childbirth_service import (
+    build_partner_childbirth_static, attach_timing, build_joint_childbirth_analysis,
+)
+from app.services.dasha_api_service import dasha_api_service
 from app.services.llm_service import llm_service
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/couple", tags=["CoupleTest"])
+
+CHILDBIRTH_STATIC_VERSION = 2  # bump if build_partner_childbirth_static's shape changes
 
 
 class PartnerProfile(BaseModel):
@@ -82,11 +87,6 @@ async def set_partner(couple_id: str, which: int, profile: PartnerProfile):
 
 @router.post("/{couple_id}/known-outcome")
 async def set_known_outcome(couple_id: str, payload: KnownOutcomeRequest):
-    """Lets the person testing a real case tell the system the actual
-    observed outcome (e.g. 'Married ~6 years, no child as of 2026') so the
-    LLM is grounded in fact rather than guessing at something astrology
-    alone can't reliably establish. Clears the cached analysis so the
-    next /childbirth or /chat call picks up the new context."""
     couple_db.update(couple_id, {"known_outcome": payload.outcome.strip() or None})
     return {"status": "success"}
 
@@ -98,6 +98,10 @@ async def get_couple_status(couple_id: str):
     def _partner_view(prefix: str):
         data = _safe_load(session.get(f"{prefix}_data"))
         chart = data.get("chart") if data else None
+        dasha_tree = data.get("dasha_tree") if data else None
+        # FIX 1 — always recomputed fresh from the cached raw tree, using
+        # the real current time. Never served from a stored snapshot.
+        fresh_current = dasha_api_service.find_current_period(dasha_tree) if dasha_tree else None
         return {
             "status": session.get(f"{prefix}_status") or "idle",
             "error": session.get(f"{prefix}_error"),
@@ -107,7 +111,7 @@ async def get_couple_status(couple_id: str):
             "birth_place": session.get(f"{prefix}_place"),
             "planets": chart.get("planets") if chart else None,
             "ascendant_sign": chart.get("ascendant_sign") if chart else None,
-            "current_dasha": (data.get("dasha_info") if data else None),
+            "current_dasha": fresh_current,
         }
 
     return {
@@ -126,36 +130,61 @@ async def get_childbirth_analysis(couple_id: str):
     if session.get("partner1_status") != "ready" or session.get("partner2_status") != "ready":
         return {"available": False, "reason": "Both partners' charts must be ready first."}
 
-    cached = _safe_load(session.get("childbirth_analysis"))
-    if cached:
-        return {"available": True, "known_outcome": session.get("known_outcome"), **cached}
-
     data1 = _safe_load(session.get("partner1_data"))
     data2 = _safe_load(session.get("partner2_data"))
     if not data1 or not data2:
         return {"available": False, "reason": "Chart data missing — please re-run the couple test."}
 
-    report1 = build_partner_childbirth_report(
-        data1["chart"]["planets"], data1["chart"]["ascendant_sign"],
-        data1.get("dasha_info"), data1.get("upcoming_periods"),
-    )
-    report2 = build_partner_childbirth_report(
-        data2["chart"]["planets"], data2["chart"]["ascendant_sign"],
-        data2.get("dasha_info"), data2.get("upcoming_periods"),
-    )
-    joint = build_joint_childbirth_analysis(report1, report2)
+    # Only the STATIC part (chart facts, never time-sensitive) is cached.
+    cached = _safe_load(session.get("childbirth_analysis"))
+    if cached and cached.get("_static_version") == CHILDBIRTH_STATIC_VERSION:
+        static1, static2 = cached["partner1_static"], cached["partner2_static"]
+    else:
+        static1 = build_partner_childbirth_static(data1["chart"]["planets"], data1["chart"]["ascendant_sign"])
+        static2 = build_partner_childbirth_static(data2["chart"]["planets"], data2["chart"]["ascendant_sign"])
+        couple_db.update(couple_id, {"childbirth_analysis": json.dumps({
+            "_static_version": CHILDBIRTH_STATIC_VERSION,
+            "partner1_static": static1, "partner2_static": static2,
+        }, default=str, ensure_ascii=False)})
+
+    # FIX 1 + FIX 2 — timing is ALWAYS recomputed fresh, every request,
+    # using the real current time and the hard 7-year future boundary.
+    now = datetime.now()
+    report1 = attach_timing(static1, data1.get("dasha_tree"), now=now)
+    report2 = attach_timing(static2, data2.get("dasha_tree"), now=now)
+
+    name1 = session.get("partner1_name") or "Partner 1"
+    name2 = session.get("partner2_name") or "Partner 2"
+    joint = build_joint_childbirth_analysis(report1, report2, partner_a_name=name1, partner_b_name=name2)
 
     result = {
-        "partner1_name": session.get("partner1_name"),
-        "partner2_name": session.get("partner2_name"),
+        "partner1_name": name1,
+        "partner2_name": name2,
         "partner1_report": report1,
         "partner2_report": report2,
         "joint": joint,
-        "computed_at": datetime.utcnow().isoformat(),
+        "window_start": report1.get("window_start"),
+        "window_end": report1.get("window_end"),
+        "computed_at": now.isoformat(),
     }
-
-    couple_db.update(couple_id, {"childbirth_analysis": json.dumps(result, default=str, ensure_ascii=False)})
     return {"available": True, "known_outcome": session.get("known_outcome"), **result}
+
+
+# ------------------------------------------------------------------
+# FIX 3 — scope detection: an individual-partner question must NEVER
+# pull in the other partner's facts or the joint analysis.
+# ------------------------------------------------------------------
+def _detect_chat_scope(message: str, name1: str, name2: str) -> str:
+    text = f" {message.lower()} "
+    n1 = (name1 or "").strip().lower()
+    n2 = (name2 or "").strip().lower()
+    mentions1 = bool(n1) and n1 in text
+    mentions2 = bool(n2) and n2 in text
+    if mentions1 and not mentions2:
+        return "partner1"
+    if mentions2 and not mentions1:
+        return "partner2"
+    return "joint"
 
 
 COUPLE_CHAT_PROMPT = """You are an experienced, warm Indian Vedic Astrologer, answering a MARRIED COUPLE
@@ -186,6 +215,36 @@ Couple's question:
 Write the answer now:
 """
 
+INDIVIDUAL_CHAT_PROMPT = """You are an experienced, warm Indian Vedic Astrologer. The question below is about
+{partner_name}'s OWN chart specifically. Answer using ONLY {partner_name}'s facts below — do NOT mention the
+other partner's chart, planets, houses, or Dasha, and do NOT reference any "joint" or "combined" analysis.
+This answer is scoped to {partner_name} alone.
+
+Respond STRICTLY in {language} (Hindi: Devanagari; Hinglish: Latin-script conversational; English: warm English).
+Length: 3-5 sentences, under 90 words. Plain prose, no bullet points, no headers.
+Speak with grounded confidence directly from the facts given below — never mention books, RAG, retrieval,
+or any technical process.
+
+{partner_name}'s 5th-house / children facts:
+{partner_facts}
+
+{partner_name}'s current Dasha (as of today):
+{current_dasha}
+
+{partner_name}'s upcoming favorable periods (window: {window_start} to {window_end}):
+{future_periods}
+
+{known_outcome_block}
+
+Conversation so far:
+{history}
+
+Question:
+"{question}"
+
+Write the answer now — about {partner_name} only:
+"""
+
 KNOWN_OUTCOME_WITH_DATA = """OBSERVED REAL-WORLD OUTCOME FOR THIS CASE (treat this as established fact, not
 something to infer from the chart): {outcome}
 Use this as ground truth. Your job is to explain HOW the chart and Dasha support or contextualize this known
@@ -200,10 +259,7 @@ already happened in real life."""
 
 def _format_partner_facts(name: str, report: dict) -> str:
     facts = report["facts"]
-    lines = [
-        f"5th House sign: {facts.get('sign')}",
-        f"5th House lord: {facts.get('lord')}",
-    ]
+    lines = [f"5th House sign: {facts.get('sign')}", f"5th House lord: {facts.get('lord')}"]
     lp = facts.get("lord_assessment")
     if lp:
         lordships = lp.get("lordships") or []
@@ -220,15 +276,26 @@ def _format_partner_facts(name: str, report: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_future_periods(report: dict) -> str:
+    periods = report.get("favorable_periods") or []
+    if not periods:
+        return "No specific standout favorable period identified in the coming years — timing is broadly neutral for this."
+    lines = []
+    for p in periods[:3]:
+        start = (p.get("start") or "").split(" ")[0]
+        end = (p.get("end") or "").split(" ")[0]
+        lines.append(f"- {p.get('mahadasha')}/{p.get('antardasha')}: {start} – {end}")
+    return "\n".join(lines)
+
+
 def _format_joint_facts(joint: dict) -> str:
     lines = [f"Joint verdict: {joint.get('joint_verdict')}"]
     if joint.get("common_factors"):
         lines.append("Common supporting factors: " + "; ".join(joint["common_factors"]))
     if joint.get("conflicting_factors"):
         lines.append("Conflicting factors: " + "; ".join(joint["conflicting_factors"]))
-    if joint.get("overlapping_windows"):
-        w = joint["overlapping_windows"][0]
-        lines.append(f"Most likely overlapping window: {w['start']} to {w['end']}")
+    if joint.get("window_evidence"):
+        lines.append("\nFull evidence chain for the most likely joint window:\n" + joint["window_evidence"])
     else:
         lines.append("No clear overlapping favorable Dasha window was found in the computed timeframe.")
     return "\n".join(lines)
@@ -245,24 +312,41 @@ async def couple_chat(couple_id: str, payload: CoupleChatRequest):
         raise HTTPException(status_code=400, detail=childbirth.get("reason", "Childbirth analysis unavailable."))
 
     known_outcome = session.get("known_outcome")
-    known_outcome_block = (
-        KNOWN_OUTCOME_WITH_DATA.format(outcome=known_outcome) if known_outcome else KNOWN_OUTCOME_ABSENT
-    )
+    known_outcome_block = KNOWN_OUTCOME_WITH_DATA.format(outcome=known_outcome) if known_outcome else KNOWN_OUTCOME_ABSENT
 
     history = _safe_load(session.get("chat_history")) or []
     history_text = "\n".join(f"{h['role']}: {h['content']}" for h in history[-6:])
 
-    prompt = COUPLE_CHAT_PROMPT.format(
-        language=payload.language or "Hinglish",
-        partner1_name=childbirth["partner1_name"] or "Partner 1",
-        partner2_name=childbirth["partner2_name"] or "Partner 2",
-        partner1_facts=_format_partner_facts(childbirth["partner1_name"], childbirth["partner1_report"]),
-        partner2_facts=_format_partner_facts(childbirth["partner2_name"], childbirth["partner2_report"]),
-        joint_facts=_format_joint_facts(childbirth["joint"]),
-        known_outcome_block=known_outcome_block,
-        history=history_text or "None",
-        question=payload.message,
-    )
+    name1, name2 = childbirth["partner1_name"], childbirth["partner2_name"]
+    scope = _detect_chat_scope(payload.message, name1, name2)
+    logger.info(f"[CoupleChat] scope detected: {scope}")
+
+    if scope in ("partner1", "partner2"):
+        name = name1 if scope == "partner1" else name2
+        report = childbirth["partner1_report"] if scope == "partner1" else childbirth["partner2_report"]
+        prompt = INDIVIDUAL_CHAT_PROMPT.format(
+            language=payload.language or "Hinglish",
+            partner_name=name,
+            partner_facts=_format_partner_facts(name, report),
+            current_dasha=report.get("current_dasha") or "Not available",
+            window_start=childbirth.get("window_start", ""),
+            window_end=childbirth.get("window_end", ""),
+            future_periods=_format_future_periods(report),
+            known_outcome_block=known_outcome_block,
+            history=history_text or "None",
+            question=payload.message,
+        )
+    else:
+        prompt = COUPLE_CHAT_PROMPT.format(
+            language=payload.language or "Hinglish",
+            partner1_name=name1, partner2_name=name2,
+            partner1_facts=_format_partner_facts(name1, childbirth["partner1_report"]),
+            partner2_facts=_format_partner_facts(name2, childbirth["partner2_report"]),
+            joint_facts=_format_joint_facts(childbirth["joint"]),
+            known_outcome_block=known_outcome_block,
+            history=history_text or "None",
+            question=payload.message,
+        )
 
     try:
         response_text = llm_service.generate(prompt=prompt, temperature=0.6).strip()
@@ -274,7 +358,7 @@ async def couple_chat(couple_id: str, payload: CoupleChatRequest):
     history.append({"role": "Astrologer", "content": response_text})
     couple_db.update(couple_id, {"chat_history": json.dumps(history, ensure_ascii=False)})
 
-    return {"message": response_text}
+    return {"message": response_text, "scope": scope}
 
 
 @router.get("/{couple_id}/chat/history")

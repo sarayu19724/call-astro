@@ -75,16 +75,17 @@ CONTRACT_WORD_BANDS = {
 }
 
 # ------------------------------------------------------------------
-# RULE APPLICABILITY ENGINE — deterministic condition patterns.
-# Each pattern extracts (subject, house_num) from rule text. Subject is
-# either "<Planet>" (a named planet) or "<N>_lord" (the lord of house N).
+# EVIDENCE RELEVANCE ENGINE — regex helpers used to scan retrieved
+# classical text for house/lord mentions so they can be checked for
+# overlap against the VERIFIED chart facts. Unlike the old Rule
+# Applicability Engine, this does NOT try to prove a rule's stated
+# condition true/false (MATCH/NO_MATCH) — it only measures how many of
+# this chart's ACTUAL factors (occupied houses, house lords, planets,
+# current Dasha lords) a passage actually talks about. That overlap
+# count becomes the passage's relevance tier (HIGH/MEDIUM/LOW).
 # ------------------------------------------------------------------
-RULE_CONDITION_PATTERNS = [
-    # "7th lord is connected with 10th" / "7th lord in 10th house" / "7th lord placed in 10th"
-    (re.compile(r"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+lord\s+(?:is\s+)?(?:connected with|in|placed in|situated in)\s+(?:the\s+)?(1[0-2]|[1-9])(?:st|nd|rd|th)", re.IGNORECASE), "lord_house"),
-    # "if Saturn is in 7th house" / "Saturn in the 7th house" / "Saturn placed in 7th"
-    (re.compile(r"\b(Sun|Moon|Mars|Mercury|Jupiter|Venus|Saturn|Rahu|Ketu)\s+(?:is\s+)?(?:placed in|situated in|in)\s+(?:the\s+)?(1[0-2]|[1-9])(?:st|nd|rd|th)\s+house\b", re.IGNORECASE), "planet_house"),
-]
+HOUSE_MENTION_PATTERN = re.compile(r"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+house\b", re.IGNORECASE)
+LORD_MENTION_PATTERN = re.compile(r"\b(1[0-2]|[1-9])(?:st|nd|rd|th)\s+lord\b", re.IGNORECASE)
 
 
 class ChatService:
@@ -184,7 +185,7 @@ class ChatService:
     # untouched Kundli API response) every time, rather than trusting the
     # separately cached kundli_raw field. kundli_raw stays cached for cheap
     # display use elsewhere, but anything that GATES what the LLM may
-    # claim — Rule Applicability, the structured Fact→Rule table, claim
+    # claim — Evidence Relevance, the structured Fact→Rule table, claim
     # validation — now re-derives from the raw API payload, so a bug or
     # staleness in the cached extraction can never silently become a
     # "verified" fact.
@@ -267,7 +268,7 @@ class ChatService:
     # returned, what house that resolves to given the Ascendant, and who
     # rules that house — each fact tagged ✓ so the reader can see nothing
     # here is invented by the LLM. This is the deterministic "ground truth"
-    # panel the rest of the pipeline (Rule Applicability, claim mapping,
+    # panel the rest of the pipeline (Evidence Relevance, claim mapping,
     # claim_validator) is checked against.
     # ------------------------------------------------------------------
     def _build_kundli_fact_verification_trace(self, session: Dict) -> Dict[str, Any]:
@@ -357,104 +358,173 @@ class ChatService:
                + "\n\n".join(sections)
 
     # ------------------------------------------------------------------
-    # RULE APPLICABILITY ENGINE
-    # For each retrieved chunk of classical text, try to extract a rule
-    # condition (e.g. "7th lord in 10th house", "Saturn in 7th house") and
-    # deterministically check it against the VERIFIED chart facts — before
-    # the LLM ever sees it. Every retrieved chunk gets tagged MATCH /
-    # NO_MATCH / UNKNOWN (no parseable condition found). This replaces
-    # "let the LLM decide if a rule applies" with a hard, checked answer.
+    # EVIDENCE RELEVANCE ENGINE
+    # Replaces the old Rule Applicability Engine (MATCH / NO_MATCH /
+    # UNKNOWN). We are NOT trying to prove a retrieved passage's stated
+    # condition true or false against this chart — classical texts often
+    # state a rule using an illustrative example placement, not a
+    # universal claim about every chart. Instead, for every retrieved
+    # chunk we ask a much safer, more honest question:
+    #
+    #   "Given the facts we already extracted from this Kundli (occupied
+    #    houses, house lords, planets present, active Dasha lords), does
+    #    this passage discuss those SAME factors?"
+    #
+    # Each hit is tagged with the specific chart factors it overlaps with
+    # (e.g. "10th house (occupied by Mercury)", "7th lord (Jupiter)",
+    # "Mars", "Dasha (Saturn)") and assigned a relevance tier — HIGH
+    # (multiple factor overlaps), MEDIUM (some overlap), or LOW (no
+    # overlap — general classical principle only). This mirrors how the
+    # classical texts themselves work: profession is judged by weighing
+    # several relevant factors together (10th/9th/11th/2nd houses, their
+    # lords, significator planets, Dasha), not by a single pass/fail
+    # rule check.
     # ------------------------------------------------------------------
-    def _evaluate_rule_applicability(self, rag_hits: List[Dict[str, Any]], session: Dict) -> List[Dict[str, Any]]:
+    def _evaluate_evidence_relevance(self, rag_hits: List[Dict[str, Any]], session: Dict) -> List[Dict[str, Any]]:
         chart = self._get_verified_planet_house_map(session)
         if not chart:
             for hit in rag_hits:
-                hit["applicability"] = "UNKNOWN"
-                hit["applicability_reason"] = "Chart data not available for verification."
+                hit["relevance"] = "LOW"
+                hit["relevance_factors"] = []
+                hit["relevance_note"] = "Chart data not available to check relevance against."
             return rag_hits
+
+        occupied_houses: Set[int] = set()
+        occupants_by_house: Dict[int, List[str]] = {}
+        for name, info in chart["planets"].items():
+            house = info.get("house")
+            if house:
+                occupied_houses.add(house)
+                occupants_by_house.setdefault(house, []).append(name)
+
+        house_lords: Dict[int, str] = chart.get("house_lords", {}) or {}
+        planets_present: Set[str] = set(chart["planets"].keys())
+
+        dasha_lords: Set[str] = set()
+        cached_dasha = session.get("kundli_dasha")
+        if cached_dasha:
+            try:
+                dasha_info = json.loads(cached_dasha)
+                maha = dasha_info.get("current_mahadasha", {}) or {}
+                antar = dasha_info.get("current_antardasha", {}) or {}
+                for lord_field in (maha.get("lord") or maha.get("name") or maha.get("planet"),
+                                    antar.get("lord") or antar.get("name") or antar.get("planet")):
+                    if lord_field:
+                        dasha_lords.add(str(lord_field))
+            except Exception:
+                pass
 
         for hit in rag_hits:
             text = hit.get("text", "") or ""
-            applicability = "UNKNOWN"
-            reason = "No checkable house/lord condition was found in this text."
+            lower = text.lower()
+            matched: List[str] = []
 
-            for pattern, kind in RULE_CONDITION_PATTERNS:
-                match = pattern.search(text)
-                if not match:
-                    continue
+            # House mentions that are actually occupied in this chart
+            for m in HOUSE_MENTION_PATTERN.finditer(text):
+                h = int(m.group(1))
+                if h in occupied_houses:
+                    occupants = ", ".join(occupants_by_house.get(h, []))
+                    matched.append(f"{h}th house (occupied by {occupants})" if occupants else f"{h}th house")
 
-                if kind == "lord_house":
-                    src_house = int(match.group(1))
-                    claimed_house = int(match.group(2))
-                    lord = chart["house_lords"].get(src_house)
-                    if not lord:
-                        applicability = "UNKNOWN"
-                        reason = f"Could not determine the {src_house}th house lord for this chart."
-                        break
-                    actual_house = chart["planets"].get(lord, {}).get("house")
-                    if actual_house is None:
-                        applicability = "UNKNOWN"
-                        reason = f"Could not determine {lord}'s actual house placement."
-                    elif actual_house == claimed_house:
-                        applicability = "MATCH"
-                        reason = f"{src_house}th lord ({lord}) is actually in the {claimed_house}th house — condition satisfied."
-                    else:
-                        applicability = "NO_MATCH"
-                        reason = f"Rule requires {src_house}th lord in {claimed_house}th house, but {lord} is actually in the {actual_house}th house."
-                    break
+            # "Nth lord" phrases that match this chart's actual house lord
+            for m in LORD_MENTION_PATTERN.finditer(text):
+                h = int(m.group(1))
+                lord = house_lords.get(h)
+                if lord and lord.lower() in lower:
+                    matched.append(f"{h}th lord ({lord})")
+                elif lord:
+                    # The passage discusses "Nth lord" generically without
+                    # naming the planet — still a relevant conceptual
+                    # overlap since this chart's Nth lord is known.
+                    matched.append(f"{h}th lord")
 
-                if kind == "planet_house":
-                    planet = match.group(1).capitalize()
-                    claimed_house = int(match.group(2))
-                    actual_house = chart["planets"].get(planet, {}).get("house")
-                    if actual_house is None:
-                        applicability = "UNKNOWN"
-                        reason = f"Could not determine {planet}'s actual house placement."
-                    elif actual_house == claimed_house:
-                        applicability = "MATCH"
-                        reason = f"{planet} is actually in the {claimed_house}th house — condition satisfied."
-                    else:
-                        applicability = "NO_MATCH"
-                        reason = f"Rule requires {planet} in {claimed_house}th house, but {planet} is actually in the {actual_house}th house."
-                    break
+            # Planets actually present in the chart, mentioned by name
+            for planet in PLANET_NAMES:
+                if planet.lower() in lower and planet in planets_present:
+                    matched.append(planet)
 
-            hit["applicability"] = applicability
-            hit["applicability_reason"] = reason
+            # Dasha / timing relevance — passage names this chart's actual
+            # active Dasha lord, or discusses Dasha/transit generally while
+            # this chart has an active Dasha to time against.
+            if dasha_lords and any(dl.lower() in lower for dl in dasha_lords):
+                matched.append(f"Dasha ({', '.join(sorted(dasha_lords))})")
+            elif dasha_lords and ("dasha" in lower or "transit" in lower):
+                matched.append("Dasha/Timing (general)")
+
+            # Deduplicate while preserving order
+            seen = set()
+            unique_matched = []
+            for m in matched:
+                if m not in seen:
+                    seen.add(m)
+                    unique_matched.append(m)
+
+            if len(unique_matched) >= 3:
+                relevance = "HIGH"
+            elif len(unique_matched) >= 1:
+                relevance = "MEDIUM"
+            else:
+                relevance = "LOW"
+
+            hit["relevance"] = relevance
+            hit["relevance_factors"] = unique_matched
+            hit["relevance_note"] = (
+                f"Overlaps with {len(unique_matched)} verified chart factor(s)." if unique_matched
+                else "No direct overlap found with this chart's verified houses, lords, planets, or active Dasha — general classical principle only."
+            )
 
         return rag_hits
 
-    def _build_rule_applicability_block(self, evaluated_hits: List[Dict[str, Any]]) -> str:
-        checkable = [h for h in evaluated_hits if h.get("applicability") in ("MATCH", "NO_MATCH")]
-        unknown = [h for h in evaluated_hits if h.get("applicability") == "UNKNOWN"]
-
-        if not checkable and not unknown:
+    def _build_evidence_relevance_block(self, evaluated_hits: List[Dict[str, Any]]) -> str:
+        if not evaluated_hits:
             return ""
 
+        high = [h for h in evaluated_hits if h.get("relevance") == "HIGH"]
+        medium = [h for h in evaluated_hits if h.get("relevance") == "MEDIUM"]
+        low = [h for h in evaluated_hits if h.get("relevance") == "LOW"]
+
+        if not high and not medium and not low:
+            return ""
+
+        def _fmt(hit: Dict[str, Any]) -> str:
+            source = hit.get("source", "Unknown")
+            page = hit.get("page")
+            page_label = f", p.{page}" if page is not None else ""
+            factors = hit.get("relevance_factors") or []
+            factors_str = "; ".join(factors) if factors else "no direct overlap with this chart's specific facts"
+            return f"[{source}{page_label}] Relevant chart factors: {factors_str}"
+
         lines = [
-            "RULE APPLICABILITY (deterministically checked against this chart — NOT the LLM's judgment):"
+            "EVIDENCE RELEVANCE TO THIS CHART (each retrieved passage checked against the VERIFIED "
+            "chart facts — not a pass/fail rule check, but which of this chart's actual houses, house "
+            "lords, planets, and active Dasha the passage actually discusses):"
         ]
-        for hit in checkable:
-            status = hit["applicability"]
-            source = hit.get("source", "Unknown")
-            page = hit.get("page")
-            page_label = f", p.{page}" if page is not None else ""
-            marker = "✓ MATCH" if status == "MATCH" else "✗ NO_MATCH"
-            lines.append(f"[{marker}] [{source}{page_label}] {hit['applicability_reason']}")
 
-        for hit in unknown[:3]:
-            source = hit.get("source", "Unknown")
-            page = hit.get("page")
-            page_label = f", p.{page}" if page is not None else ""
-            lines.append(f"[? UNKNOWN] [{source}{page_label}] {hit['applicability_reason']}")
+        if high:
+            lines.append("\nHIGH relevance — multiple chart factors overlap (safe to ground specific claims on):")
+            for hit in high:
+                lines.append(f"✓ {_fmt(hit)}")
 
-        no_match_count = sum(1 for h in checkable if h["applicability"] == "NO_MATCH")
-        if no_match_count > 0:
+        if medium:
+            lines.append("\nMEDIUM relevance — some chart factor overlap (usable as supporting context):")
+            for hit in medium:
+                lines.append(f"~ {_fmt(hit)}")
+
+        if low:
             lines.append(
-                f"\nSTRICT RULE: {no_match_count} rule(s) above are marked NO_MATCH — their stated "
-                f"condition does NOT hold for this chart. Do NOT apply, cite, or base any claim on a "
-                f"NO_MATCH rule as if it described this user's chart. Only MATCH rules may be used as "
-                f"grounding for chart-specific claims."
+                f"\nLOW relevance — {len(low)} source(s) with no specific overlap found "
+                f"(general classical framework only, not tied to this chart's exact placements):"
             )
+            for hit in low[:3]:
+                lines.append(f"· {_fmt(hit)}")
+
+        lines.append(
+            "\nSTRICT RULE: HIGH and MEDIUM relevance evidence may be used to ground chart-specific "
+            "claims (e.g. 'because your 10th lord Mercury sits in the 1st house...'). LOW-relevance "
+            "evidence may only support GENERAL classical principles (e.g. 'classical texts examine the "
+            "10th, 9th, 11th and 2nd houses for profession') — do not present it as if it describes this "
+            "specific chart's placements."
+        )
         return "\n".join(lines)
 
     def _build_structured_evidence_table(self, rag_hits: List[Dict[str, Any]], session: Dict,
@@ -479,7 +549,7 @@ class ChatService:
 
             matched_rule = None
             matched_source = None
-            matched_applicability = None
+            matched_relevance = None
             house_pattern = re.compile(rf"\b{house}(?:st|nd|rd|th)\s+house\b", re.IGNORECASE)
             for hit in rag_hits:
                 text = hit.get("text", "") or ""
@@ -493,12 +563,12 @@ class ChatService:
                 matched_rule = snippet
                 page = hit.get("page")
                 matched_source = f"{hit.get('source', 'Unknown')}" + (f", p.{page}" if page is not None else "")
-                matched_applicability = hit.get("applicability", "UNKNOWN")
+                matched_relevance = hit.get("relevance", "LOW")
                 break
 
             if matched_rule:
-                app_tag = f" [{matched_applicability}]" if matched_applicability else ""
-                rows.append(f"| {fact_str} | {matched_rule}{app_tag} | {matched_source} |")
+                relevance_tag = f" [{matched_relevance} relevance]" if matched_relevance else ""
+                rows.append(f"| {fact_str} | {matched_rule}{relevance_tag} | {matched_source} |")
             else:
                 rows.append(f"| {fact_str} | No retrieved rule matches this exact placement — do not invent one | — |")
 
@@ -1440,7 +1510,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             all_hits = framework_rag_hits + comparison_hits + personalized_rag_hits
 
-            all_hits = self._evaluate_rule_applicability(all_hits, session)
+            # Evidence Relevance Engine — tags each hit with which of THIS
+            # chart's actual factors (occupied houses, house lords, planets,
+            # active Dasha lords) it overlaps with. See
+            # _evaluate_evidence_relevance for the full rationale.
+            all_hits = self._evaluate_evidence_relevance(all_hits, session)
 
             context_parts = []
             if framework_chunks:
@@ -1793,7 +1867,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         if self._is_followup_retrieval_question(message_text, history):
             context_str, rag_hits = self._get_followup_rag_context(message_text, topic, history)
             if rag_hits:
-                rag_hits = self._evaluate_rule_applicability(rag_hits, session)
+                rag_hits = self._evaluate_evidence_relevance(rag_hits, session)
         if not rag_hits:
             context_str, rag_hits, targeted_facts, referenced = self._get_rag_first_context(
                 session_id, message_text, topic, session, query_understanding
@@ -1832,10 +1906,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         if bucketed_evidence:
             final_kundli_data = f"{final_kundli_data}\n\n{bucketed_evidence}" if final_kundli_data else bucketed_evidence
 
-        # --- Rule Applicability Engine block ---
-        applicability_block = self._build_rule_applicability_block(rag_hits)
-        if applicability_block:
-            final_kundli_data = f"{final_kundli_data}\n\n{applicability_block}" if final_kundli_data else applicability_block
+        # --- Evidence Relevance Engine block ---
+        relevance_block = self._build_evidence_relevance_block(rag_hits)
+        if relevance_block:
+            final_kundli_data = f"{final_kundli_data}\n\n{relevance_block}" if final_kundli_data else relevance_block
 
         evidence_table = self._build_structured_evidence_table(rag_hits, session, referenced)
         if evidence_table:
@@ -1871,7 +1945,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             "referenced": referenced,
             "evidence_table": evidence_table,
             "bucketed_evidence": bucketed_evidence,
-            "applicability_block": applicability_block,
+            "relevance_block": relevance_block,
             "sufficiency": sufficiency,
             "contradiction": contradiction,
             "final_kundli_data": final_kundli_data,
@@ -2065,7 +2139,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             try:
                 trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], response_text,
                                                      ctx["query_understanding"], ctx.get("evidence_table", ""), ctx.get("bucketed_evidence", ""),
-                                                     ctx.get("sufficiency"), claim_mapping, ctx.get("contradiction"), ctx.get("applicability_block", ""),
+                                                     ctx.get("sufficiency"), claim_mapping, ctx.get("contradiction"), ctx.get("relevance_block", ""),
                                                      ctx.get("intent"), ctx.get("response_contract"))
                 db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
             except Exception as trace_err:
@@ -2186,7 +2260,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             try:
                 trace = self._build_reasoning_trace(session, topic, ctx["rag_hits"], ctx["targeted_facts"], full_text,
                                                      ctx["query_understanding"], ctx.get("evidence_table", ""), ctx.get("bucketed_evidence", ""),
-                                                     ctx.get("sufficiency"), claim_mapping, ctx.get("contradiction"), ctx.get("applicability_block", ""),
+                                                     ctx.get("sufficiency"), claim_mapping, ctx.get("contradiction"), ctx.get("relevance_block", ""),
                                                      ctx.get("intent"), ctx.get("response_contract"))
                 db.update_session(session_id, {"last_reasoning_trace": json.dumps(trace)})
             except Exception as trace_err:
@@ -2213,8 +2287,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
     #  2. Topic & Intent Resolution
     #  3. Classical Framework Retrieved
     #  4. Relevant Chart Factors
-    #  5. Kundli Fact Verification            <-- NEW
-    #  6. Rule Applicability Analysis
+    #  5. Kundli Fact Verification
+    #  6. Evidence Retrieved Against Chart Factors   <-- REPLACES Rule Applicability
     #  7. Evidence Bucketed by Type
     #  8. Personalized + Comparative Evidence Retrieved
     #  9. Evidence Consensus (incl. contradiction analysis)
@@ -2237,7 +2311,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         sufficiency: Optional[Dict[str, Any]] = None,
         claim_mapping: Optional[List[Dict[str, str]]] = None,
         contradiction: Optional[Dict[str, Any]] = None,
-        applicability_block: str = "",
+        relevance_block: str = "",
         intent: Optional[str] = None,
         response_contract: Optional[str] = None,
     ) -> list:
@@ -2320,22 +2394,35 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 chart_detail = "No targeted chart facts were identified from the retrieved classical framework."
             steps.append({"step": 4, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
 
-            # ---------------- STEP 5 — KUNDLI FACT VERIFICATION (NEW) ----------------
+            # ---------------- STEP 5 — KUNDLI FACT VERIFICATION ----------------
             verification = self._build_kundli_fact_verification_trace(session)
             steps.append({
                 "step": 5, "title": "Kundli Fact Verification",
                 "detail": verification["detail"], "type": "kundli_verification"
             })
 
-            # ---------------- STEP 6 — RULE APPLICABILITY ANALYSIS ----------------
-            if applicability_block:
-                rule_app_detail = applicability_block
+            # ---------------- STEP 6 — EVIDENCE RETRIEVED AGAINST CHART FACTORS ----------------
+            # Replaces the old binary Rule Applicability (MATCH/NO_MATCH/UNKNOWN)
+            # check. We are not proving retrieved rules true or false against
+            # this chart — we are showing which of the chart's ACTUAL,
+            # verified factors (occupied houses, house lords, planets, active
+            # Dasha) each retrieved passage discusses, so the synthesis step
+            # can weigh multiple relevant classical factors together, the way
+            # the source texts themselves recommend (e.g. examining the
+            # 10th/9th/11th/2nd houses, their lords, significator planets,
+            # and Dasha together for a profession question).
+            if relevance_block:
+                relevance_detail = relevance_block
             else:
-                rule_app_detail = (
-                    "No checkable house/lord conditions were found in the retrieved classical text for "
-                    "this question — none of the retrieved rules matched the deterministic pattern-checker."
+                relevance_detail = (
+                    "No retrieved classical evidence could be checked for chart-factor relevance for "
+                    "this question — either no evidence was retrieved, or verified chart data was "
+                    "unavailable."
                 )
-            steps.append({"step": 6, "title": "Rule Applicability Analysis", "detail": rule_app_detail, "type": "rule_applicability"})
+            steps.append({
+                "step": 6, "title": "Evidence Retrieved Against Chart Factors",
+                "detail": relevance_detail, "type": "evidence_relevance"
+            })
 
             # ---------------- STEP 7 — EVIDENCE BUCKETED BY TYPE ----------------
             bucket_detail = bucketed_evidence if bucketed_evidence else "No bucketed evidence categories were populated for this question."
@@ -2494,8 +2581,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     reference += f" [{stage}]"
                 if hit.get("branch"):
                     reference += f" (option: {hit['branch']})"
-                if hit.get("applicability"):
-                    reference += f" [{hit['applicability']}]"
+                if hit.get("relevance"):
+                    reference += f" [{hit['relevance']} relevance]"
                 reference_lines.append(f"• {reference}")
 
             ranking_header = "Reranked: semantic + lexical\nDeduplicated: ✓\n\nTop evidence:\n"
@@ -2505,7 +2592,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             # ---------------- STEP 12 — EVIDENCE SYNTHESIS (+ sufficiency) ----------------
             synthesis_lines = [
                 "The final interpretation combines the bucketed evidence (classical rule / Dasha timing / "
-                "Yoga, kept as distinct categories), the Rule Applicability Engine's MATCH/NO_MATCH checks, "
+                "Yoga, kept as distinct categories), the Evidence Relevance Engine's chart-factor overlap "
+                "checks (how many of this chart's actual houses/lords/planets/Dasha each source discusses), "
                 "the structured Fact→Rule table, verified chart placements (re-derived fresh from the raw "
                 "Kundli API response on every check), comparative branch analysis, timing-gated Dasha data "
                 "(sourced exclusively from the real Dasha API, with no local fallback calculation), "

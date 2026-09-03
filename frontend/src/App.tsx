@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { ChatWindow } from './components/ChatWindow';
 import { ChatInput } from './components/ChatInput';
 import { ProfileCard } from './components/ProfileCard';
-import { Sparkles, Database, CheckCircle, ArrowLeft, Download, Trash2, RotateCcw } from 'lucide-react';
+import { Sparkles, Database, CheckCircle, ArrowLeft, Download, Trash2, RotateCcw, Heart } from 'lucide-react';
 import OnboardingForm from './components/OnboardingForm';
 import KundliChartToggle from './components/KundliChartToggle';
 import LifeDashboard from './components/LifeDashboard';
@@ -13,6 +13,7 @@ import FaqStarter from './components/FaqStarter';
 import ReasoningTrace from './components/ReasoningTrace';
 import KundliReportButton from './components/KundliReportButton';
 import CouplePage from './components/CouplePage';
+
 interface Message { role: 'user' | 'assistant' | 'system'; content: string; timestamp?: string; }
 interface IngestStatus { indexing_completed: boolean; total_chunks: number; loading: boolean; }
 
@@ -32,12 +33,14 @@ const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_MAX_ATTEMPTS = 60; // 60 * 4s = 240s
 
 type ChartStatus = 'idle' | 'loading' | 'ready' | 'failed';
+type ViewMode = 'dashboard' | 'chat' | 'couple';
 
 function App() {
   const [sessionId, setSessionId] = useState<string>('');
   const [onboarded, setOnboarded] = useState<boolean>(false);
   const [checkingProfile, setCheckingProfile] = useState<boolean>(true);
-  const [view, setView] = useState<'dashboard' | 'chat' | 'couple'>('dashboard');
+  const [view, setView] = useState<ViewMode>('dashboard');
+
   const [name, setName] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [dob, setDob] = useState<string | null>(null);
@@ -409,9 +412,13 @@ function App() {
       </div>
     );
   };
+
+  // ---------------- COUPLE TEST VIEW ----------------
   if (view === 'couple') {
-  return <CouplePage language={language} onBack={() => setView('dashboard')} />;
+    return <CouplePage language={language} onBack={() => setView('dashboard')} />;
   }
+
+  // ---------------- DASHBOARD VIEW ----------------
   if (view === 'dashboard') {
     const greetingFn = GREETINGS[language] || GREETINGS.Hinglish;
     const greeting = name ? greetingFn(name) : '';
@@ -426,9 +433,17 @@ function App() {
               <p className="text-[10px] text-slate-400 font-medium mt-0.5">{greeting || 'Your Dashboard'}</p>
             </div>
           </div>
-          {kundliPlanets && ascendantSign && (
-            <KundliReportButton sessionId={sessionId} language={language} name={name} />
-          )}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setView('couple')}
+              className="flex items-center gap-1.5 text-xs font-semibold text-white bg-rose-500 hover:bg-rose-600 px-3 py-2 rounded-lg shadow-sm transition"
+            >
+              <Heart size={14} /> Couple Test
+            </button>
+            {kundliPlanets && ascendantSign && (
+              <KundliReportButton sessionId={sessionId} language={language} name={name} />
+            )}
+          </div>
         </header>
 
         <div className="flex-1 overflow-y-auto p-6">
@@ -441,12 +456,7 @@ function App() {
               {renderChartPanel()}
               <LifeDashboard sessionId={sessionId} language={language} />
             </div>
-            <button
-  onClick={() => setView('couple')}
-  className="flex items-center gap-1.5 text-xs font-semibold text-white bg-rose-500 hover:bg-rose-600 px-3 py-2 rounded-lg shadow-sm transition"
->
-  💑 Couple Test
-</button>
+
             <GoToChatCard language={language} onGoToChat={() => setView('chat')} />
           </div>
         </div>
@@ -479,6 +489,7 @@ function App() {
     );
   }
 
+  // ---------------- CHAT VIEW ----------------
   return (
     <div className="flex flex-col h-full bg-slate-50">
       {!ingestStatus.loading && !ingestStatus.indexing_completed && (

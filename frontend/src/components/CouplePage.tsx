@@ -77,6 +77,7 @@ interface ChildbirthAnalysis {
     window_evidence?: string | null;
   };
 }
+
 interface ChatMsg {
   role: string;
   content: string;
@@ -87,6 +88,14 @@ const VERDICT_STYLES: Record<string, string> = {
   challenging: 'bg-rose-50 text-rose-700 border-rose-200',
   mixed: 'bg-amber-50 text-amber-700 border-amber-200',
   neutral: 'bg-slate-100 text-slate-500 border-slate-200',
+};
+
+const VERDICT_BADGE_STYLES: Record<string, string> = {
+  Strong: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  Favorable: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  'Mixed / Moderate': 'bg-amber-50 text-amber-700 border-amber-200',
+  Challenged: 'bg-rose-50 text-rose-700 border-rose-200',
+  Weak: 'bg-rose-50 text-rose-700 border-rose-200',
 };
 
 const emptyPartner: PartnerForm = { name: '', dob: '', birthTime: '', birthPlace: '' };
@@ -107,6 +116,9 @@ export default function CouplePage({ language, onBack }: CouplePageProps) {
   const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatSending, setChatSending] = useState(false);
+
+  const [knownOutcome, setKnownOutcome] = useState('');
+  const [outcomeSaved, setOutcomeSaved] = useState(false);
 
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollingFor = useRef<string | null>(null);
@@ -243,25 +255,24 @@ export default function CouplePage({ language, onBack }: CouplePageProps) {
       setSubmitting(false);
     }
   };
-  const [knownOutcome, setKnownOutcome] = useState('');
-  const [outcomeSaved, setOutcomeSaved] = useState(false);
 
   const handleSaveOutcome = async () => {
-   if (!coupleId) return;
-   try {
-    const res = await fetch(`${API_BASE}/couple/${coupleId}/known-outcome`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ outcome: knownOutcome.trim() }),
-    });
-     if (res.ok) {
-      setOutcomeSaved(true);
-      setTimeout(() => setOutcomeSaved(false), 2000);
+    if (!coupleId) return;
+    try {
+      const res = await fetch(`${API_BASE}/couple/${coupleId}/known-outcome`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ outcome: knownOutcome.trim() }),
+      });
+      if (res.ok) {
+        setOutcomeSaved(true);
+        setTimeout(() => setOutcomeSaved(false), 2000);
+      }
+    } catch (err) {
+      console.error('Failed to save known outcome:', err);
     }
-  }  catch (err) {
-    console.error('Failed to save known outcome:', err);
-  }
-};
+  };
+
   const retryLoading = () => {
     if (!coupleId) return;
     setLoadError(null);
@@ -280,6 +291,7 @@ export default function CouplePage({ language, onBack }: CouplePageProps) {
     setLoadError(null);
     setP1Form(emptyPartner);
     setP2Form(emptyPartner);
+    setKnownOutcome('');
   };
 
   const handleSendChat = async () => {
@@ -353,99 +365,78 @@ export default function CouplePage({ language, onBack }: CouplePageProps) {
     </div>
   );
 
-  const VERDICT_BADGE_STYLES: Record<string, string> = {
-  Strong: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-  Favorable: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-  'Mixed / Moderate': 'bg-amber-50 text-amber-700 border-amber-200',
-  Challenged: 'bg-rose-50 text-rose-700 border-rose-200',
-  Weak: 'bg-rose-50 text-rose-700 border-rose-200',
-};
+  const renderAssessmentRow = (label: string, a: PlanetAssessment | null) => {
+    if (!a) return (
+      <div className="flex justify-between text-xs">
+        <span className="text-slate-400">{label}</span>
+        <span className="text-slate-400">—</span>
+      </div>
+    );
+    return (
+      <div className="text-xs py-1.5 border-b border-slate-50 last:border-0">
+        <div className="flex justify-between items-start gap-2">
+          <span className="text-slate-400 shrink-0">{label}</span>
+          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${VERDICT_BADGE_STYLES[a.verdict] || 'bg-slate-100 text-slate-500 border-slate-200'}`}>
+            {a.verdict}
+          </span>
+        </div>
+        <p className="text-slate-600 mt-1 leading-snug">{a.reason}</p>
+        {a.lordships && a.lordships.length > 0 && (
+          <p className="text-slate-400 text-[10px] mt-0.5">Rules house{a.lordships.length > 1 ? 's' : ''} {a.lordships.join(', ')}</p>
+        )}
+      </div>
+    );
+  };
 
-const renderAssessmentRow = (label: string, a: PlanetAssessment | null) => {
-  if (!a) return (
-    <div className="flex justify-between text-xs">
-      <span className="text-slate-400">{label}</span>
-      <span className="text-slate-400">—</span>
-    </div>
-  );
-  return (
-    <div className="text-xs py-1.5 border-b border-slate-50 last:border-0">
-      <div className="flex justify-between items-start gap-2">
-        <span className="text-slate-400 shrink-0">{label}</span>
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${VERDICT_BADGE_STYLES[a.verdict] || 'bg-slate-100 text-slate-500 border-slate-200'}`}>
-          {a.verdict}
+  const renderPartnerFactsCard = (name: string, report: PartnerReport) => (
+    <div className="bg-white border border-slate-200 rounded-2xl p-5">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-bold text-slate-800">{name}</h3>
+        <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border capitalize ${VERDICT_STYLES[report.verdict] || VERDICT_STYLES.neutral}`}>
+          {report.verdict}
         </span>
       </div>
-      <p className="text-slate-600 mt-1 leading-snug">{a.reason}</p>
-      {a.lordships && a.lordships.length > 0 && (
-        <p className="text-slate-400 text-[10px] mt-0.5">Rules house{a.lordships.length > 1 ? 's' : ''} {a.lordships.join(', ')}</p>
+
+      <div className="space-y-1 mb-2">
+        <div className="flex justify-between text-xs">
+          <span className="text-slate-400">5th House Sign</span>
+          <span className="font-medium text-slate-800">{report.facts.sign || '—'}</span>
+        </div>
+        <div className="flex justify-between text-xs">
+          <span className="text-slate-400">5th House Lord</span>
+          <span className="font-medium text-slate-800">{report.facts.lord || '—'}</span>
+        </div>
+        <div className="flex justify-between text-xs">
+          <span className="text-slate-400">Planets in 5th</span>
+          <span className="font-medium text-slate-800">
+            {report.facts.occupants.length ? report.facts.occupants.map((o) => o.name).join(', ') : 'None'}
+          </span>
+        </div>
+        <div className="flex justify-between text-xs">
+          <span className="text-slate-400">Current Dasha (as of today)</span>
+          <span className="font-medium text-slate-800">{report.current_dasha || '—'}</span>
+        </div>
+      </div>
+
+      <div className="mt-3 pt-2 border-t border-slate-100">
+        {renderAssessmentRow('5th Lord Strength', report.facts.lord_assessment)}
+        {renderAssessmentRow('Jupiter (Child Significator)', report.facts.significator_assessment)}
+      </div>
+
+      {report.favorable_periods.length > 0 && (
+        <div className="mt-3 pt-3 border-t border-slate-100">
+          <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-1.5">
+            Future Favorable Periods {report.window_start ? `(${report.window_start} – ${report.window_end})` : ''}
+          </p>
+          {report.favorable_periods.slice(0, 3).map((p, i) => (
+            <p key={i} className="text-xs text-slate-600">
+              {p.mahadasha}/{p.antardasha}: {p.start.split(' ')[0]} – {p.end.split(' ')[0]}
+            </p>
+          ))}
+        </div>
       )}
     </div>
   );
-};
-
-const renderPartnerFactsCard = (name: string, report: PartnerReport) => (
-  <div className="bg-white border border-slate-200 rounded-2xl p-5">
-    <div className="flex items-center justify-between mb-3">
-      <h3 className="text-sm font-bold text-slate-800">{name}</h3>
-      <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border capitalize ${VERDICT_STYLES[report.verdict] || VERDICT_STYLES.neutral}`}>
-        {report.verdict}
-      </span>
-    </div>
-    <div className="space-y-1 mb-2">
-      <div className="flex justify-between text-xs">
-        <span className="text-slate-400">5th House Sign</span>
-        <span className="font-medium text-slate-800">{report.facts.sign || '—'}</span>
-      </div>
-      <div className="flex justify-between text-xs">
-        <span className="text-slate-400">5th House Lord</span>
-        <span className="font-medium text-slate-800">{report.facts.lord || '—'}</span>
-      </div>
-      <div className="flex justify-between text-xs">
-        <span className="text-slate-400">Planets in 5th</span>
-        <span className="font-medium text-slate-800">
-          {report.facts.occupants.length ? report.facts.occupants.map((o) => o.name).join(', ') : 'None'}
-        </span>
-      </div>
-      <div className="flex justify-between text-xs">
-        <span className="text-slate-400">Current Dasha (as of today)</span>
-        <span className="font-medium text-slate-800">{report.current_dasha || '—'}</span>
-      </div> 
-      {report.favorable_periods.length > 0 && (
-       <div className="mt-3 pt-3 border-t border-slate-100">
-        <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-1.5">
-           Future Favorable Periods {report.window_start ? `(${report.window_start} – ${report.window_end})` : ''}
-        </p>
-        {report.favorable_periods.slice(0, 3).map((p, i) => (
-          <p key={i} className="text-xs text-slate-600">
-            {p.mahadasha}/{p.antardasha}: {p.start.split(' ')[0]} – {p.end.split(' ')[0]}
-          </p>
-        ))}
-       </div>
-)}
-      <div className="flex justify-between text-xs">
-        <span className="text-slate-400">Current Dasha</span>
-        <span className="font-medium text-slate-800">{report.current_dasha || '—'}</span>
-      </div>
-    </div>
-
-    <div className="mt-3 pt-2 border-t border-slate-100">
-      {renderAssessmentRow('5th Lord Strength', report.facts.lord_assessment)}
-      {renderAssessmentRow('Jupiter (Child Significator)', report.facts.significator_assessment)}
-    </div>
-
-    {report.favorable_periods.length > 0 && (
-      <div className="mt-3 pt-3 border-t border-slate-100">
-        <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-1.5">Favorable Upcoming Periods</p>
-        {report.favorable_periods.slice(0, 3).map((p, i) => (
-          <p key={i} className="text-xs text-slate-600">
-            {p.mahadasha}/{p.antardasha}: {p.start.split(' ')[0]} – {p.end.split(' ')[0]}
-          </p>
-        ))}
-      </div>
-    )}
-  </div>
-);
 
   return (
     <div className="flex flex-col h-full bg-slate-50">
@@ -540,27 +531,29 @@ const renderPartnerFactsCard = (name: string, report: PartnerReport) => (
                       {renderPartnerFactsCard(childbirth.partner2_name, childbirth.partner2_report)}
                     </div>
                   </div>
+
                   <div className="bg-white border border-slate-200 rounded-2xl p-5">
-                   <h2 className="text-sm font-bold text-slate-800 mb-1">Known Real-World Outcome (optional)</h2>
-                   <p className="text-xs text-slate-400 mb-3">
+                    <h2 className="text-sm font-bold text-slate-800 mb-1">Known Real-World Outcome (optional)</h2>
+                    <p className="text-xs text-slate-400 mb-3">
                       If you're testing a known case, tell the system what actually happened —
                       it will use this as ground truth instead of guessing from the chart alone.
-                   </p>
-                   <div className="flex gap-2">
-                     <input
-                         value={knownOutcome}
-                         onChange={(e) => setKnownOutcome(e.target.value)}
-                         placeholder="e.g. Married ~6 years, no child as of 2026"
-                         className="flex-1 rounded-lg border border-slate-200 px-3 py-2 text-sm"
-                     />
-                     <button
-                           onClick={handleSaveOutcome}
-                           className="px-3 py-2 rounded-lg text-xs font-semibold bg-slate-900 text-white hover:bg-slate-800 transition shrink-0"
-                     >
-                           {outcomeSaved ? 'Saved ✓' : 'Save'}
-                     </button>
+                    </p>
+                    <div className="flex gap-2">
+                      <input
+                        value={knownOutcome}
+                        onChange={(e) => setKnownOutcome(e.target.value)}
+                        placeholder="e.g. Married ~6 years, no child as of 2026"
+                        className="flex-1 rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                      />
+                      <button
+                        onClick={handleSaveOutcome}
+                        className="px-3 py-2 rounded-lg text-xs font-semibold bg-slate-900 text-white hover:bg-slate-800 transition shrink-0"
+                      >
+                        {outcomeSaved ? 'Saved ✓' : 'Save'}
+                      </button>
                     </div>
                   </div>
+
                   <div className="bg-white border border-slate-200 rounded-2xl p-5">
                     <div className="flex items-center justify-between mb-3">
                       <h2 className="text-sm font-bold text-slate-800">Joint Couple Analysis</h2>
@@ -598,16 +591,17 @@ const renderPartnerFactsCard = (name: string, report: PartnerReport) => (
                       )}
                       <p className="text-[10px] text-slate-300 mt-1">Only periods starting after today are considered as future predictions.</p>
                     </div>
+
                     {childbirth.joint.window_evidence && (
-                     <div className="mt-3 pt-3 border-t border-slate-100">
-                       <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-1.5">
-                        Why This Window — Evidence Chain
-                       </p>
-                       <pre className="text-xs text-slate-600 whitespace-pre-wrap font-sans leading-relaxed">
-                         {childbirth.joint.window_evidence}
-                       </pre>
-                     </div>
-)}
+                      <div className="mt-3 pt-3 border-t border-slate-100">
+                        <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-1.5">
+                          Why This Window — Evidence Chain
+                        </p>
+                        <pre className="text-xs text-slate-600 whitespace-pre-wrap font-sans leading-relaxed">
+                          {childbirth.joint.window_evidence}
+                        </pre>
+                      </div>
+                    )}
                   </div>
                 </>
               ) : (

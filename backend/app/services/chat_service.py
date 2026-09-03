@@ -261,11 +261,43 @@ class ChatService:
             print(f"house lord = {lord} for house {house_num} (ascendant {ascendant_sign})")
         
         
-        print("\n[5] FINAL VERIFIED CHART MAP")
+        print("\n[4] D9 VERIFICATION")
         print("-" * 90)
 
+        try:
+        # Get the full chart data that contains divisional charts.
+         kundli_full_raw = session.get("kundli_full_raw")
 
-        print(f"Ascendant: {result['ascendant']}")
+         if kundli_full_raw:
+            from app.services.kundli_service import extract_divisional_chart
+
+            d9 = extract_divisional_chart(
+                kundli_full_raw,
+                "D9"
+            )
+
+            print(f"D9 RAW RESULT: {d9}")
+
+            if d9:
+                print("\nD9 DETAILS:")
+
+                if isinstance(d9, dict):
+                    for key, value in d9.items():
+                        print(f"  {key}: {value}")
+            else:
+                print("[D9 VERIFY] WARNING: D9 extraction returned empty")
+
+         else:
+            print("[D9 VERIFY] WARNING: kundli_full_raw not available in session")
+
+        except Exception as e:
+         print(f"[D9 VERIFY] ERROR: {type(e).__name__}: {e}") 
+        
+         print("\n[5] FINAL VERIFIED CHART MAP")
+         print("-" * 90)
+
+
+         print(f"Ascendant: {result['ascendant']}")
 
         for planet, data in result["planets"].items():
          print(
@@ -846,45 +878,53 @@ class ChatService:
             logger.info(f"[EvidenceDedup] {len(hits)} hits -> {len(kept)} after semantic dedup (max={max_hits})")
         return kept
 
-    # ------------------------------------------------------------------
-    # DASHA — fetched exactly ONCE per Kundli fetch, from the REAL Dasha
-    # API only. The local Vimshottari calculation fallback has been
-    # REMOVED — it silently produced a WRONG Mahadasha/Antardasha lord in
-    # verified testing (calculated Mercury, correct value Venus). No Dasha
-    # data is safer than confidently wrong Dasha data in an astrology
-    # reading, so on any failure this now returns (None, None) and
-    # downstream prompt-building explicitly states "Dasha not available"
-    # rather than fabricating a period.
-    # ------------------------------------------------------------------
-    def _fetch_dasha_bundle(self, session: Dict, kundli_data: Dict, lat: float, lon: float,
-                              time_24h: str) -> Tuple[Optional[Dict], Optional[str]]:
-        dob = session.get("dob")
+    def _get_dasha_timeline(self, session_id: str, session: Dict, topic: Optional[str], language: str) -> str:
+        if not topic:
+            return ""
         try:
-            ascendant_data = kundli_service.get_ascendant_data(kundli_data)
-            if not ascendant_data:
-                logger.warning("No ascendant_data available — cannot fetch real dasha")
-                return None, None
-            if not dob:
-                logger.warning("No dob available — cannot fetch real dasha")
-                return None, None
+            cached_tree_raw = session.get("dasha_tree_raw")
+            dasha_tree = None
+            if cached_tree_raw:
+                try:
+                    dasha_tree = json.loads(cached_tree_raw)
+                except Exception:
+                    dasha_tree = None
 
-            dasha_tree = dasha_api_service.fetch_dasha_tree(
-                date=dob, time=time_24h, latitude=lat, longitude=lon,
-                ascendant_data=ascendant_data,
-            )
-            if dasha_tree:
-                current_period = dasha_api_service.find_current_period(dasha_tree)
-                if current_period:
-                    logger.info("Dasha fetched once from REAL API — current period + full tree both cached")
-                    return current_period, json.dumps(dasha_tree, ensure_ascii=False)
-                logger.error("Dasha tree fetched but no period matched today's date")
-            else:
-                logger.error("Real Dasha API returned no data")
-        except Exception as e:
-            logger.error(f"Real dasha API failed: {e}")
+            if dasha_tree is None:
+                time_24h = self._to_24h(session.get("birth_time", ""))
+                coords_lat = session.get("latitude")
+                coords_lon = session.get("longitude")
+                if not (coords_lat and coords_lon):
+                    return ""
 
-        logger.warning("No real Dasha data available for this session — Dasha content will note 'not available'")
-        return None, None
+                kundli_raw_full = self._get_full_kundli_response(session_id, session)
+                ascendant_data = kundli_service.get_ascendant_data(kundli_raw_full) if kundli_raw_full else None
+                if not ascendant_data:
+                    logger.warning("Could not extract ascendant_data — skipping dasha timeline")
+                    return ""
+
+                dasha_tree = dasha_api_service.fetch_dasha_tree(
+                    date=session.get("dob"), time=time_24h,
+                    latitude=coords_lat, longitude=coords_lon,
+                    ascendant_data=ascendant_data,
+                )
+                if not dasha_tree:
+                    return ""
+
+                tree_json = json.dumps(dasha_tree, ensure_ascii=False)
+                db.update_session(session_id, {"dasha_tree_raw": tree_json})
+                session["dasha_tree_raw"] = tree_json
+
+            upcoming = dasha_api_service.get_upcoming_periods(dasha_tree, months_ahead=60)
+            favorable = rank_favorable_periods(upcoming, topic)
+            timeline_str = format_dasha_timeline_for_prompt(upcoming, favorable, language)
+            logger.info(f"Dasha timeline built for topic '{topic}': {len(upcoming)} periods, {len(favorable)} favorable")
+            return timeline_str
+        except Exception as dasha_err:
+            logger.error(f"Dasha timeline fetch failed: {dasha_err}")
+            return ""
+    
+    
 
     def _fetch_and_cache_kundli(self, session_id: str, session: Dict) -> str:
         try:
@@ -898,7 +938,7 @@ class ChatService:
 
             kundli_data = kundli_service.fetch_kundli(
                 name=session.get("name") or "User",
-                date=session.get("dob"), time=time_24h, latitude=lat, longitude=lon,
+                date=session.get("dob"), birth_time=time_24h, latitude=lat, longitude=lon,
             )
             if kundli_data:
                 dasha_info, dasha_tree_json = self._fetch_dasha_bundle(session, kundli_data, lat, lon, time_24h)

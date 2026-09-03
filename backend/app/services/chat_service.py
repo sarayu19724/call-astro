@@ -211,9 +211,22 @@ class ChatService:
     def _get_verified_planet_house_map(self, session: Dict) -> Optional[Dict[str, Any]]:
         parsed = self._get_fresh_chart_data(session)
         if not parsed:
+            print("[CHART VERIFY] ERROR: No parsed Kundli data available")
             return None
         planets = parsed.get("planets", []) or []
         ascendant_sign = parsed.get("ascendant_sign")
+        print("\n[1] EXTRACTED FROM KUNDLI API")
+        print("-" * 90)
+        print(f"Ascendant Sign : {ascendant_sign}")
+        print(f"Planet Count   : {len(planets)}")
+        for p in planets:
+         print(
+            f"  {p.get('name'):10s} | "
+            f"Sign={p.get('sign_name')} | "
+            f"Retro={p.get('isRetro')}"
+        )
+
+        
         if not ascendant_sign or not planets:
             return None
 
@@ -227,18 +240,52 @@ class ChatService:
             if not name or not sign:
                 continue
             house = get_house_for_sign(sign, ascendant_sign)
+            
             result["planets"][name] = {
                 "house": house,
                 "sign": sign,
                 "retro": str(p.get("isRetro", "")).lower() == "true",
             }
+            print(
+            f"  {name:10s} | "
+            f"Sign={sign:12s} | "
+            f"House={house:2d} | "
+            
+        )
 
         for house_num in range(1, 13):
             lord = get_house_lord(house_num, ascendant_sign)
             if lord:
                 result["house_lords"][house_num] = lord
+            
+            print(f"house lord = {lord} for house {house_num} (ascendant {ascendant_sign})")
+        
+        
+        print("\n[5] FINAL VERIFIED CHART MAP")
+        print("-" * 90)
 
+
+        print(f"Ascendant: {result['ascendant']}")
+
+        for planet, data in result["planets"].items():
+         print(
+            f"  {planet:10s} → "
+            f"{data['sign']:12s} → "
+            f"House {data['house']:2d}"
+        )
+
+        print("\nHouse Lords:")
+
+        for house, lord in result["house_lords"].items():
+         print(f"  House {house:2d} → {lord}")
+
+        print("\n" + "=" * 90)
+        print("[CHART VERIFICATION — COMPLETE]")
+        print("=" * 90 + "\n")
+        
         return result
+
+  
 
     def _build_verified_chart_block(self, session: Dict) -> str:
         chart = self._get_verified_planet_house_map(session)

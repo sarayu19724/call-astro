@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config.settings import settings
 from app.utils.logger import logger
-from app.api import chat, session, ingest, house_insight,report   # ← added house_insight
+from app.api import chat, session, ingest, house_insight,report,couple   # ← added house_insight
 from app.memory.database import db
 from app.rag.indexer import document_indexer
 from app.rag.vector_store import vector_store
@@ -55,6 +55,7 @@ app.include_router(chat.router, prefix="/api")
 app.include_router(session.router, prefix="/api")
 app.include_router(ingest.router, prefix="/api")
 app.include_router(house_insight.router, prefix="/api")   # ← added
+app.include_router(couple.router, prefix="/api")
 app.include_router(report.router, prefix="/api")   # ← added
 @app.get("/")
 async def root():

@@ -12,7 +12,7 @@ import WeeklyGuidance from './components/WeeklyGuidance';
 import FaqStarter from './components/FaqStarter';
 import ReasoningTrace from './components/ReasoningTrace';
 import KundliReportButton from './components/KundliReportButton';
-
+import CouplePage from './components/CouplePage';
 interface Message { role: 'user' | 'assistant' | 'system'; content: string; timestamp?: string; }
 interface IngestStatus { indexing_completed: boolean; total_chunks: number; loading: boolean; }
 
@@ -37,8 +37,7 @@ function App() {
   const [sessionId, setSessionId] = useState<string>('');
   const [onboarded, setOnboarded] = useState<boolean>(false);
   const [checkingProfile, setCheckingProfile] = useState<boolean>(true);
-  const [view, setView] = useState<'dashboard' | 'chat'>('dashboard');
-
+  const [view, setView] = useState<'dashboard' | 'chat' | 'couple'>('dashboard');
   const [name, setName] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [dob, setDob] = useState<string | null>(null);
@@ -410,7 +409,9 @@ function App() {
       </div>
     );
   };
-
+  if (view === 'couple') {
+  return <CouplePage language={language} onBack={() => setView('dashboard')} />;
+  }
   if (view === 'dashboard') {
     const greetingFn = GREETINGS[language] || GREETINGS.Hinglish;
     const greeting = name ? greetingFn(name) : '';
@@ -440,7 +441,12 @@ function App() {
               {renderChartPanel()}
               <LifeDashboard sessionId={sessionId} language={language} />
             </div>
-
+            <button
+  onClick={() => setView('couple')}
+  className="flex items-center gap-1.5 text-xs font-semibold text-white bg-rose-500 hover:bg-rose-600 px-3 py-2 rounded-lg shadow-sm transition"
+>
+  💑 Couple Test
+</button>
             <GoToChatCard language={language} onGoToChat={() => setView('chat')} />
           </div>
         </div>

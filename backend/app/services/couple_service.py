@@ -48,7 +48,7 @@ def fetch_partner_chart_bundle(name: str, dob: str, birth_time: str, birth_place
         ascendant_data = kundli_service.get_ascendant_data(kundli_data)
         if ascendant_data:
             dasha_tree = dasha_api_service.fetch_dasha_tree(
-                date=dob, birth_time=time_24h, latitude=lat, longitude=lon,
+                date=dob, time=time_24h, latitude=lat, longitude=lon,
                 ascendant_data=ascendant_data,
             )
             if dasha_tree:

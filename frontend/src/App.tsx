@@ -11,6 +11,7 @@ import GoToChatCard from './components/GoToChatCard';
 import WeeklyGuidance from './components/WeeklyGuidance';
 import FaqStarter from './components/FaqStarter';
 import ReasoningTrace from './components/ReasoningTrace';
+import KundliReportButton from './components/KundliReportButton';
 
 interface Message { role: 'user' | 'assistant' | 'system'; content: string; timestamp?: string; }
 interface IngestStatus { indexing_completed: boolean; total_chunks: number; loading: boolean; }
@@ -23,10 +24,14 @@ const GREETINGS: Record<string, (name: string) => string> = {
   Hinglish: (name) => `Hey ${name}!`,
 };
 
-// Chart-loading tuning: poll fast at first (kundli fetch is usually a
-// couple seconds), back off, and give up with a manual retry after ~90s
-// total instead of spinning forever.
-const CHART_POLL_INTERVALS_MS = [1500, 1500, 2000, 2000, 3000, 3000, 5000, 5000, 5000, 5000, 8000, 8000];
+// Chart calculation genuinely can take 1-3 minutes (Kundli lambda retries
+// + Dasha lambda retries stacked). Poll status (cheap DB read) rather than
+// re-triggering the fetch, and keep polling for up to ~4 minutes before
+// calling it stuck — matching the backend's own stale-pending window.
+const STATUS_POLL_INTERVAL_MS = 4000;
+const STATUS_POLL_MAX_ATTEMPTS = 60; // 60 * 4s = 240s
+
+type ChartStatus = 'idle' | 'loading' | 'ready' | 'failed';
 
 function App() {
   const [sessionId, setSessionId] = useState<string>('');
@@ -52,10 +57,11 @@ function App() {
   const [ingestStatus, setIngestStatus] = useState<IngestStatus>({ indexing_completed: false, total_chunks: 0, loading: true });
 
   // --- Chart loading state ---
-  const [chartStatus, setChartStatus] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle');
+  const [chartStatus, setChartStatus] = useState<ChartStatus>('idle');
+  const [chartError, setChartError] = useState<string | null>(null);
   const chartPollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chartPollAttempt = useRef(0);
-  const chartPollingFor = useRef<string | null>(null); // guards against stale timers after session reset
+  const chartPollingFor = useRef<string | null>(null);
 
   useEffect(() => {
     let sid = localStorage.getItem('call-astro_session_id');
@@ -97,15 +103,9 @@ function App() {
   }, [sessionId]);
 
   // ------------------------------------------------------------------
-  // CHART LOADING — replaces the old "fetch once on mount / messages
-  // change" effect. Two entry points feed into the same poll loop:
-  //   1. Onboarding just completed -> we kick off a backend fetch AND
-  //      start polling for the result.
-  //   2. Dashboard mounts with an already-onboarded session that has no
-  //      chart yet (e.g. user closed the tab before it finished last
-  //      time) -> we also kick off a fetch and start polling.
-  // The backend call (recalculate-kundli) is idempotent and safe to
-  // fire even if a fetch is already in flight elsewhere.
+  // CHART LOADING — polls the lightweight /kundli-status endpoint
+  // instead of guessing off a fixed timer. Distinguishes "still working"
+  // from "actually failed" using the real backend status + error message.
   // ------------------------------------------------------------------
   const stopChartPolling = useCallback(() => {
     if (chartPollTimer.current) {
@@ -114,7 +114,7 @@ function App() {
     }
   }, []);
 
-  const fetchChartOnce = useCallback(async (sid: string): Promise<boolean> => {
+  const fetchChartData = useCallback(async (sid: string): Promise<boolean> => {
     try {
       const res = await fetch(`${API_BASE}/session/${sid}/kundli-chart`);
       if (!res.ok) return false;
@@ -131,76 +131,88 @@ function App() {
     }
   }, []);
 
-  const pollForChart = useCallback((sid: string) => {
+  const pollChartStatus = useCallback((sid: string) => {
     stopChartPolling();
     chartPollingFor.current = sid;
     chartPollAttempt.current = 0;
     setChartStatus('loading');
+    setChartError(null);
 
     const tick = async () => {
-      if (chartPollingFor.current !== sid) return; // session changed under us, abandon
-      const ready = await fetchChartOnce(sid);
       if (chartPollingFor.current !== sid) return;
 
-      if (ready) {
-        setChartStatus('ready');
-        return;
+      try {
+        const res = await fetch(`${API_BASE}/session/${sid}/kundli-status`);
+        if (res.ok) {
+          const data = await res.json();
+          if (chartPollingFor.current !== sid) return;
+
+          if (data.status === 'ready' && data.has_chart) {
+            const ready = await fetchChartData(sid);
+            if (chartPollingFor.current !== sid) return;
+            if (ready) {
+              setChartStatus('ready');
+              return;
+            }
+            // status says ready but chart payload isn't parseable yet —
+            // treat as a transient race and keep polling briefly.
+          } else if (data.status === 'failed') {
+            setChartStatus('failed');
+            setChartError(data.error || 'Chart calculation failed. Please retry.');
+            return;
+          }
+          // status === 'pending' or 'idle' -> keep polling
+        }
+      } catch (err) {
+        console.error('Chart status poll failed:', err);
       }
 
-      const idx = chartPollAttempt.current;
-      if (idx >= CHART_POLL_INTERVALS_MS.length) {
+      const attempt = chartPollAttempt.current;
+      if (attempt >= STATUS_POLL_MAX_ATTEMPTS) {
         setChartStatus('failed');
+        setChartError('This is taking longer than expected. Please retry.');
         return;
       }
-      const delay = CHART_POLL_INTERVALS_MS[idx];
       chartPollAttempt.current += 1;
-      chartPollTimer.current = setTimeout(tick, delay);
+      chartPollTimer.current = setTimeout(tick, STATUS_POLL_INTERVAL_MS);
     };
 
     tick();
-  }, [fetchChartOnce, stopChartPolling]);
+  }, [fetchChartData, stopChartPolling]);
 
-  // Kick the backend to actually compute the chart (fire-and-forget —
-  // the poll loop above is what picks up the result once it's ready).
-  const triggerKundliFetch = useCallback((sid: string) => {
-    fetch(`${API_BASE}/session/${sid}/recalculate-kundli`, { method: 'POST' }).catch((err) => {
+  const triggerKundliFetch = useCallback(async (sid: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/session/${sid}/recalculate-kundli`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        setChartStatus('failed');
+        setChartError(body?.detail || 'Could not start chart calculation.');
+        return;
+      }
+      // Backend returns immediately with status "pending" — polling picks up the result.
+    } catch (err) {
       console.error('Failed to trigger kundli fetch:', err);
-    });
+      setChartStatus('failed');
+      setChartError('Could not reach the backend to start chart calculation.');
+    }
   }, []);
 
-  // Entry point 2: dashboard mounts / session becomes known and profile
-  // is complete but we don't have a chart yet — start the same flow.
   useEffect(() => {
     if (!sessionId || !onboarded) return;
-    if (kundliPlanets && ascendantSign) return; // already have it
+    if (kundliPlanets && ascendantSign) return;
     if (chartStatus === 'loading' || chartStatus === 'ready') return;
 
     triggerKundliFetch(sessionId);
-    pollForChart(sessionId);
+    pollChartStatus(sessionId);
 
     return () => stopChartPolling();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, onboarded]);
 
-  // Re-check the chart right after a NEW assistant message lands too —
-  // cheap safety net, and it's a single fetch (not a full poll restart)
-  // since by then the backend has almost certainly already computed it.
-  useEffect(() => {
-    if (!sessionId || chartStatus === 'ready') return;
-    if (messages.length === 0) return;
-    fetchChartOnce(sessionId).then((ready) => {
-      if (ready) {
-        stopChartPolling();
-        setChartStatus('ready');
-      }
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages.length]);
-
   const retryChartLoad = () => {
     if (!sessionId) return;
     triggerKundliFetch(sessionId);
-    pollForChart(sessionId);
+    pollChartStatus(sessionId);
   };
 
   const checkIngestStatus = async () => {
@@ -305,6 +317,7 @@ function App() {
         setKundliPlanets(null);
         setAscendantSign(null);
         setChartStatus('idle');
+        setChartError(null);
       }
     } catch (err) {
       console.error('Reset failed:', err);
@@ -323,12 +336,9 @@ function App() {
     setOnboarded(true);
     setView('dashboard');
 
-    // Entry point 1 — fire the fetch immediately instead of waiting for
-    // the first chat message. The dashboard-mount effect below will also
-    // start polling once `onboarded` flips true.
     if (sessionId) {
       triggerKundliFetch(sessionId);
-      pollForChart(sessionId);
+      pollChartStatus(sessionId);
     }
   };
 
@@ -373,7 +383,6 @@ function App() {
     }
   };
 
-  // --- Chart panel renderer (replaces the old ternary inline in JSX) ---
   const renderChartPanel = () => {
     if (kundliPlanets && ascendantSign) {
       return <KundliChartToggle planets={kundliPlanets} ascendantSign={ascendantSign} language={language} sessionId={sessionId} />;
@@ -381,8 +390,8 @@ function App() {
 
     if (chartStatus === 'failed') {
       return (
-        <div className="w-full bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col items-center justify-center gap-3 text-sm text-slate-400 h-full">
-          <span>Couldn't load your chart right now.</span>
+        <div className="w-full bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col items-center justify-center gap-3 text-sm text-slate-400 h-full text-center">
+          <span>{chartError || "Couldn't load your chart right now."}</span>
           <button
             onClick={retryChartLoad}
             className="flex items-center gap-1.5 text-xs font-medium text-slate-600 hover:text-slate-800 bg-slate-50 hover:bg-slate-100 px-3 py-1.5 rounded-lg transition"
@@ -397,6 +406,7 @@ function App() {
       <div className="w-full bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col items-center justify-center gap-2 text-sm text-slate-400 h-full">
         <div className="w-5 h-5 border-2 border-slate-300 border-t-amber-500 rounded-full animate-spin" />
         <span>Preparing your chart...</span>
+        <span className="text-[10px] text-slate-300">This can take up to a couple of minutes.</span>
       </div>
     );
   };
@@ -415,6 +425,9 @@ function App() {
               <p className="text-[10px] text-slate-400 font-medium mt-0.5">{greeting || 'Your Dashboard'}</p>
             </div>
           </div>
+          {kundliPlanets && ascendantSign && (
+            <KundliReportButton sessionId={sessionId} language={language} name={name} />
+          )}
         </header>
 
         <div className="flex-1 overflow-y-auto p-6">
@@ -445,15 +458,14 @@ function App() {
               setLanguage(profile.language);
               setKundliPlanets(null);
               setAscendantSign(null);
-              setChartStatus('loading');
+              setChartStatus('idle');
+              setChartError(null);
               const historyRes = await fetch(`${API_BASE}/chat/history/${sessionId}`);
               if (historyRes.ok) {
                 const history = await historyRes.json();
                 setMessages(history.messages);
               }
-              // EditDetailsModal already calls recalculate-kundli itself —
-              // we just need to start polling for the result here.
-              pollForChart(sessionId);
+              pollChartStatus(sessionId);
             }}
           />
         )}

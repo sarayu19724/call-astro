@@ -47,6 +47,13 @@ class KundliService:
             try:
                 with urllib.request.urlopen(req, timeout=45) as resp:
                     response = json.loads(resp.read().decode("utf-8"))
+                logger.info(
+    "\n"
+    "================ FULL KUNDLI API RESPONSE ================\n"
+    "%s\n"
+    "================ END FULL KUNDLI API RESPONSE ================\n",
+    json.dumps(response, indent=2, ensure_ascii=False, default=str)
+)    
                 logger.info(f"Kundli data fetched successfully (attempt {attempt})")
                 return response
             except urllib.error.HTTPError as e:

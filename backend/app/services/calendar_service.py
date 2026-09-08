@@ -1,19 +1,30 @@
 """
 Astrology Calendar Service — computes planetary transit events, Dasha period
-boundaries, and personalized relevance for a given month or day.
+boundaries, Muhurta (auspicious/inauspicious timing windows), and personalized
+relevance for a given month or day.
 
-Deterministic core: transit sign-changes come from pyswisseph (Lahiri
-sidereal), Dasha boundaries come from the already-cached dasha_tree_raw
-(the REAL Dasha API tree — no local Vimshottari fallback, matching the
-rest of the codebase). Personalization re-uses get_house_for_sign() and
-TOPIC_CHART_FACTORS so "important for me" means the same thing here as
-it does in the chat pipeline.
+Deterministic core: transit sign-changes and sunrise/sunset come from
+pyswisseph (Lahiri sidereal), Dasha boundaries come from the already-cached
+dasha_tree_raw (the REAL Dasha API tree — no local Vimshottari fallback,
+matching the rest of the codebase). Personalization re-uses
+get_house_for_sign() and TOPIC_CHART_FACTORS so "important for me" means the
+same thing here as it does in the chat pipeline.
 
-The only LLM call in this file (explain_day) is optional and purely
-phrases already-computed facts — same pattern as house_insight_service.py.
-If a section's underlying data isn't available (no swisseph, no cached
-Dasha tree, no natal chart yet), that section is simply omitted from the
-response rather than faked.
+MUHURTA CALCULATION: Rahu Kalam, Yamaganda, Gulika Kalam, Abhijit Muhurta,
+and Brahma Muhurta are computed deterministically from sunrise/sunset —
+these are well-established, weekday-indexed (or fixed-offset) formulas that
+don't depend on Tithi/Nakshatra. Durmuhurtham is intentionally NOT computed:
+a correct Durmuhurtham needs the day's Tithi and Nakshatra (a full Panchang
+engine), which this system does not yet have. Returning an approximated/
+guessed Durmuhurtham would be worse than omitting it — this mirrors how
+kundli_report_service.py already handles Shad Bala and live transits:
+clearly marked as unavailable rather than faked.
+
+The only LLM call in this file (explain_day) is optional and purely phrases
+already-computed facts — same pattern as house_insight_service.py. If a
+section's underlying data isn't available (no swisseph, no cached Dasha
+tree, no natal chart yet, no lat/lon for Muhurta), that section is simply
+omitted from the response rather than faked.
 """
 import json
 import calendar as pycalendar
@@ -34,8 +45,8 @@ try:
 except ImportError:
     SWISSEPH_AVAILABLE = False
     logger.warning(
-        "[Calendar] pyswisseph not installed — transit events will be unavailable "
-        "in the Astrology Calendar. Run: pip install pyswisseph"
+        "[Calendar] pyswisseph not installed — transit events and Muhurta timings will be "
+        "unavailable in the Astrology Calendar. Run: pip install pyswisseph"
     )
 
 PLANET_IDS: Dict[str, int] = {}
@@ -168,16 +179,142 @@ def _find_active_dasha(session: Dict, target_date: date) -> Optional[Dict[str, s
     return None
 
 
+# ------------------------------------------------------------------
+# MUHURTA / PANCHANG-STYLE TIMING CALCULATION
+#
+# All of this is computed once from sunrise/sunset — no LLM involvement,
+# no invented numbers. Rahu Kalam / Yamaganda / Gulika Kalam divide the
+# sunrise-to-sunset window into 8 equal segments and pick a fixed segment
+# per weekday (standard, widely published tables). Abhijit Muhurta divides
+# the same window into 15 equal muhurtas and takes the 8th (centered on
+# solar noon). Brahma Muhurta is the fixed 96-minute window ending 48
+# minutes before sunrise. These are all independent of Tithi/Nakshatra,
+# unlike Durmuhurtham — which is why Durmuhurtham is left out entirely
+# rather than approximated.
+# ------------------------------------------------------------------
+IST_OFFSET_HOURS = 5.5
+
+# Segment index (1-8) per Python weekday (Monday=0 ... Sunday=6).
+RAHU_KALAM_SEGMENT = {6: 8, 0: 2, 1: 7, 2: 5, 3: 6, 4: 4, 5: 3}
+YAMAGANDA_SEGMENT = {6: 5, 0: 4, 1: 3, 2: 2, 3: 1, 4: 7, 5: 6}
+GULIKA_SEGMENT = {6: 7, 0: 6, 1: 5, 2: 4, 3: 3, 4: 2, 5: 1}
+
+
+def _revjul_minutes_ut(jd_ut: float) -> float:
+    """swe.revjul gives a fractional UT hour for the given Julian day moment;
+    convert to minutes-since-UT-midnight of that same calendar day."""
+    _, _, _, hour = swe.revjul(jd_ut, swe.GREG_CAL)
+    return hour * 60.0
+
+
+def get_sun_rise_set_minutes(target_date: date, latitude: float, longitude: float) -> Optional[Dict[str, float]]:
+    """Returns {"sunrise": minutes_after_local_midnight, "sunset": ...} in
+    IST (Asia/Kolkata, matching every other fixed-timezone assumption
+    already made elsewhere in this codebase), or None if swisseph is
+    unavailable or the rise/set search fails (can happen at extreme
+    latitudes, not a concern for Indian birth locations)."""
+    if not SWISSEPH_AVAILABLE:
+        return None
+    try:
+        jd_start_ut = swe.julday(target_date.year, target_date.month, target_date.day, 0.0) - (IST_OFFSET_HOURS / 24.0)
+        geopos = (longitude, latitude, 0.0)
+
+        ret_r, tret_r = swe.rise_trans(jd_start_ut, swe.SUN, swe.CALC_RISE, geopos)
+        ret_s, tret_s = swe.rise_trans(jd_start_ut, swe.SUN, swe.CALC_SET, geopos)
+        if ret_r != 0 or ret_s != 0:
+            logger.warning(f"[Calendar] rise/set search failed for {target_date} at ({latitude},{longitude})")
+            return None
+
+        sunrise_minutes = (_revjul_minutes_ut(tret_r[0]) + IST_OFFSET_HOURS * 60.0) % 1440
+        sunset_minutes = (_revjul_minutes_ut(tret_s[0]) + IST_OFFSET_HOURS * 60.0) % 1440
+        if sunset_minutes < sunrise_minutes:
+            sunset_minutes += 1440
+
+        return {"sunrise": sunrise_minutes, "sunset": sunset_minutes}
+    except Exception as e:
+        logger.error(f"[Calendar] sunrise/sunset calculation failed for {target_date}: {e}")
+        return None
+
+
+def _minutes_to_hhmm(minutes: float) -> str:
+    total = round(minutes) % 1440
+    hh, mm = divmod(total, 60)
+    period = "AM" if hh < 12 else "PM"
+    display_hh = hh % 12 or 12
+    return f"{display_hh}:{mm:02d} {period}"
+
+
+def compute_muhurta_periods(target_date: date, latitude: float, longitude: float) -> Optional[Dict[str, Any]]:
+    """Returns {"sunrise", "sunset", "good": [...], "avoid": [...]} or None
+    if sunrise/sunset couldn't be computed. Each entry in good/avoid has
+    name, start, end, note."""
+    sun_times = get_sun_rise_set_minutes(target_date, latitude, longitude)
+    if not sun_times:
+        return None
+
+    sunrise = sun_times["sunrise"]
+    sunset = sun_times["sunset"]
+    day_duration = sunset - sunrise
+    if day_duration <= 0:
+        return None
+
+    weekday = target_date.weekday()  # Monday=0 ... Sunday=6
+    segment_len = day_duration / 8.0
+
+    def _segment(idx: int) -> Dict[str, str]:
+        start = sunrise + (idx - 1) * segment_len
+        end = sunrise + idx * segment_len
+        return {"start": _minutes_to_hhmm(start), "end": _minutes_to_hhmm(end)}
+
+    rahu = _segment(RAHU_KALAM_SEGMENT[weekday])
+    yama = _segment(YAMAGANDA_SEGMENT[weekday])
+    gulika = _segment(GULIKA_SEGMENT[weekday])
+
+    muhurta_len = day_duration / 15.0
+    abhijit = {
+        "start": _minutes_to_hhmm(sunrise + 7 * muhurta_len),
+        "end": _minutes_to_hhmm(sunrise + 8 * muhurta_len),
+    }
+    brahma = {
+        "start": _minutes_to_hhmm(sunrise - 96),
+        "end": _minutes_to_hhmm(sunrise - 48),
+    }
+
+    return {
+        "sunrise": _minutes_to_hhmm(sunrise),
+        "sunset": _minutes_to_hhmm(sunset),
+        "avoid": [
+            {"name": "Rahu Kalam", "start": rahu["start"], "end": rahu["end"],
+             "note": "Traditionally avoided for starting important new activities."},
+            {"name": "Yamaganda", "start": yama["start"], "end": yama["end"],
+             "note": "Traditionally avoided for auspicious beginnings."},
+            {"name": "Gulika Kalam", "start": gulika["start"], "end": gulika["end"],
+             "note": "Traditionally considered inauspicious for new ventures."},
+        ],
+        "good": [
+            {"name": "Abhijit Muhurta", "start": abhijit["start"], "end": abhijit["end"],
+             "note": "Traditionally favorable for beginning important work."},
+            {"name": "Brahma Muhurta", "start": brahma["start"], "end": brahma["end"],
+             "note": "Traditionally suitable for meditation, study, and spiritual practice."},
+        ],
+    }
+
+
+# ------------------------------------------------------------------
+# MONTH / DAY VIEWS
+# ------------------------------------------------------------------
 def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
     session = db.get_or_create_session(session_id)
     chart = _get_natal_chart(session)
     ascendant_sign = chart["ascendant_sign"] if chart else None
+    latitude = session.get("latitude")
+    longitude = session.get("longitude")
 
     days_in_month = pycalendar.monthrange(year, month)[1]
     daily_signs = _daily_signs_for_month(year, month)
 
     days: Dict[str, Dict[str, Any]] = {
-        str(d): {"transits": [], "dasha": [], "is_significant": False}
+        str(d): {"transits": [], "dasha": [], "good": [], "avoid": [], "is_significant": False}
         for d in range(1, days_in_month + 1)
     }
 
@@ -202,11 +339,20 @@ def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
         days[d]["dasha"].append(ev)
         days[d]["is_significant"] = True
 
+    has_muhurta_data = bool(SWISSEPH_AVAILABLE and latitude and longitude)
+    if has_muhurta_data:
+        for day in range(1, days_in_month + 1):
+            muhurta = compute_muhurta_periods(date(year, month, day), latitude, longitude)
+            if muhurta:
+                days[str(day)]["good"] = muhurta["good"]
+                days[str(day)]["avoid"] = muhurta["avoid"]
+
     return {
         "year": year, "month": month,
         "swisseph_available": SWISSEPH_AVAILABLE,
         "has_dasha_data": bool(session.get("dasha_tree_raw")),
         "has_chart_data": chart is not None,
+        "has_muhurta_data": has_muhurta_data,
         "days": days,
     }
 
@@ -220,6 +366,8 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
     session = db.get_or_create_session(session_id)
     chart = _get_natal_chart(session)
     ascendant_sign = chart["ascendant_sign"] if chart else None
+    latitude = session.get("latitude")
+    longitude = session.get("longitude")
 
     planetary_positions: List[Dict[str, Any]] = []
     if SWISSEPH_AVAILABLE:
@@ -241,6 +389,10 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
     for entry in planetary_positions:
         significant_topics.update(entry.get("relevance", {}).get("topics", []))
 
+    muhurta = None
+    if SWISSEPH_AVAILABLE and latitude and longitude:
+        muhurta = compute_muhurta_periods(target_date, latitude, longitude)
+
     is_auspicious = bool(
         maha_lord and maha_lord in NATURAL_BENEFICS
         and (not antar_lord or antar_lord not in NATURAL_MALEFICS)
@@ -257,24 +409,30 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
         "is_auspicious_heuristic": is_auspicious,
         "swisseph_available": SWISSEPH_AVAILABLE,
         "has_dasha_data": bool(session.get("dasha_tree_raw")),
+        "muhurta": muhurta,
+        "has_muhurta_data": muhurta is not None,
     }
 
 
 DAY_EXPLAIN_PROMPT = """You are a warm, experienced Indian Vedic Astrologer explaining why one specific
 calendar date matters for your client, using ONLY the verified facts below — never invent a planet,
-sign, or house placement that isn't listed.
+sign, house placement, or timing that isn't listed.
 
 Rules:
 1. Respond STRICTLY in {language}.
 2. Length: 2-4 sentences, under 70 words. Plain prose, no bullet points, no headers.
 3. Never mention "calendar", "computed", "database", or any technical process — speak as if reading
    their chart directly.
-4. If the facts below are sparse, keep the explanation brief and honest rather than padding it out.
+4. If Good/Avoid timings are listed below, you may mention them naturally (e.g. "the Rahu Kalam window
+   in the morning") but never invent a time that isn't given.
+5. If the facts below are sparse, keep the explanation brief and honest rather than padding it out.
 
 Date: {date}
 Planetary movements on this date (verified): {transits}
 Current Dasha period (verified): {dasha}
 Life areas activated for this client (verified): {topics}
+Favorable timing windows today (verified): {good_muhurta}
+Timing windows to avoid today (verified): {avoid_muhurta}
 
 Write the explanation now:
 """
@@ -297,8 +455,13 @@ def explain_day(session_id: str, date_str: str) -> Dict[str, Any]:
     ) if detail.get("current_mahadasha") else "Not available"
     topics_str = ", ".join(detail.get("significant_topics", [])) or "None specifically activated"
 
+    muhurta = detail.get("muhurta")
+    good_str = "; ".join(f"{m['name']} {m['start']}-{m['end']}" for m in muhurta["good"]) if muhurta else "Not available"
+    avoid_str = "; ".join(f"{m['name']} {m['start']}-{m['end']}" for m in muhurta["avoid"]) if muhurta else "Not available"
+
     prompt = DAY_EXPLAIN_PROMPT.format(
         language=language, date=date_str, transits=transits_str, dasha=dasha_str, topics=topics_str,
+        good_muhurta=good_str, avoid_muhurta=avoid_str,
     )
 
     fallback = {
@@ -323,6 +486,8 @@ def get_month_summary(session_id: str, year: int, month: int) -> Dict[str, Any]:
 
     transit_count = sum(len(d["transits"]) for d in days.values())
     dasha_event_count = sum(len(d["dasha"]) for d in days.values())
+    good_muhurta_days = sum(1 for d in days.values() if d.get("good"))
+    avoid_muhurta_days = sum(1 for d in days.values() if d.get("avoid"))
     significant_days = [
         {"day": int(day), "transits": info["transits"], "dasha": info["dasha"]}
         for day, info in sorted(days.items(), key=lambda kv: int(kv[0]))
@@ -344,8 +509,11 @@ def get_month_summary(session_id: str, year: int, month: int) -> Dict[str, Any]:
         "transit_count": transit_count,
         "dasha_event_count": dasha_event_count,
         "significant_day_count": len(significant_days),
+        "good_muhurta_days": good_muhurta_days,
+        "avoid_muhurta_days": avoid_muhurta_days,
         "most_significant_day": most_significant,
         "swisseph_available": month_data["swisseph_available"],
         "has_dasha_data": month_data["has_dasha_data"],
         "has_chart_data": month_data["has_chart_data"],
+        "has_muhurta_data": month_data.get("has_muhurta_data", False),
     }

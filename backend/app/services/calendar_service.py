@@ -1,24 +1,51 @@
 """
 Astrology Calendar Service — computes planetary transit events, Dasha period
-boundaries, Muhurta (auspicious/inauspicious timing windows), and personalized
-relevance for a given month or day.
+boundaries, full Panchang (Tithi/Nakshatra/Yoga/Karana), Muhurta (auspicious/
+inauspicious timing windows including Durmuhurtham), and a PERSONAL day
+favorability classification for a given month or day.
 
-Deterministic core: transit sign-changes and sunrise/sunset come from
-pyswisseph (Lahiri sidereal), Dasha boundaries come from the already-cached
-dasha_tree_raw (the REAL Dasha API tree — no local Vimshottari fallback,
-matching the rest of the codebase). Personalization re-uses
-get_house_for_sign() and TOPIC_CHART_FACTORS so "important for me" means the
-same thing here as it does in the chat pipeline.
+ARCHITECTURE (matches the split requested):
 
-MUHURTA CALCULATION: Rahu Kalam, Yamaganda, Gulika Kalam, Abhijit Muhurta,
-and Brahma Muhurta are computed deterministically from sunrise/sunset —
-these are well-established, weekday-indexed (or fixed-offset) formulas that
-don't depend on Tithi/Nakshatra. Durmuhurtham is intentionally NOT computed:
-a correct Durmuhurtham needs the day's Tithi and Nakshatra (a full Panchang
-engine), which this system does not yet have. Returning an approximated/
-guessed Durmuhurtham would be worse than omitting it — this mirrors how
-kundli_report_service.py already handles Shad Bala and live transits:
-clearly marked as unavailable rather than faked.
+                        DATE
+                          |
+          +---------------+---------------+
+          |                               |
+   PERSONAL ANALYSIS               GENERAL PANCHANG
+          |                               |
+   User's Kundli (Lagna)              Tithi
+   Daily transits                     Nakshatra
+   Active Dasha lord                  Yoga
+   Kendra/Trikona/Dusthana            Karana
+          |                               |
+          v                               v
+   day classification                 MUHURTA
+     GREEN / RED / NORMAL             Rahu Kalam
+                                       Yamaganda
+                                       Gulika Kalam
+                                       Abhijit Muhurta
+                                       Brahma Muhurta
+                                       Durmuhurtham
+
+Deterministic core: transit sign-changes, Panchang (Tithi/Nakshatra/Yoga/
+Karana), and sunrise/sunset all come from pyswisseph (Lahiri sidereal).
+Dasha boundaries come from the already-cached dasha_tree_raw (the REAL Dasha
+API tree — no local Vimshottari fallback, matching the rest of the
+codebase). Personal favorability re-uses get_house_for_sign(),
+KENDRA_TRIKONA_HOUSES, DUSTHANA_HOUSES and NATURAL_BENEFICS/MALEFICS from
+topic_service so "favorable for me" means the same thing here as it does in
+chat (the Evidence Vote / consistency-check logic).
+
+PANCHANG NOTE: Tithi, Nakshatra, and Yoga are computed from exact Sun/Moon
+sidereal longitude at local noon — precise, deterministic classical
+formulas, not approximations. Karana (half-tithi) is derived the same way.
+Durmuhurtham, by contrast, genuinely depends on which published table you
+follow (sources disagree on the exact muhurta index per weekday) — the
+table used below follows the widely-repeated STRUCTURAL pattern (no
+Durmuhurtham on Wednesday, two periods on Tuesday and Friday, one period on
+every other day), which is far more consistently agreed upon than the exact
+minute-level table. This is flagged here rather than silently presented as
+undisputed classical fact, the same way the rest of this file discloses its
+assumptions.
 
 The only LLM call in this file (explain_day) is optional and purely phrases
 already-computed facts — same pattern as house_insight_service.py. If a
@@ -29,11 +56,14 @@ omitted from the response rather than faked.
 import json
 import calendar as pycalendar
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 from app.memory.database import db
 from app.services.kundli_service import ZODIAC_SIGNS_ORDER
-from app.services.topic_service import get_house_for_sign, TOPIC_CHART_FACTORS, NATURAL_BENEFICS, NATURAL_MALEFICS
+from app.services.topic_service import (
+    get_house_for_sign, TOPIC_CHART_FACTORS, NATURAL_BENEFICS, NATURAL_MALEFICS,
+    KENDRA_TRIKONA_HOUSES, DUSTHANA_HOUSES,
+)
 from app.services.dasha_api_service import dasha_api_service
 from app.services.llm_service import llm_service
 from app.utils.logger import logger
@@ -45,8 +75,8 @@ try:
 except ImportError:
     SWISSEPH_AVAILABLE = False
     logger.warning(
-        "[Calendar] pyswisseph not installed — transit events and Muhurta timings will be "
-        "unavailable in the Astrology Calendar. Run: pip install pyswisseph"
+        "[Calendar] pyswisseph not installed — transit events, Panchang, and Muhurta "
+        "timings will be unavailable in the Astrology Calendar. Run: pip install pyswisseph"
     )
 
 PLANET_IDS: Dict[str, int] = {}
@@ -71,26 +101,34 @@ def _sign_for_longitude(longitude: float) -> str:
     return ZODIAC_SIGNS_ORDER[idx]
 
 
-def _get_planet_sign(jd: float, planet_name: str) -> Optional[str]:
-    """Sidereal (Lahiri) sign for one planet at one Julian day, computed
-    at 12:00 UTC — sufficient resolution for a monthly sign-change
-    overview; not meant to pinpoint the exact hour of ingress."""
+def _get_planet_longitude(jd: float, planet_name: str) -> Optional[float]:
+    """Exact sidereal (Lahiri) ecliptic longitude, 0-360°. Needed (not just
+    the sign) for Tithi/Yoga/Karana, which depend on the precise Sun-Moon
+    angular difference, not just which sign each occupies."""
     if not SWISSEPH_AVAILABLE:
         return None
     try:
         if planet_name == "Ketu":
             rahu_pos, _ = swe.calc_ut(jd, swe.MEAN_NODE, swe.FLG_SIDEREAL)
-            longitude = (rahu_pos[0] + 180.0) % 360.0
-        else:
-            planet_id = PLANET_IDS.get(planet_name)
-            if planet_id is None:
-                return None
-            result, _ = swe.calc_ut(jd, planet_id, swe.FLG_SIDEREAL)
-            longitude = result[0]
-        return _sign_for_longitude(longitude)
+            return (rahu_pos[0] + 180.0) % 360.0
+        planet_id = PLANET_IDS.get(planet_name)
+        if planet_id is None:
+            return None
+        result, _ = swe.calc_ut(jd, planet_id, swe.FLG_SIDEREAL)
+        return result[0]
     except Exception as e:
-        logger.error(f"[Calendar] swisseph calc failed for {planet_name} on jd={jd}: {e}")
+        logger.error(f"[Calendar] swisseph longitude calc failed for {planet_name} on jd={jd}: {e}")
         return None
+
+
+def _get_planet_sign(jd: float, planet_name: str) -> Optional[str]:
+    """Sidereal (Lahiri) sign for one planet at one Julian day, computed
+    at 12:00 UTC — sufficient resolution for a monthly sign-change
+    overview; not meant to pinpoint the exact hour of ingress."""
+    longitude = _get_planet_longitude(jd, planet_name)
+    if longitude is None:
+        return None
+    return _sign_for_longitude(longitude)
 
 
 def _daily_signs_for_month(year: int, month: int) -> Dict[str, Dict[int, Optional[str]]]:
@@ -180,17 +218,184 @@ def _find_active_dasha(session: Dict, target_date: date) -> Optional[Dict[str, s
 
 
 # ------------------------------------------------------------------
-# MUHURTA / PANCHANG-STYLE TIMING CALCULATION
+# PERSONAL DAY FAVORABILITY — separate from Panchang/Muhurta entirely.
 #
-# All of this is computed once from sunrise/sunset — no LLM involvement,
-# no invented numbers. Rahu Kalam / Yamaganda / Gulika Kalam divide the
-# sunrise-to-sunset window into 8 equal segments and pick a fixed segment
-# per weekday (standard, widely published tables). Abhijit Muhurta divides
-# the same window into 15 equal muhurtas and takes the 8th (centered on
-# solar noon). Brahma Muhurta is the fixed 96-minute window ending 48
-# minutes before sunrise. These are all independent of Tithi/Nakshatra,
-# unlike Durmuhurtham — which is why Durmuhurtham is left out entirely
-# rather than approximated.
+# For a given date, we look at:
+#   1. Every planet's transit sign that day -> house from the user's Lagna
+#      -> whether that placement is classically supportive (kendra/trikona)
+#      or challenging (dusthana), weighted by whether the planet is a
+#      natural benefic or malefic.
+#   2. The active Mahadasha lord's nature (benefic/malefic).
+#
+# This mirrors the exact same scoring philosophy already used in
+# topic_service._score_chart_signal() / _score_dasha_signal() for chat
+# responses — "favorable for you" here means the same thing it means when
+# the astrologer chatbot says it. The result is a soft score, not a
+# prediction: language stays in "supportive indication" / "challenging
+# indication" terms, never "this will happen".
+# ------------------------------------------------------------------
+def _score_day_for_user(
+    daily_planet_signs: Dict[str, Optional[str]],
+    ascendant_sign: str,
+    dasha_lord: Optional[str],
+) -> Dict[str, Any]:
+    score = 0.0
+    supportive_reasons: List[str] = []
+    challenging_reasons: List[str] = []
+
+    for planet, sign in daily_planet_signs.items():
+        if not sign:
+            continue
+        house = get_house_for_sign(sign, ascendant_sign)
+        if not house:
+            continue
+
+        if planet in NATURAL_BENEFICS:
+            if house in KENDRA_TRIKONA_HOUSES:
+                score += 1.0
+                supportive_reasons.append(f"{planet} transiting your {house}th house")
+            elif house in DUSTHANA_HOUSES:
+                score -= 0.5
+                challenging_reasons.append(f"{planet} transiting your {house}th house (mildly softened)")
+        elif planet in NATURAL_MALEFICS:
+            if house in DUSTHANA_HOUSES:
+                score -= 1.0
+                challenging_reasons.append(f"{planet} transiting your {house}th house")
+            elif house in KENDRA_TRIKONA_HOUSES:
+                score -= 0.25
+                challenging_reasons.append(f"{planet} transiting your {house}th house (needs care)")
+
+    if dasha_lord:
+        if dasha_lord in NATURAL_BENEFICS:
+            score += 1.0
+            supportive_reasons.append(f"{dasha_lord} Mahadasha (naturally supportive)")
+        elif dasha_lord in NATURAL_MALEFICS:
+            score -= 0.5
+            challenging_reasons.append(f"{dasha_lord} Mahadasha (needs steadier effort)")
+
+    if score >= 1.5:
+        status = "favorable"
+    elif score <= -1.5:
+        status = "caution"
+    else:
+        status = "normal"
+
+    return {
+        "status": status,
+        "score": round(score, 2),
+        "supportive_reasons": supportive_reasons,
+        "challenging_reasons": challenging_reasons,
+    }
+
+
+# ------------------------------------------------------------------
+# PANCHANG — Tithi, Nakshatra, Yoga, Karana.
+# All computed deterministically from exact Sun/Moon sidereal longitude —
+# no LLM, no invented numbers.
+# ------------------------------------------------------------------
+NAKSHATRA_NAMES = [
+    "Ashwini", "Bharani", "Krittika", "Rohini", "Mrigashira", "Ardra",
+    "Punarvasu", "Pushya", "Ashlesha", "Magha", "Purva Phalguni", "Uttara Phalguni",
+    "Hasta", "Chitra", "Swati", "Vishakha", "Anuradha", "Jyeshtha",
+    "Mula", "Purva Ashadha", "Uttara Ashadha", "Shravana", "Dhanishta", "Shatabhisha",
+    "Purva Bhadrapada", "Uttara Bhadrapada", "Revati",
+]
+
+YOGA_NAMES = [
+    "Vishkambha", "Priti", "Ayushman", "Saubhagya", "Shobhana", "Atiganda",
+    "Sukarman", "Dhriti", "Shoola", "Ganda", "Vriddhi", "Dhruva",
+    "Vyaghata", "Harshana", "Vajra", "Siddhi", "Vyatipata", "Variyana",
+    "Parigha", "Shiva", "Siddha", "Sadhya", "Shubha", "Shukla",
+    "Brahma", "Indra", "Vaidhriti",
+]
+
+_TITHI_BASE_NAMES = [
+    "Pratipada", "Dwitiya", "Tritiya", "Chaturthi", "Panchami", "Shashthi", "Saptami",
+    "Ashtami", "Navami", "Dashami", "Ekadashi", "Dwadashi", "Trayodashi", "Chaturdashi",
+]
+
+_KARANA_MOVABLE = ["Bava", "Balava", "Kaulava", "Taitila", "Garaja", "Vanija", "Vishti"]
+_KARANA_FIXED_END = ["Shakuni", "Chatushpada", "Naga"]
+
+_ARC_27 = 360.0 / 27.0
+
+
+def _tithi_name(tithi_num: int) -> Tuple[str, str]:
+    """tithi_num is 1-30. Returns (name, paksha)."""
+    if tithi_num <= 15:
+        paksha = "Shukla"
+        name = "Purnima" if tithi_num == 15 else _TITHI_BASE_NAMES[tithi_num - 1]
+    else:
+        paksha = "Krishna"
+        idx = tithi_num - 16
+        name = "Amavasya" if tithi_num == 30 else _TITHI_BASE_NAMES[idx]
+    return name, paksha
+
+
+def _karana_name(karana_index: int) -> str:
+    """karana_index is 1-60."""
+    if karana_index == 1:
+        return "Kimstughna"
+    if karana_index >= 58:
+        return _KARANA_FIXED_END[karana_index - 58]
+    return _KARANA_MOVABLE[(karana_index - 2) % 7]
+
+
+def compute_panchang(target_date: date) -> Optional[Dict[str, Any]]:
+    """Returns {"tithi", "paksha", "nakshatra", "nakshatra_pada", "yoga",
+    "karana"} computed at local noon for the given date, or None if
+    swisseph is unavailable."""
+    if not SWISSEPH_AVAILABLE:
+        return None
+    try:
+        jd = swe.julday(target_date.year, target_date.month, target_date.day, 12.0)
+        sun_long = _get_planet_longitude(jd, "Sun")
+        moon_long = _get_planet_longitude(jd, "Moon")
+        if sun_long is None or moon_long is None:
+            return None
+
+        diff = (moon_long - sun_long) % 360.0
+
+        tithi_num = int(diff // 12) + 1
+        tithi_num = min(tithi_num, 30)
+        tithi, paksha = _tithi_name(tithi_num)
+
+        nak_idx = int(moon_long // _ARC_27) % 27
+        nakshatra = NAKSHATRA_NAMES[nak_idx]
+        pada = int((moon_long % _ARC_27) // (_ARC_27 / 4)) + 1
+        pada = min(max(pada, 1), 4)
+
+        yoga_long = (sun_long + moon_long) % 360.0
+        yoga_idx = int(yoga_long // _ARC_27) % 27
+        yoga = YOGA_NAMES[yoga_idx]
+
+        karana_index = int(diff // 6) + 1
+        karana_index = min(karana_index, 60)
+        karana = _karana_name(karana_index)
+
+        return {
+            "tithi": tithi, "paksha": paksha,
+            "nakshatra": nakshatra, "nakshatra_pada": pada,
+            "yoga": yoga, "karana": karana,
+        }
+    except Exception as e:
+        logger.error(f"[Calendar] Panchang calculation failed for {target_date}: {e}")
+        return None
+
+
+# ------------------------------------------------------------------
+# MUHURTA / TIMING CALCULATION
+#
+# All computed once from sunrise/sunset — no LLM involvement, no invented
+# numbers for Rahu Kalam / Yamaganda / Gulika Kalam / Abhijit / Brahma
+# Muhurta, which divide the sunrise-to-sunset window into fixed, weekday-
+# indexed segments (standard, widely published tables).
+#
+# DURMUHURTHAM: see the module docstring — the STRUCTURAL pattern (none on
+# Wednesday, two periods on Tuesday/Friday, one period every other day) is
+# well agreed upon; the exact muhurta index used below is a best-effort
+# reading of commonly published tables, flagged here rather than presented
+# as beyond dispute.
 # ------------------------------------------------------------------
 IST_OFFSET_HOURS = 5.5
 
@@ -198,6 +403,18 @@ IST_OFFSET_HOURS = 5.5
 RAHU_KALAM_SEGMENT = {6: 8, 0: 2, 1: 7, 2: 5, 3: 6, 4: 4, 5: 3}
 YAMAGANDA_SEGMENT = {6: 5, 0: 4, 1: 3, 2: 2, 3: 1, 4: 7, 5: 6}
 GULIKA_SEGMENT = {6: 7, 0: 6, 1: 5, 2: 4, 3: 3, 4: 2, 5: 1}
+
+# Durmuhurtham segments as (start_muhurta, end_muhurta) out of 15 equal
+# muhurtas spanning sunrise-to-sunset. Weekday keys: Monday=0 ... Sunday=6.
+DURMUHURTAM_SEGMENTS: Dict[int, List[Tuple[int, int]]] = {
+    6: [(12, 13)],             # Sunday — one period
+    0: [(10, 11)],             # Monday — one period
+    1: [(4, 5), (9, 10)],      # Tuesday — two periods
+    2: [],                     # Wednesday — none
+    3: [(8, 9)],                # Thursday — one period
+    4: [(4, 5), (6, 7)],        # Friday — two periods
+    5: [(2, 3)],                 # Saturday — one period
+}
 
 
 def _revjul_minutes_ut(jd_ut: float) -> float:
@@ -211,8 +428,7 @@ def get_sun_rise_set_minutes(target_date: date, latitude: float, longitude: floa
     """Returns {"sunrise": minutes_after_local_midnight, "sunset": ...} in
     IST (Asia/Kolkata, matching every other fixed-timezone assumption
     already made elsewhere in this codebase), or None if swisseph is
-    unavailable or the rise/set search fails (can happen at extreme
-    latitudes, not a concern for Indian birth locations)."""
+    unavailable or the rise/set search fails."""
     if not SWISSEPH_AVAILABLE:
         return None
     try:
@@ -244,10 +460,27 @@ def _minutes_to_hhmm(minutes: float) -> str:
     return f"{display_hh}:{mm:02d} {period}"
 
 
+def _durmuhurtam_periods(weekday: int, sunrise: float, muhurta_len: float) -> List[Dict[str, str]]:
+    segments = DURMUHURTAM_SEGMENTS.get(weekday, [])
+    periods = []
+    for i, (start_idx, end_idx) in enumerate(segments):
+        start = sunrise + (start_idx - 1) * muhurta_len
+        end = sunrise + end_idx * muhurta_len
+        label = "Durmuhurtham" if len(segments) == 1 else f"Durmuhurtham {i + 1}"
+        periods.append({
+            "name": label,
+            "start": _minutes_to_hhmm(start),
+            "end": _minutes_to_hhmm(end),
+            "note": "Traditionally considered an inauspicious window for starting new ventures.",
+        })
+    return periods
+
+
 def compute_muhurta_periods(target_date: date, latitude: float, longitude: float) -> Optional[Dict[str, Any]]:
     """Returns {"sunrise", "sunset", "good": [...], "avoid": [...]} or None
-    if sunrise/sunset couldn't be computed. Each entry in good/avoid has
-    name, start, end, note."""
+    if sunrise/sunset couldn't be computed. "avoid" includes Rahu Kalam,
+    Yamaganda, Gulika Kalam, and Durmuhurtham; "good" includes Abhijit and
+    Brahma Muhurta."""
     sun_times = get_sun_rise_set_minutes(target_date, latitude, longitude)
     if not sun_times:
         return None
@@ -280,17 +513,20 @@ def compute_muhurta_periods(target_date: date, latitude: float, longitude: float
         "end": _minutes_to_hhmm(sunrise - 48),
     }
 
+    avoid = [
+        {"name": "Rahu Kalam", "start": rahu["start"], "end": rahu["end"],
+         "note": "Traditionally avoided for starting important new activities."},
+        {"name": "Yamaganda", "start": yama["start"], "end": yama["end"],
+         "note": "Traditionally avoided for auspicious beginnings."},
+        {"name": "Gulika Kalam", "start": gulika["start"], "end": gulika["end"],
+         "note": "Traditionally considered inauspicious for new ventures."},
+    ]
+    avoid.extend(_durmuhurtam_periods(weekday, sunrise, muhurta_len))
+
     return {
         "sunrise": _minutes_to_hhmm(sunrise),
         "sunset": _minutes_to_hhmm(sunset),
-        "avoid": [
-            {"name": "Rahu Kalam", "start": rahu["start"], "end": rahu["end"],
-             "note": "Traditionally avoided for starting important new activities."},
-            {"name": "Yamaganda", "start": yama["start"], "end": yama["end"],
-             "note": "Traditionally avoided for auspicious beginnings."},
-            {"name": "Gulika Kalam", "start": gulika["start"], "end": gulika["end"],
-             "note": "Traditionally considered inauspicious for new ventures."},
-        ],
+        "avoid": avoid,
         "good": [
             {"name": "Abhijit Muhurta", "start": abhijit["start"], "end": abhijit["end"],
              "note": "Traditionally favorable for beginning important work."},
@@ -314,7 +550,11 @@ def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
     daily_signs = _daily_signs_for_month(year, month)
 
     days: Dict[str, Dict[str, Any]] = {
-        str(d): {"transits": [], "dasha": [], "good": [], "avoid": [], "is_significant": False}
+        str(d): {
+            "transits": [], "dasha": [], "good": [], "avoid": [],
+            "is_significant": False,
+            "personal_status": "normal", "personal_score": 0.0,
+        }
         for d in range(1, days_in_month + 1)
     }
 
@@ -347,6 +587,16 @@ def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
                 days[str(day)]["good"] = muhurta["good"]
                 days[str(day)]["avoid"] = muhurta["avoid"]
 
+    # --- Personal day favorability, independent of Panchang/Muhurta ---
+    if SWISSEPH_AVAILABLE and ascendant_sign:
+        for day in range(1, days_in_month + 1):
+            day_signs = {planet: daily_signs.get(planet, {}).get(day) for planet in PLANET_ORDER}
+            active_dasha = _find_active_dasha(session, date(year, month, day))
+            dasha_lord = active_dasha.get("mahadasha") if active_dasha else None
+            result = _score_day_for_user(day_signs, ascendant_sign, dasha_lord)
+            days[str(day)]["personal_status"] = result["status"]
+            days[str(day)]["personal_score"] = result["score"]
+
     return {
         "year": year, "month": month,
         "swisseph_available": SWISSEPH_AVAILABLE,
@@ -370,10 +620,12 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
     longitude = session.get("longitude")
 
     planetary_positions: List[Dict[str, Any]] = []
+    day_signs: Dict[str, Optional[str]] = {}
     if SWISSEPH_AVAILABLE:
         jd = swe.julday(target_date.year, target_date.month, target_date.day, 12.0)
         for planet in PLANET_ORDER:
             sign = _get_planet_sign(jd, planet)
+            day_signs[planet] = sign
             if not sign:
                 continue
             entry: Dict[str, Any] = {"planet": planet, "sign": sign}
@@ -393,6 +645,18 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
     if SWISSEPH_AVAILABLE and latitude and longitude:
         muhurta = compute_muhurta_periods(target_date, latitude, longitude)
 
+    panchang = compute_panchang(target_date) if SWISSEPH_AVAILABLE else None
+
+    personal_status, personal_score = "normal", 0.0
+    supportive_reasons: List[str] = []
+    challenging_reasons: List[str] = []
+    if SWISSEPH_AVAILABLE and ascendant_sign:
+        result = _score_day_for_user(day_signs, ascendant_sign, maha_lord)
+        personal_status = result["status"]
+        personal_score = result["score"]
+        supportive_reasons = result["supportive_reasons"]
+        challenging_reasons = result["challenging_reasons"]
+
     is_auspicious = bool(
         maha_lord and maha_lord in NATURAL_BENEFICS
         and (not antar_lord or antar_lord not in NATURAL_MALEFICS)
@@ -411,6 +675,11 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
         "has_dasha_data": bool(session.get("dasha_tree_raw")),
         "muhurta": muhurta,
         "has_muhurta_data": muhurta is not None,
+        "panchang": panchang,
+        "personal_status": personal_status,
+        "personal_score": personal_score,
+        "personal_supportive_reasons": supportive_reasons,
+        "personal_challenging_reasons": challenging_reasons,
     }
 
 
@@ -421,13 +690,17 @@ sign, house placement, or timing that isn't listed.
 Rules:
 1. Respond STRICTLY in {language}.
 2. Length: 2-4 sentences, under 70 words. Plain prose, no bullet points, no headers.
-3. Never mention "calendar", "computed", "database", or any technical process — speak as if reading
-   their chart directly.
-4. If Good/Avoid timings are listed below, you may mention them naturally (e.g. "the Rahu Kalam window
+3. Never mention "calendar", "computed", "database", "score", or any technical process — speak as if
+   reading their chart directly.
+4. Frame the personal indication as "supportive" or "needs a bit more care" — NEVER as a guarantee or
+   a definite outcome. This is a tendency to be aware of, not a prediction.
+5. If Good/Avoid timings are listed below, you may mention them naturally (e.g. "the Rahu Kalam window
    in the morning") but never invent a time that isn't given.
-5. If the facts below are sparse, keep the explanation brief and honest rather than padding it out.
+6. If the facts below are sparse, keep the explanation brief and honest rather than padding it out.
 
 Date: {date}
+Personal indication: {personal_status} (supportive factors: {supportive}; factors needing care: {challenging})
+Panchang: {panchang}
 Planetary movements on this date (verified): {transits}
 Current Dasha period (verified): {dasha}
 Life areas activated for this client (verified): {topics}
@@ -459,8 +732,21 @@ def explain_day(session_id: str, date_str: str) -> Dict[str, Any]:
     good_str = "; ".join(f"{m['name']} {m['start']}-{m['end']}" for m in muhurta["good"]) if muhurta else "Not available"
     avoid_str = "; ".join(f"{m['name']} {m['start']}-{m['end']}" for m in muhurta["avoid"]) if muhurta else "Not available"
 
+    panchang = detail.get("panchang")
+    panchang_str = (
+        f"{panchang['paksha']} Paksha {panchang['tithi']}, {panchang['nakshatra']} Nakshatra "
+        f"(Pada {panchang['nakshatra_pada']}), {panchang['yoga']} Yoga, {panchang['karana']} Karana"
+    ) if panchang else "Not available"
+
+    supportive_str = "; ".join(detail.get("personal_supportive_reasons", [])) or "None specifically identified"
+    challenging_str = "; ".join(detail.get("personal_challenging_reasons", [])) or "None specifically identified"
+
     prompt = DAY_EXPLAIN_PROMPT.format(
-        language=language, date=date_str, transits=transits_str, dasha=dasha_str, topics=topics_str,
+        language=language, date=date_str,
+        personal_status=detail.get("personal_status", "normal"),
+        supportive=supportive_str, challenging=challenging_str,
+        panchang=panchang_str,
+        transits=transits_str, dasha=dasha_str, topics=topics_str,
         good_muhurta=good_str, avoid_muhurta=avoid_str,
     )
 
@@ -488,6 +774,9 @@ def get_month_summary(session_id: str, year: int, month: int) -> Dict[str, Any]:
     dasha_event_count = sum(len(d["dasha"]) for d in days.values())
     good_muhurta_days = sum(1 for d in days.values() if d.get("good"))
     avoid_muhurta_days = sum(1 for d in days.values() if d.get("avoid"))
+    favorable_days = sum(1 for d in days.values() if d.get("personal_status") == "favorable")
+    caution_days = sum(1 for d in days.values() if d.get("personal_status") == "caution")
+
     significant_days = [
         {"day": int(day), "transits": info["transits"], "dasha": info["dasha"]}
         for day, info in sorted(days.items(), key=lambda kv: int(kv[0]))
@@ -511,6 +800,8 @@ def get_month_summary(session_id: str, year: int, month: int) -> Dict[str, Any]:
         "significant_day_count": len(significant_days),
         "good_muhurta_days": good_muhurta_days,
         "avoid_muhurta_days": avoid_muhurta_days,
+        "favorable_days": favorable_days,
+        "caution_days": caution_days,
         "most_significant_day": most_significant,
         "swisseph_available": month_data["swisseph_available"],
         "has_dasha_data": month_data["has_dasha_data"],

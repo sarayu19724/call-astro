@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config.settings import settings
 from app.utils.logger import logger
-from app.api import chat, session, ingest, house_insight,report,couple   # ← added house_insight
+from app.api import chat, session, ingest, calendar
 from app.memory.database import db
 from app.rag.indexer import document_indexer
 from app.rag.vector_store import vector_store
@@ -15,20 +15,25 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Configure CORS to allow frontend connections
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Adjust in production environments
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Background indexing task (runs in separate thread)
 def background_index_knowledge_base():
+    """Run knowledge base indexing in background thread.
+    Skips entirely if a valid vector store already exists on disk —
+    only new/unindexed files get processed (incremental indexing)."""
     logger.info("Checking knowledge base index status...")
     try:
         if vector_store.vectors is not None and len(vector_store.chunks) > 0:
             logger.info(f"✓ Existing vector store loaded: {len(vector_store.chunks)} chunks already indexed.")
-            processed_files, total_chunks = document_indexer.ingest_knowledge_base()
+            processed_files, total_chunks = document_indexer.ingest_knowledge_base(force_rebuild=False)
             if processed_files:
                 logger.info(f"✓ Indexed {len(processed_files)} new file(s), added chunks. Total now: {len(vector_store.chunks)}")
             else:
@@ -43,10 +48,13 @@ def background_index_knowledge_base():
     except Exception as e:
         logger.error(f"✗ Failed to index knowledge base: {e}")
 
+# Startup: Initialize DB and start background indexing
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting Call-Astro FastAPI Server...")
+
     db.init_db()
+
     indexing_thread = threading.Thread(target=background_index_knowledge_base, daemon=True)
     indexing_thread.start()
 
@@ -54,9 +62,8 @@ async def startup_event():
 app.include_router(chat.router, prefix="/api")
 app.include_router(session.router, prefix="/api")
 app.include_router(ingest.router, prefix="/api")
-app.include_router(house_insight.router, prefix="/api")   # ← added
-app.include_router(couple.router, prefix="/api")
-app.include_router(report.router, prefix="/api")   # ← added
+app.include_router(calendar.router, prefix="/api")
+
 @app.get("/")
 async def root():
     return {

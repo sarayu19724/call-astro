@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { ChatWindow } from './components/ChatWindow';
 import { ChatInput } from './components/ChatInput';
 import { ProfileCard } from './components/ProfileCard';
-import { Sparkles, Database, CheckCircle, ArrowLeft, Download, Trash2, RotateCcw, Heart } from 'lucide-react';
+import { Sparkles, Database, CheckCircle, ArrowLeft, Download, Trash2, RotateCcw, Heart, CalendarDays } from 'lucide-react';
 import OnboardingForm from './components/OnboardingForm';
 import KundliChartToggle from './components/KundliChartToggle';
 import LifeDashboard from './components/LifeDashboard';
@@ -13,6 +13,7 @@ import FaqStarter from './components/FaqStarter';
 import ReasoningTrace from './components/ReasoningTrace';
 import KundliReportButton from './components/KundliReportButton';
 import CouplePage from './components/CouplePage';
+import AstrologyCalendar from './components/AstrologyCalendar';
 
 interface Message { role: 'user' | 'assistant' | 'system'; content: string; timestamp?: string; }
 interface IngestStatus { indexing_completed: boolean; total_chunks: number; loading: boolean; }
@@ -33,7 +34,7 @@ const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_MAX_ATTEMPTS = 60; // 60 * 4s = 240s
 
 type ChartStatus = 'idle' | 'loading' | 'ready' | 'failed';
-type ViewMode = 'dashboard' | 'chat' | 'couple';
+type ViewMode = 'dashboard' | 'chat' | 'couple' | 'calendar';
 
 function App() {
   const [sessionId, setSessionId] = useState<string>('');
@@ -210,6 +211,20 @@ function App() {
     return () => stopChartPolling();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, onboarded]);
+
+  // Extra safety net: after chat activity, make one more attempt to pick
+  // up the chart in case the status-based poll missed the transition.
+  useEffect(() => {
+    if (!sessionId || chartStatus === 'ready') return;
+    if (messages.length === 0) return;
+    fetchChartData(sessionId).then((ready) => {
+      if (ready) {
+        stopChartPolling();
+        setChartStatus('ready');
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages.length]);
 
   const retryChartLoad = () => {
     if (!sessionId) return;
@@ -418,6 +433,11 @@ function App() {
     return <CouplePage language={language} onBack={() => setView('dashboard')} />;
   }
 
+  // ---------------- CALENDAR VIEW ----------------
+  if (view === 'calendar') {
+    return <AstrologyCalendar sessionId={sessionId} language={language} onBack={() => setView('dashboard')} />;
+  }
+
   // ---------------- DASHBOARD VIEW ----------------
   if (view === 'dashboard') {
     const greetingFn = GREETINGS[language] || GREETINGS.Hinglish;
@@ -457,7 +477,20 @@ function App() {
               <LifeDashboard sessionId={sessionId} language={language} />
             </div>
 
-            <GoToChatCard language={language} onGoToChat={() => setView('chat')} />
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <GoToChatCard language={language} onGoToChat={() => setView('chat')} />
+              <button
+                onClick={() => setView('calendar')}
+                className="w-full bg-violet-600 hover:bg-violet-700 rounded-2xl px-8 py-6 shadow-sm transition flex items-center justify-between text-left"
+              >
+                <div>
+                  <h3 className="text-white font-semibold text-base flex items-center gap-2">
+                    <CalendarDays size={18} /> Astrology Calendar
+                  </h3>
+                  <p className="text-violet-100 text-sm mt-0.5">See planetary movements, Dashas & auspicious periods</p>
+                </div>
+              </button>
+            </div>
           </div>
         </div>
 

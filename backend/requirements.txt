@@ -11,3 +11,4 @@ pydantic-settings
 sentence-transformers
 pypdf
 reportlab
+pyswisseph

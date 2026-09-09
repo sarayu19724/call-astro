@@ -579,9 +579,9 @@ def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
         str(d): {
             "transits": [],
             "dasha": [],
+            "muhurta": None,
             "is_significant": False,
             "personal_status": "normal",
-            "personal_score": 0.0,
         }
         for d in range(1, days_in_month + 1)
     }
@@ -612,9 +612,7 @@ def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
         for day in range(1, days_in_month + 1):
             muhurta = compute_muhurta_periods(date(year, month, day), latitude, longitude)
             if muhurta:
-                # The complete Muhurta data is returned by get_day_detail().
-                # The monthly grid uses personal_status for its markers.
-                pass
+                days[str(day)]["muhurta"] = muhurta
 
     # --- Personal day favorability, independent of Panchang/Muhurta ---
     if SWISSEPH_AVAILABLE and ascendant_sign:
@@ -624,7 +622,6 @@ def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
             dasha_lord = active_dasha.get("mahadasha") if active_dasha else None
             result = _score_day_for_user(day_signs, ascendant_sign, dasha_lord)
             days[str(day)]["personal_status"] = result["status"]
-            days[str(day)]["personal_score"] = result["score"]
 
     return {
         "year": year, "month": month,
@@ -676,13 +673,12 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
 
     panchang = compute_panchang(target_date) if SWISSEPH_AVAILABLE else None
 
-    personal_status, personal_score = "normal", 0.0
+    personal_status = "normal"
     supportive_reasons: List[str] = []
     challenging_reasons: List[str] = []
     if SWISSEPH_AVAILABLE and ascendant_sign:
         result = _score_day_for_user(day_signs, ascendant_sign, maha_lord)
         personal_status = result["status"]
-        personal_score = result["score"]
         supportive_reasons = result["supportive_reasons"]
         challenging_reasons = result["challenging_reasons"]
 
@@ -706,7 +702,6 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
         "has_muhurta_data": muhurta is not None,
         "panchang": panchang,
         "personal_status": personal_status,
-        "personal_score": personal_score,
         "personal_supportive_reasons": supportive_reasons,
         "personal_challenging_reasons": challenging_reasons,
     }
@@ -829,6 +824,9 @@ def get_month_summary(session_id: str, year: int, month: int) -> Dict[str, Any]:
         1 for d in days.values()
         if d.get("personal_status") == "caution"
     )
+
+    favorable_days = sum(1 for info in days.values() if info.get("personal_status") == "favorable")
+    caution_days = sum(1 for info in days.values() if info.get("personal_status") == "caution")
 
     significant_days = [
         {

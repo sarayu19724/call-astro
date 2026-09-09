@@ -16,12 +16,9 @@ interface MuhurtaWindow { name: string; start: string; end: string; note: string
 interface DayInfo {
   transits: TransitEvent[];
   dasha: DashaEvent[];
-  good: MuhurtaWindow[];
-  avoid: MuhurtaWindow[];
   muhurta?: MuhurtaDetail | null;
   is_significant: boolean;
   personal_status?: 'favorable' | 'caution' | 'normal';
-  personal_score?: number;
 }
 interface MonthData {
   year: number; month: number; swisseph_available: boolean;
@@ -60,7 +57,6 @@ interface DayDetail {
     karana: string;
   } | null;
   personal_status?: 'favorable' | 'caution' | 'normal';
-  personal_score?: number;
   personal_supportive_reasons?: string[];
   personal_challenging_reasons?: string[];
 }
@@ -68,8 +64,6 @@ interface MonthSummary {
   transit_count: number;
   dasha_event_count: number;
   significant_day_count: number;
-  good_muhurta_days: number;
-  avoid_muhurta_days: number;
   favorable_days?: number;
   caution_days?: number;
   has_muhurta_data: boolean;
@@ -370,8 +364,8 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
 
             {!loading && monthData?.has_muhurta_data && (
               <div className="flex flex-wrap gap-3 mt-4 pt-3 border-t border-slate-100 text-[10px] text-slate-400">
-                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {t.goodTimes}</span>
-                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> {t.avoidTimes}</span>
+                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> Favorable for Me</span>
+                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> Needs Care</span>
                 <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-sky-500" /> {t.significantTransits}</span>
                 <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-violet-500" /> {t.dashaEvents}</span>
               </div>
@@ -410,8 +404,11 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                       ...dayDetail.muhurta.rahu_kalam,
                       ...dayDetail.muhurta.yamaganda,
                       ...dayDetail.muhurta.gulika_kalam,
-                      ...dayDetail.muhurta.durmuhurtham,
                     ]} />
+                  )}
+
+                  {dayDetail.muhurta && dayDetail.muhurta.durmuhurtham.length > 0 && (
+                    <MuhurtaSection title="Durmuhurtham" items={dayDetail.muhurta.durmuhurtham} />
                   )}
 
                   {dayDetail.panchang && (
@@ -464,7 +461,6 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                       </p>
                       <p className="text-xs font-medium capitalize">
                         {dayDetail.personal_status}
-                        {typeof dayDetail.personal_score === 'number' ? ` · score ${dayDetail.personal_score}` : ''}
                       </p>
                       {dayDetail.personal_supportive_reasons?.length ? (
                         <p className="text-[11px] mt-1">{dayDetail.personal_supportive_reasons.join(' • ')}</p>
@@ -527,17 +523,11 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
             <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
               <h3 className="text-sm font-bold text-slate-800 mb-3">{t.monthAtGlance.toUpperCase()} — {MONTH_NAMES[month - 1]} {year}</h3>
               <ul className="text-sm text-slate-700 space-y-1.5">
-                {summary.has_muhurta_data && (
-                  <>
-                    <li>• {summary.good_muhurta_days} {t.goodDaysCount}</li>
-                    <li>• {summary.avoid_muhurta_days} {t.avoidDaysCount}</li>
-                  </>
-                )}
                 {typeof summary.favorable_days === 'number' && (
-                  <li>• {summary.favorable_days} favorable personal days</li>
+                  <li>• {summary.favorable_days} favorable days for you</li>
                 )}
                 {typeof summary.caution_days === 'number' && (
-                  <li>• {summary.caution_days} personal caution days</li>
+                  <li>• {summary.caution_days} days needing more care</li>
                 )}
                 <li>• {summary.transit_count} {t.significantTransits}</li>
                 <li>• {summary.dasha_event_count} {t.dashaEvents}</li>

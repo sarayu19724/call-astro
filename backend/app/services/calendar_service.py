@@ -1,7 +1,7 @@
 """
 Astrology Calendar Service — computes planetary transit events, Dasha period
 boundaries, full Panchang (Tithi/Nakshatra/Yoga/Karana), Muhurta (auspicious/
-inauspicious timing windows including Durmuhurtham), and a PERSONAL day
+inauspicious timing windows including Durmuhurtham), and an event-based PERSONAL day
 favorability classification for a given month or day.
 
 ARCHITECTURE (matches the split requested):
@@ -30,10 +30,9 @@ Deterministic core: transit sign-changes, Panchang (Tithi/Nakshatra/Yoga/
 Karana), and sunrise/sunset all come from pyswisseph (Lahiri sidereal).
 Dasha boundaries come from the already-cached dasha_tree_raw (the REAL Dasha
 API tree — no local Vimshottari fallback, matching the rest of the
-codebase). Personal favorability re-uses get_house_for_sign(),
-KENDRA_TRIKONA_HOUSES, DUSTHANA_HOUSES and NATURAL_BENEFICS/MALEFICS from
-topic_service so "favorable for me" means the same thing here as it does in
-chat (the Evidence Vote / consistency-check logic).
+codebase). Personal "For Me" classification is event-based: only relevant transit
+sign changes and Dasha boundary events are considered. No numeric score or
+threshold is used; this preserves the earlier sparse, event-driven behavior.
 
 PANCHANG NOTE: Tithi, Nakshatra, and Yoga are computed from exact Sun/Moon
 sidereal longitude at local noon — precise, deterministic classical
@@ -234,58 +233,46 @@ def _find_active_dasha(session: Dict, target_date: date) -> Optional[Dict[str, s
 # prediction: language stays in "supportive indication" / "challenging
 # indication" terms, never "this will happen".
 # ------------------------------------------------------------------
-def _score_day_for_user(
-    daily_planet_signs: Dict[str, Optional[str]],
-    ascendant_sign: str,
-    dasha_lord: Optional[str],
-) -> Dict[str, Any]:
-    score = 0.0
-    supportive_reasons: List[str] = []
-    challenging_reasons: List[str] = []
+def _classify_personal_day(
+    transit_events: List[Dict[str, Any]],
+    dasha_events: List[Dict[str, Any]],
+) -> str:
+    """Classify a day from actual personalized calendar events only.
 
-    for planet, sign in daily_planet_signs.items():
-        if not sign:
-            continue
-        house = get_house_for_sign(sign, ascendant_sign)
-        if not house:
-            continue
+    No numeric score is used. A day is favorable when a relevant transit/Dasha
+    event is directly supportive and there is no directly challenging event.
+    A day is caution when the relevant event is challenging and there is no
+    supportive event. Mixed/no relevant events remain normal.
 
+    This intentionally mirrors the earlier calendar behavior: only actual
+    sign-change/Dasha events that are relevant to the user's chart contribute
+    to the 'For Me' view; ordinary daily planetary positions are not scored.
+    """
+    supportive = False
+    challenging = False
+
+    for event in transit_events:
+        relevance = event.get("relevance", {})
+        if not relevance.get("topics"):
+            continue
+        planet = event.get("planet")
         if planet in NATURAL_BENEFICS:
-            if house in KENDRA_TRIKONA_HOUSES:
-                score += 1.0
-                supportive_reasons.append(f"{planet} transiting your {house}th house")
-            elif house in DUSTHANA_HOUSES:
-                score -= 0.5
-                challenging_reasons.append(f"{planet} transiting your {house}th house (mildly softened)")
+            supportive = True
         elif planet in NATURAL_MALEFICS:
-            if house in DUSTHANA_HOUSES:
-                score -= 1.0
-                challenging_reasons.append(f"{planet} transiting your {house}th house")
-            elif house in KENDRA_TRIKONA_HOUSES:
-                score -= 0.25
-                challenging_reasons.append(f"{planet} transiting your {house}th house (needs care)")
+            challenging = True
 
-    if dasha_lord:
-        if dasha_lord in NATURAL_BENEFICS:
-            score += 1.0
-            supportive_reasons.append(f"{dasha_lord} Mahadasha (naturally supportive)")
-        elif dasha_lord in NATURAL_MALEFICS:
-            score -= 0.5
-            challenging_reasons.append(f"{dasha_lord} Mahadasha (needs steadier effort)")
+    for event in dasha_events:
+        lord = event.get("mahadasha")
+        if lord in NATURAL_BENEFICS:
+            supportive = True
+        elif lord in NATURAL_MALEFICS:
+            challenging = True
 
-    if score >= 1.5:
-        status = "favorable"
-    elif score <= -1.5:
-        status = "caution"
-    else:
-        status = "normal"
-
-    return {
-        "status": status,
-        "score": round(score, 2),
-        "supportive_reasons": supportive_reasons,
-        "challenging_reasons": challenging_reasons,
-    }
+    if supportive and not challenging:
+        return "favorable"
+    if challenging and not supportive:
+        return "caution"
+    return "normal"
 
 
 # ------------------------------------------------------------------
@@ -614,14 +601,14 @@ def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
             if muhurta:
                 days[str(day)]["muhurta"] = muhurta
 
-    # --- Personal day favorability, independent of Panchang/Muhurta ---
-    if SWISSEPH_AVAILABLE and ascendant_sign:
+    # --- Personal day classification: event-based, no numeric score ---
+    # Only actual personalized sign-change/Dasha events contribute.
+    if ascendant_sign:
         for day in range(1, days_in_month + 1):
-            day_signs = {planet: daily_signs.get(planet, {}).get(day) for planet in PLANET_ORDER}
-            active_dasha = _find_active_dasha(session, date(year, month, day))
-            dasha_lord = active_dasha.get("mahadasha") if active_dasha else None
-            result = _score_day_for_user(day_signs, ascendant_sign, dasha_lord)
-            days[str(day)]["personal_status"] = result["status"]
+            info = days[str(day)]
+            info["personal_status"] = _classify_personal_day(
+                info["transits"], info["dasha"]
+            )
 
     return {
         "year": year, "month": month,
@@ -663,9 +650,31 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
     maha_lord = active_dasha.get("mahadasha") if active_dasha else None
     antar_lord = active_dasha.get("antardasha") if active_dasha else None
 
+    day_dasha_events = _get_dasha_events_for_range(session, target_date, target_date)
+
     significant_topics = set()
     for entry in planetary_positions:
         significant_topics.update(entry.get("relevance", {}).get("topics", []))
+
+    # For the selected day, classify only actual sign-change events, matching
+    # the month-level For Me logic.
+    day_transit_events: List[Dict[str, Any]] = []
+    if SWISSEPH_AVAILABLE and ascendant_sign:
+        prev_jd = swe.julday(
+            (target_date - timedelta(days=1)).year,
+            (target_date - timedelta(days=1)).month,
+            (target_date - timedelta(days=1)).day,
+            12.0,
+        )
+        for planet in PLANET_ORDER:
+            current_sign = day_signs.get(planet)
+            previous_sign = _get_planet_sign(prev_jd, planet)
+            if current_sign and previous_sign and current_sign != previous_sign:
+                day_transit_events.append({
+                    "planet": planet,
+                    "new_sign": current_sign,
+                    "relevance": _personal_relevance(current_sign, ascendant_sign),
+                })
 
     muhurta = None
     if SWISSEPH_AVAILABLE and latitude and longitude:
@@ -673,14 +682,17 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
 
     panchang = compute_panchang(target_date) if SWISSEPH_AVAILABLE else None
 
-    personal_status = "normal"
-    supportive_reasons: List[str] = []
-    challenging_reasons: List[str] = []
-    if SWISSEPH_AVAILABLE and ascendant_sign:
-        result = _score_day_for_user(day_signs, ascendant_sign, maha_lord)
-        personal_status = result["status"]
-        supportive_reasons = result["supportive_reasons"]
-        challenging_reasons = result["challenging_reasons"]
+    personal_status = _classify_personal_day(day_transit_events, day_dasha_events)
+    supportive_reasons: List[str] = [
+        f"{e['planet']} moved into {e['new_sign']}"
+        for e in day_transit_events
+        if e.get("planet") in NATURAL_BENEFICS and e.get("relevance", {}).get("topics")
+    ]
+    challenging_reasons: List[str] = [
+        f"{e['planet']} moved into {e['new_sign']}"
+        for e in day_transit_events
+        if e.get("planet") in NATURAL_MALEFICS and e.get("relevance", {}).get("topics")
+    ]
 
     is_auspicious = bool(
         maha_lord and maha_lord in NATURAL_BENEFICS
@@ -703,6 +715,7 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
         "panchang": panchang,
         "personal_status": personal_status,
         "personal_supportive_reasons": supportive_reasons,
+
         "personal_challenging_reasons": challenging_reasons,
     }
 
@@ -817,16 +830,27 @@ def get_month_summary(session_id: str, year: int, month: int) -> Dict[str, Any]:
     dasha_event_count = sum(len(d["dasha"]) for d in days.values())
 
     favorable_days = sum(
-        1 for d in days.values()
-        if d.get("personal_status") == "favorable"
+        1 for d in days.values() if d.get("personal_status") == "favorable"
     )
     caution_days = sum(
-        1 for d in days.values()
-        if d.get("personal_status") == "caution"
+        1 for d in days.values() if d.get("personal_status") == "caution"
     )
 
-    favorable_days = sum(1 for info in days.values() if info.get("personal_status") == "favorable")
-    caution_days = sum(1 for info in days.values() if info.get("personal_status") == "caution")
+    good_muhurta_days = sum(
+        1 for d in days.values()
+        if d.get("muhurta") and (
+            d["muhurta"].get("abhijit") or d["muhurta"].get("brahma")
+        )
+    )
+    avoid_muhurta_days = sum(
+        1 for d in days.values()
+        if d.get("muhurta") and (
+            d["muhurta"].get("rahu_kalam")
+            or d["muhurta"].get("yamaganda")
+            or d["muhurta"].get("gulika_kalam")
+            or d["muhurta"].get("durmuhurtham")
+        )
+    )
 
     significant_days = [
         {
@@ -840,12 +864,10 @@ def get_month_summary(session_id: str, year: int, month: int) -> Dict[str, Any]:
 
     most_significant = None
     best_count = 0
-
     for day_info in significant_days:
         topics = set()
         for t in day_info["transits"]:
             topics.update(t.get("relevance", {}).get("topics", []))
-
         if topics and len(topics) > best_count:
             best_count = len(topics)
             most_significant = {
@@ -861,6 +883,8 @@ def get_month_summary(session_id: str, year: int, month: int) -> Dict[str, Any]:
         "significant_day_count": len(significant_days),
         "favorable_days": favorable_days,
         "caution_days": caution_days,
+        "good_muhurta_days": good_muhurta_days,
+        "avoid_muhurta_days": avoid_muhurta_days,
         "most_significant_day": most_significant,
         "swisseph_available": month_data["swisseph_available"],
         "has_dasha_data": month_data["has_dasha_data"],

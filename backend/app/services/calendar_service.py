@@ -1,4 +1,58 @@
+"""
+Astrology Calendar Service — computes planetary transit events, Dasha period
+boundaries, full Panchang (Tithi/Nakshatra/Yoga/Karana), Muhurta (auspicious/
+inauspicious timing windows including Durmuhurtham), and a PERSONAL day
+favorability classification for a given month or day.
 
+ARCHITECTURE (matches the split requested):
+
+                        DATE
+                          |
+          +---------------+---------------+
+          |                               |
+   PERSONAL ANALYSIS               GENERAL PANCHANG
+          |                               |
+   User's Kundli (Lagna)              Tithi
+   Daily transits                     Nakshatra
+   Active Dasha lord                  Yoga
+   Kendra/Trikona/Dusthana            Karana
+          |                               |
+          v                               v
+   day classification                 MUHURTA
+     GREEN / RED / NORMAL             Rahu Kalam
+                                       Yamaganda
+                                       Gulika Kalam
+                                       Abhijit Muhurta
+                                       Brahma Muhurta
+                                       Durmuhurtham
+
+Deterministic core: transit sign-changes, Panchang (Tithi/Nakshatra/Yoga/
+Karana), and sunrise/sunset all come from pyswisseph (Lahiri sidereal).
+Dasha boundaries come from the already-cached dasha_tree_raw (the REAL Dasha
+API tree — no local Vimshottari fallback, matching the rest of the
+codebase). Personal favorability re-uses get_house_for_sign(),
+KENDRA_TRIKONA_HOUSES, DUSTHANA_HOUSES and NATURAL_BENEFICS/MALEFICS from
+topic_service so "favorable for me" means the same thing here as it does in
+chat (the Evidence Vote / consistency-check logic).
+
+PANCHANG NOTE: Tithi, Nakshatra, and Yoga are computed from exact Sun/Moon
+sidereal longitude at local noon — precise, deterministic classical
+formulas, not approximations. Karana (half-tithi) is derived the same way.
+Durmuhurtham, by contrast, genuinely depends on which published table you
+follow (sources disagree on the exact muhurta index per weekday) — the
+table used below follows the widely-repeated STRUCTURAL pattern (no
+Durmuhurtham on Wednesday, two periods on Tuesday and Friday, one period on
+every other day), which is far more consistently agreed upon than the exact
+minute-level table. This is flagged here rather than silently presented as
+undisputed classical fact, the same way the rest of this file discloses its
+assumptions.
+
+The only LLM call in this file (explain_day) is optional and purely phrases
+already-computed facts — same pattern as house_insight_service.py. If a
+section's underlying data isn't available (no swisseph, no cached Dasha
+tree, no natal chart yet, no lat/lon for Muhurta), that section is simply
+omitted from the response rather than faked.
+"""
 import json
 import calendar as pycalendar
 from datetime import date, datetime, timedelta
@@ -294,7 +348,14 @@ def compute_panchang(target_date: date) -> Optional[Dict[str, Any]]:
     if not SWISSEPH_AVAILABLE:
         return None
     try:
-        jd = swe.julday(target_date.year, target_date.month, target_date.day, 12.0)
+        # Swiss Ephemeris expects UT. For India, 12:00 IST = 06:30 UTC.
+        local_noon_ut = 12.0 - IST_OFFSET_HOURS
+        jd = swe.julday(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            local_noon_ut,
+        )
         sun_long = _get_planet_longitude(jd, "Sun")
         moon_long = _get_planet_longitude(jd, "Moon")
         if sun_long is None or moon_long is None:
@@ -423,10 +484,7 @@ def _durmuhurtam_periods(weekday: int, sunrise: float, muhurta_len: float) -> Li
 
 
 def compute_muhurta_periods(target_date: date, latitude: float, longitude: float) -> Optional[Dict[str, Any]]:
-    """Returns {"sunrise", "sunset", "good": [...], "avoid": [...]} or None
-    if sunrise/sunset couldn't be computed. "avoid" includes Rahu Kalam,
-    Yamaganda, Gulika Kalam, and Durmuhurtham; "good" includes Abhijit and
-    Brahma Muhurta."""
+    """Return separately named Muhurta windows for one date."""
     sun_times = get_sun_rise_set_minutes(target_date, latitude, longitude)
     if not sun_times:
         return None
@@ -450,35 +508,57 @@ def compute_muhurta_periods(target_date: date, latitude: float, longitude: float
     gulika = _segment(GULIKA_SEGMENT[weekday])
 
     muhurta_len = day_duration / 15.0
+
     abhijit = {
         "start": _minutes_to_hhmm(sunrise + 7 * muhurta_len),
         "end": _minutes_to_hhmm(sunrise + 8 * muhurta_len),
     }
+
     brahma = {
         "start": _minutes_to_hhmm(sunrise - 96),
         "end": _minutes_to_hhmm(sunrise - 48),
     }
 
-    avoid = [
-        {"name": "Rahu Kalam", "start": rahu["start"], "end": rahu["end"],
-         "note": "Traditionally avoided for starting important new activities."},
-        {"name": "Yamaganda", "start": yama["start"], "end": yama["end"],
-         "note": "Traditionally avoided for auspicious beginnings."},
-        {"name": "Gulika Kalam", "start": gulika["start"], "end": gulika["end"],
-         "note": "Traditionally considered inauspicious for new ventures."},
-    ]
-    avoid.extend(_durmuhurtam_periods(weekday, sunrise, muhurta_len))
+    durmuhurtham = _durmuhurtam_periods(
+        weekday,
+        sunrise,
+        muhurta_len,
+    )
 
     return {
         "sunrise": _minutes_to_hhmm(sunrise),
         "sunset": _minutes_to_hhmm(sunset),
-        "avoid": avoid,
-        "good": [
-            {"name": "Abhijit Muhurta", "start": abhijit["start"], "end": abhijit["end"],
-             "note": "Traditionally favorable for beginning important work."},
-            {"name": "Brahma Muhurta", "start": brahma["start"], "end": brahma["end"],
-             "note": "Traditionally suitable for meditation, study, and spiritual practice."},
-        ],
+        "abhijit": [{
+            "name": "Abhijit Muhurta",
+            "start": abhijit["start"],
+            "end": abhijit["end"],
+            "note": "Traditionally favorable for beginning important work.",
+        }],
+        "brahma": [{
+            "name": "Brahma Muhurta",
+            "start": brahma["start"],
+            "end": brahma["end"],
+            "note": "Traditionally suitable for meditation, study, and spiritual practice.",
+        }],
+        "rahu_kalam": [{
+            "name": "Rahu Kalam",
+            "start": rahu["start"],
+            "end": rahu["end"],
+            "note": "Traditionally avoided for starting important new activities.",
+        }],
+        "yamaganda": [{
+            "name": "Yamaganda",
+            "start": yama["start"],
+            "end": yama["end"],
+            "note": "Traditionally avoided for auspicious beginnings.",
+        }],
+        "gulika_kalam": [{
+            "name": "Gulika Kalam",
+            "start": gulika["start"],
+            "end": gulika["end"],
+            "note": "Traditionally considered unsuitable for some new beginnings.",
+        }],
+        "durmuhurtham": durmuhurtham,
     }
 
 
@@ -497,9 +577,11 @@ def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
 
     days: Dict[str, Dict[str, Any]] = {
         str(d): {
-            "transits": [], "dasha": [], "good": [], "avoid": [],
+            "transits": [],
+            "dasha": [],
             "is_significant": False,
-            "personal_status": "normal", "personal_score": 0.0,
+            "personal_status": "normal",
+            "personal_score": 0.0,
         }
         for d in range(1, days_in_month + 1)
     }
@@ -530,8 +612,9 @@ def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
         for day in range(1, days_in_month + 1):
             muhurta = compute_muhurta_periods(date(year, month, day), latitude, longitude)
             if muhurta:
-                days[str(day)]["good"] = muhurta["good"]
-                days[str(day)]["avoid"] = muhurta["avoid"]
+                # The complete Muhurta data is returned by get_day_detail().
+                # The monthly grid uses personal_status for its markers.
+                pass
 
     # --- Personal day favorability, independent of Panchang/Muhurta ---
     if SWISSEPH_AVAILABLE and ascendant_sign:
@@ -675,8 +758,27 @@ def explain_day(session_id: str, date_str: str) -> Dict[str, Any]:
     topics_str = ", ".join(detail.get("significant_topics", [])) or "None specifically activated"
 
     muhurta = detail.get("muhurta")
-    good_str = "; ".join(f"{m['name']} {m['start']}-{m['end']}" for m in muhurta["good"]) if muhurta else "Not available"
-    avoid_str = "; ".join(f"{m['name']} {m['start']}-{m['end']}" for m in muhurta["avoid"]) if muhurta else "Not available"
+
+    favorable_windows: List[Dict[str, str]] = []
+    avoid_windows: List[Dict[str, str]] = []
+
+    if muhurta:
+        favorable_windows.extend(muhurta.get("abhijit", []))
+        favorable_windows.extend(muhurta.get("brahma", []))
+        avoid_windows.extend(muhurta.get("rahu_kalam", []))
+        avoid_windows.extend(muhurta.get("yamaganda", []))
+        avoid_windows.extend(muhurta.get("gulika_kalam", []))
+        avoid_windows.extend(muhurta.get("durmuhurtham", []))
+
+    good_str = "; ".join(
+        f"{m['name']} {m['start']}-{m['end']}"
+        for m in favorable_windows
+    ) or "Not available"
+
+    avoid_str = "; ".join(
+        f"{m['name']} {m['start']}-{m['end']}"
+        for m in avoid_windows
+    ) or "Not available"
 
     panchang = detail.get("panchang")
     panchang_str = (
@@ -718,34 +820,47 @@ def get_month_summary(session_id: str, year: int, month: int) -> Dict[str, Any]:
 
     transit_count = sum(len(d["transits"]) for d in days.values())
     dasha_event_count = sum(len(d["dasha"]) for d in days.values())
-    good_muhurta_days = sum(1 for d in days.values() if d.get("good"))
-    avoid_muhurta_days = sum(1 for d in days.values() if d.get("avoid"))
-    favorable_days = sum(1 for d in days.values() if d.get("personal_status") == "favorable")
-    caution_days = sum(1 for d in days.values() if d.get("personal_status") == "caution")
+
+    favorable_days = sum(
+        1 for d in days.values()
+        if d.get("personal_status") == "favorable"
+    )
+    caution_days = sum(
+        1 for d in days.values()
+        if d.get("personal_status") == "caution"
+    )
 
     significant_days = [
-        {"day": int(day), "transits": info["transits"], "dasha": info["dasha"]}
+        {
+            "day": int(day),
+            "transits": info["transits"],
+            "dasha": info["dasha"],
+        }
         for day, info in sorted(days.items(), key=lambda kv: int(kv[0]))
         if info["is_significant"]
     ]
 
     most_significant = None
     best_count = 0
+
     for day_info in significant_days:
         topics = set()
         for t in day_info["transits"]:
             topics.update(t.get("relevance", {}).get("topics", []))
+
         if topics and len(topics) > best_count:
             best_count = len(topics)
-            most_significant = {"day": day_info["day"], "topics": sorted(topics)}
+            most_significant = {
+                "day": day_info["day"],
+                "topics": sorted(topics),
+            }
 
     return {
-        "year": year, "month": month,
+        "year": year,
+        "month": month,
         "transit_count": transit_count,
         "dasha_event_count": dasha_event_count,
         "significant_day_count": len(significant_days),
-        "good_muhurta_days": good_muhurta_days,
-        "avoid_muhurta_days": avoid_muhurta_days,
         "favorable_days": favorable_days,
         "caution_days": caution_days,
         "most_significant_day": most_significant,

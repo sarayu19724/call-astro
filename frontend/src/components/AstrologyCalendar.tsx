@@ -14,16 +14,30 @@ interface TransitEvent { planet: string; new_sign: string; relevance?: Relevance
 interface DashaEvent { date: string; mahadasha: string; antardasha: string; boundary: string; }
 interface MuhurtaWindow { name: string; start: string; end: string; note: string; }
 interface DayInfo {
-  transits: TransitEvent[]; dasha: DashaEvent[];
-  good: MuhurtaWindow[]; avoid: MuhurtaWindow[];
+  transits: TransitEvent[];
+  dasha: DashaEvent[];
+  good: MuhurtaWindow[];
+  avoid: MuhurtaWindow[];
+  muhurta?: MuhurtaDetail | null;
   is_significant: boolean;
+  personal_status?: 'favorable' | 'caution' | 'normal';
+  personal_score?: number;
 }
 interface MonthData {
   year: number; month: number; swisseph_available: boolean;
   has_dasha_data: boolean; has_chart_data: boolean; has_muhurta_data: boolean;
   days: Record<string, DayInfo>;
 }
-interface MuhurtaDetail { sunrise: string; sunset: string; good: MuhurtaWindow[]; avoid: MuhurtaWindow[]; }
+interface MuhurtaDetail {
+  sunrise: string;
+  sunset: string;
+  abhijit: MuhurtaWindow[];
+  brahma: MuhurtaWindow[];
+  rahu_kalam: MuhurtaWindow[];
+  yamaganda: MuhurtaWindow[];
+  gulika_kalam: MuhurtaWindow[];
+  durmuhurtham: MuhurtaWindow[];
+}
 interface DayDetail {
   available: boolean;
   date?: string;
@@ -34,16 +48,35 @@ interface DayDetail {
   is_auspicious_heuristic?: boolean;
   explanation?: string;
   swisseph_available?: boolean;
+  has_dasha_data?: boolean;
   muhurta?: MuhurtaDetail | null;
   has_muhurta_data?: boolean;
+  panchang?: {
+    tithi: string;
+    paksha: string;
+    nakshatra: string;
+    nakshatra_pada: number;
+    yoga: string;
+    karana: string;
+  } | null;
+  personal_status?: 'favorable' | 'caution' | 'normal';
+  personal_score?: number;
+  personal_supportive_reasons?: string[];
+  personal_challenging_reasons?: string[];
 }
 interface MonthSummary {
-  transit_count: number; dasha_event_count: number; significant_day_count: number;
-  good_muhurta_days: number; avoid_muhurta_days: number; has_muhurta_data: boolean;
+  transit_count: number;
+  dasha_event_count: number;
+  significant_day_count: number;
+  good_muhurta_days: number;
+  avoid_muhurta_days: number;
+  favorable_days?: number;
+  caution_days?: number;
+  has_muhurta_data: boolean;
   most_significant_day: { day: number; topics: string[] } | null;
 }
 
-type FilterKey = 'all' | 'good' | 'avoid' | 'transits' | 'dasha' | 'important';
+type FilterKey = 'all' | 'transits' | 'dasha' | 'important';
 
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const WEEKDAY_LABELS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
@@ -59,7 +92,7 @@ const STRINGS: Record<string, {
 }> = {
   English: {
     title: 'Astrology Calendar',
-    filters: { all: 'All', good: 'Good Times', avoid: 'Avoid', transits: 'Transits', dasha: 'Dasha', important: 'For Me' },
+    filters: { all: 'All', transits: 'Transits', dasha: 'Dasha', important: 'For Me' },
     monthAtGlance: 'Month at a Glance', significantDates: 'potentially significant dates',
     significantTransits: 'planetary movements', dashaEvents: 'Dasha-related events',
     mostSignificant: 'Most significant', viewMonthly: 'View Monthly Analysis',
@@ -74,7 +107,7 @@ const STRINGS: Record<string, {
   },
   Hindi: {
     title: 'ज्योतिष कैलेंडर',
-    filters: { all: 'सभी', good: 'शुभ समय', avoid: 'बचें', transits: 'गोचर', dasha: 'दशा', important: 'मेरे लिए' },
+    filters: { all: 'सभी', transits: 'गोचर', dasha: 'दशा', important: 'मेरे लिए' },
     monthAtGlance: 'माह की झलक', significantDates: 'संभावित महत्वपूर्ण तिथियाँ',
     significantTransits: 'ग्रह गोचर', dashaEvents: 'दशा से जुड़ी घटनाएँ',
     mostSignificant: 'सबसे महत्वपूर्ण', viewMonthly: 'मासिक विश्लेषण देखें',
@@ -89,7 +122,7 @@ const STRINGS: Record<string, {
   },
   Hinglish: {
     title: 'Astrology Calendar',
-    filters: { all: 'All', good: 'Good Times', avoid: 'Avoid', transits: 'Transits', dasha: 'Dasha', important: 'For Me' },
+    filters: { all: 'All', transits: 'Transits', dasha: 'Dasha', important: 'For Me' },
     monthAtGlance: 'Month at a Glance', significantDates: 'potentially significant dates',
     significantTransits: 'planetary movements', dashaEvents: 'Dasha-related events',
     mostSignificant: 'Most significant', viewMonthly: 'View Monthly Analysis',
@@ -103,6 +136,44 @@ const STRINGS: Record<string, {
     goodDaysCount: 'din jab favorable Muhurta hai', avoidDaysCount: 'din jab avoid karne wala period hai',
   },
 };
+
+function MuhurtaSection({
+  title,
+  items,
+  positive = false,
+}: {
+  title: string;
+  items: MuhurtaWindow[];
+  positive?: boolean;
+}) {
+  if (!items.length) return null;
+  const box = positive
+    ? 'bg-emerald-50 border-emerald-200'
+    : 'bg-rose-50 border-rose-200';
+  const titleClass = positive ? 'text-emerald-700' : 'text-rose-600';
+  const nameClass = positive ? 'text-emerald-800' : 'text-rose-800';
+  const timeClass = positive ? 'text-emerald-700' : 'text-rose-700';
+  const noteClass = positive ? 'text-emerald-600' : 'text-rose-600';
+
+  return (
+    <div>
+      <p className={`text-[10px] uppercase tracking-wide font-semibold mb-1.5 ${titleClass}`}>
+        {positive ? '🟢' : '🔴'} {title}
+      </p>
+      <div className="space-y-1.5">
+        {items.map((m, i) => (
+          <div key={`${m.name}-${m.start}-${i}`} className={`${box} border rounded-lg px-3 py-2`}>
+            <div className="flex items-center justify-between gap-2">
+              <span className={`text-xs font-semibold ${nameClass}`}>{m.name}</span>
+              <span className={`text-xs ${timeClass}`}>{m.start} – {m.end}</span>
+            </div>
+            {m.note && <p className={`text-[11px] mt-0.5 ${noteClass}`}>{m.note}</p>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export default function AstrologyCalendar({ sessionId, language, onBack }: AstrologyCalendarProps) {
   const t = STRINGS[language] || STRINGS.Hinglish;
@@ -179,11 +250,9 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
 
   const dayMatchesFilter = (info: DayInfo): boolean => {
     switch (filter) {
-      case 'good': return info.good.length > 0;
-      case 'avoid': return info.avoid.length > 0;
       case 'transits': return info.transits.length > 0;
       case 'dasha': return info.dasha.length > 0;
-      case 'important': return info.is_significant;
+      case 'important': return info.is_significant || info.personal_status === 'favorable' || info.personal_status === 'caution';
       default: return true;
     }
   };
@@ -272,10 +341,10 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   if (day === null) return <div key={`b-${idx}`} />;
                   const info = monthData?.days[String(day)];
                   const visible = info ? dayMatchesFilter(info) : false;
-                  const hasGood = !!info?.good.length;
-                  const hasAvoid = !!info?.avoid.length;
-                  const hasTransit = !!info?.transits.length;
-                  const hasDasha = !!info?.dasha.length;
+                  const hasGood = info?.personal_status === 'favorable';
+                  const hasAvoid = info?.personal_status === 'caution';
+                  const hasTransit = !!info?.transits?.length;
+                  const hasDasha = !!info?.dasha?.length;
                   const isToday = year === today.getFullYear() && month === today.getMonth() + 1 && day === today.getDate();
 
                   return (
@@ -329,36 +398,33 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                     </div>
                   )}
 
-                  {dayDetail.muhurta && dayDetail.muhurta.good.length > 0 && (
-                    <div>
-                      <p className="text-[10px] uppercase tracking-wide text-emerald-600 font-semibold mb-1.5">🟢 {t.goodTimes}</p>
-                      <div className="space-y-1.5">
-                        {dayDetail.muhurta.good.map((m) => (
-                          <div key={m.name} className="bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-xs font-semibold text-emerald-800">{m.name}</span>
-                              <span className="text-xs text-emerald-700">{m.start} – {m.end}</span>
-                            </div>
-                            <p className="text-[11px] text-emerald-600 mt-0.5">{m.note}</p>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
+                  {dayDetail.muhurta && dayDetail.muhurta.abhijit.length > 0 && (
+                    <MuhurtaSection title="Favorable Muhurta" items={[
+                      ...dayDetail.muhurta.abhijit,
+                      ...dayDetail.muhurta.brahma,
+                    ]} positive />
                   )}
 
-                  {dayDetail.muhurta && dayDetail.muhurta.avoid.length > 0 && (
-                    <div>
-                      <p className="text-[10px] uppercase tracking-wide text-rose-600 font-semibold mb-1.5">🔴 {t.avoidTimes}</p>
-                      <div className="space-y-1.5">
-                        {dayDetail.muhurta.avoid.map((m) => (
-                          <div key={m.name} className="bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-xs font-semibold text-rose-800">{m.name}</span>
-                              <span className="text-xs text-rose-700">{m.start} – {m.end}</span>
-                            </div>
-                            <p className="text-[11px] text-rose-600 mt-0.5">{m.note}</p>
-                          </div>
-                        ))}
+                  {dayDetail.muhurta && (
+                    <MuhurtaSection title={t.avoidTimes} items={[
+                      ...dayDetail.muhurta.rahu_kalam,
+                      ...dayDetail.muhurta.yamaganda,
+                      ...dayDetail.muhurta.gulika_kalam,
+                      ...dayDetail.muhurta.durmuhurtham,
+                    ]} />
+                  )}
+
+                  {dayDetail.panchang && (
+                    <div className="bg-amber-50 border border-amber-200 rounded-xl px-3 py-3">
+                      <p className="text-[10px] uppercase tracking-wide text-amber-700 font-semibold mb-2">
+                        Panchang
+                      </p>
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-2 text-xs text-slate-700">
+                        <div><span className="text-slate-400">Tithi:</span> {dayDetail.panchang.tithi}</div>
+                        <div><span className="text-slate-400">Paksha:</span> {dayDetail.panchang.paksha}</div>
+                        <div><span className="text-slate-400">Nakshatra:</span> {dayDetail.panchang.nakshatra} (Pada {dayDetail.panchang.nakshatra_pada})</div>
+                        <div><span className="text-slate-400">Yoga:</span> {dayDetail.panchang.yoga}</div>
+                        <div><span className="text-slate-400">Karana:</span> {dayDetail.panchang.karana}</div>
                       </div>
                     </div>
                   )}
@@ -385,6 +451,30 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                     </div>
                   )}
 
+                  {dayDetail.personal_status && (
+                    <div className={`rounded-xl px-3 py-2 border ${
+                      dayDetail.personal_status === 'favorable'
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                        : dayDetail.personal_status === 'caution'
+                          ? 'bg-rose-50 border-rose-200 text-rose-700'
+                          : 'bg-slate-50 border-slate-200 text-slate-600'
+                    }`}>
+                      <p className="text-[10px] uppercase tracking-wide font-semibold mb-1">
+                        {t.significantFor}
+                      </p>
+                      <p className="text-xs font-medium capitalize">
+                        {dayDetail.personal_status}
+                        {typeof dayDetail.personal_score === 'number' ? ` · score ${dayDetail.personal_score}` : ''}
+                      </p>
+                      {dayDetail.personal_supportive_reasons?.length ? (
+                        <p className="text-[11px] mt-1">{dayDetail.personal_supportive_reasons.join(' • ')}</p>
+                      ) : null}
+                      {dayDetail.personal_challenging_reasons?.length ? (
+                        <p className="text-[11px] mt-1">{dayDetail.personal_challenging_reasons.join(' • ')}</p>
+                      ) : null}
+                    </div>
+                  )}
+
                   {dayDetail.significant_topics && dayDetail.significant_topics.length > 0 && (
                     <div>
                       <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-1.5">{t.significantFor}</p>
@@ -400,7 +490,15 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
 
                   {(!dayDetail.planetary_positions || dayDetail.planetary_positions.length === 0) &&
                     !dayDetail.current_mahadasha &&
-                    !(dayDetail.muhurta && (dayDetail.muhurta.good.length || dayDetail.muhurta.avoid.length)) && (
+                    !dayDetail.panchang &&
+                    !(dayDetail.muhurta && (
+                      dayDetail.muhurta.abhijit.length ||
+                      dayDetail.muhurta.brahma.length ||
+                      dayDetail.muhurta.rahu_kalam.length ||
+                      dayDetail.muhurta.yamaganda.length ||
+                      dayDetail.muhurta.gulika_kalam.length ||
+                      dayDetail.muhurta.durmuhurtham.length
+                    )) && (
                     <p className="text-xs text-slate-400 italic">{t.noData}</p>
                   )}
 
@@ -434,6 +532,12 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                     <li>• {summary.good_muhurta_days} {t.goodDaysCount}</li>
                     <li>• {summary.avoid_muhurta_days} {t.avoidDaysCount}</li>
                   </>
+                )}
+                {typeof summary.favorable_days === 'number' && (
+                  <li>• {summary.favorable_days} favorable personal days</li>
+                )}
+                {typeof summary.caution_days === 'number' && (
+                  <li>• {summary.caution_days} personal caution days</li>
                 )}
                 <li>• {summary.transit_count} {t.significantTransits}</li>
                 <li>• {summary.dasha_event_count} {t.dashaEvents}</li>

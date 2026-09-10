@@ -1,3 +1,57 @@
+"""
+Astrology Calendar Service — computes planetary transit events, Dasha period
+boundaries, full Panchang (Tithi/Nakshatra/Yoga/Karana), Muhurta (auspicious/
+inauspicious timing windows including Durmuhurtham), and an event-based PERSONAL day
+favorability classification for a given month or day.
+
+ARCHITECTURE (matches the split requested):
+
+                        DATE
+                          |
+          +---------------+---------------+
+          |                               |
+   PERSONAL ANALYSIS               GENERAL PANCHANG
+          |                               |
+   User's Kundli (Lagna)              Tithi
+   Daily transits                     Nakshatra
+   Active Dasha lord                  Yoga
+   Kendra/Trikona/Dusthana            Karana
+          |                               |
+          v                               v
+   day classification                 MUHURTA
+     GREEN / RED / NORMAL             Rahu Kalam
+                                       Yamaganda
+                                       Gulika Kalam
+                                       Abhijit Muhurta
+                                       Brahma Muhurta
+                                       Durmuhurtham
+
+Deterministic core: transit sign-changes, Panchang (Tithi/Nakshatra/Yoga/
+Karana), and sunrise/sunset all come from pyswisseph (Lahiri sidereal).
+Dasha boundaries come from the already-cached dasha_tree_raw (the REAL Dasha
+API tree — no local Vimshottari fallback, matching the rest of the
+codebase). Personal "For Me" classification is event-based: only relevant transit
+sign changes and Dasha boundary events are considered. No numeric score or
+threshold is used; this preserves the earlier sparse, event-driven behavior.
+
+PANCHANG NOTE: Tithi, Nakshatra, and Yoga are computed from exact Sun/Moon
+sidereal longitude at local noon — precise, deterministic classical
+formulas, not approximations. Karana (half-tithi) is derived the same way.
+Durmuhurtham, by contrast, genuinely depends on which published table you
+follow (sources disagree on the exact muhurta index per weekday) — the
+table used below follows the widely-repeated STRUCTURAL pattern (no
+Durmuhurtham on Wednesday, two periods on Tuesday and Friday, one period on
+every other day), which is far more consistently agreed upon than the exact
+minute-level table. This is flagged here rather than silently presented as
+undisputed classical fact, the same way the rest of this file discloses its
+assumptions.
+
+The only LLM call in this file (explain_day) is optional and purely phrases
+already-computed facts — same pattern as house_insight_service.py. If a
+section's underlying data isn't available (no swisseph, no cached Dasha
+tree, no natal chart yet, no lat/lon for Muhurta), that section is simply
+omitted from the response rather than faked.
+"""
 import json
 import calendar as pycalendar
 from datetime import date, datetime, timedelta
@@ -557,9 +611,6 @@ def get_month_events(
     latitude, longitude, location_source = _resolve_calendar_location(
         session, current_latitude, current_longitude
     )
-    logger.info(
-        f"[Calendar] location_source={location_source}, latitude={latitude}, longitude={longitude}"
-    )
 
     days_in_month = pycalendar.monthrange(year, month)[1]
     daily_signs = _daily_signs_for_month(year, month)
@@ -641,9 +692,6 @@ def get_day_detail(
     ascendant_sign = chart["ascendant_sign"] if chart else None
     latitude, longitude, location_source = _resolve_calendar_location(
         session, current_latitude, current_longitude
-    )
-    logger.info(
-        f"[Calendar] location_source={location_source}, latitude={latitude}, longitude={longitude}"
     )
 
     planetary_positions: List[Dict[str, Any]] = []

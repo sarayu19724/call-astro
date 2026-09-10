@@ -80,7 +80,7 @@ interface MonthSummary {
   most_significant_day: { day: number; topics: string[] } | null;
 }
 
-type FilterKey = 'all' | 'favorable' | 'caution' | 'transits' | 'dasha';
+type FilterKey = 'all' | 'transits' | 'dasha' | 'important';
 
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const WEEKDAY_LABELS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
@@ -97,7 +97,7 @@ const STRINGS: Record<string, {
 }> = {
   English: {
     title: 'Astrology Calendar',
-    filters: { all: 'All', favorable: 'Favorable', caution: 'Needs Care', transits: 'Transits', dasha: 'Dasha' },
+    filters: { all: 'All', transits: 'Transits', dasha: 'Dasha', important: 'For Me' },
     monthAtGlance: 'Month at a Glance', significantDates: 'potentially significant dates',
     significantTransits: 'planetary movements', dashaEvents: 'Dasha-related events',
     mostSignificant: 'Most significant', viewMonthly: 'View Monthly Analysis',
@@ -113,7 +113,7 @@ const STRINGS: Record<string, {
   },
   Hindi: {
     title: 'ज्योतिष कैलेंडर',
-    filters: { all: 'सभी', favorable: 'अनुकूल', caution: 'सावधानी', transits: 'गोचर', dasha: 'दशा' },
+    filters: { all: 'सभी', transits: 'गोचर', dasha: 'दशा', important: 'मेरे लिए' },
     monthAtGlance: 'माह की झलक', significantDates: 'संभावित महत्वपूर्ण तिथियाँ',
     significantTransits: 'ग्रह गोचर', dashaEvents: 'दशा से जुड़ी घटनाएँ',
     mostSignificant: 'सबसे महत्वपूर्ण', viewMonthly: 'मासिक विश्लेषण देखें',
@@ -129,7 +129,7 @@ const STRINGS: Record<string, {
   },
   Hinglish: {
     title: 'Astrology Calendar',
-    filters: { all: 'All', favorable: 'Favorable', caution: 'Needs Care', transits: 'Transits', dasha: 'Dasha' },
+    filters: { all: 'All', transits: 'Transits', dasha: 'Dasha', important: 'For Me' },
     monthAtGlance: 'Month at a Glance', significantDates: 'potentially significant dates',
     significantTransits: 'planetary movements', dashaEvents: 'Dasha-related events',
     mostSignificant: 'Most significant', viewMonthly: 'View Monthly Analysis',
@@ -203,7 +203,6 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
   // the user's current browser location when permission is granted.
   const [currentLocation, setCurrentLocation] = useState<{ latitude: number; longitude: number } | null>(null);
   const [locationStatus, setLocationStatus] = useState<'requesting' | 'ready' | 'denied' | 'unsupported'>('requesting');
-  const [locationError, setLocationError] = useState<string | null>(null);
 
   const requestCurrentLocation = useCallback(() => {
     if (!navigator.geolocation) {
@@ -212,7 +211,6 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
     }
 
     setLocationStatus('requesting');
-    setLocationError(null);
     navigator.geolocation.getCurrentPosition(
       (position) => {
         setCurrentLocation({
@@ -220,18 +218,11 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
           longitude: position.coords.longitude,
         });
         setLocationStatus('ready');
-        setLocationError(null);
       },
       (error) => {
         console.warn('Current location unavailable:', error.message);
         setCurrentLocation(null);
-        if (error.code === error.PERMISSION_DENIED) {
-          setLocationStatus('denied');
-          setLocationError('Location permission was denied. Allow location access for callastro.vercel.app and try again.');
-        } else {
-          setLocationStatus('unsupported');
-          setLocationError(error.message || 'Current location could not be obtained.');
-        }
+        setLocationStatus(error.code === error.PERMISSION_DENIED ? 'denied' : 'unsupported');
       },
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 5 * 60 * 1000 },
     );
@@ -261,12 +252,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
     }
   }, [sessionId, year, month, locationQuery]);
 
-  useEffect(() => {
-    // Wait for the browser location decision first. If permission is denied,
-    // locationStatus becomes denied and the calendar intentionally falls back
-    // to the birth location.
-    if (locationStatus !== 'requesting') loadMonth();
-  }, [loadMonth, locationStatus]);
+  useEffect(() => { loadMonth(); }, [loadMonth]);
 
   const changeMonth = (delta: number) => {
     setSelectedDay(null);
@@ -310,10 +296,9 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
 
   const dayMatchesFilter = (info: DayInfo): boolean => {
     switch (filter) {
-      case 'favorable': return info.personal_status === 'favorable';
-      case 'caution': return info.personal_status === 'caution';
       case 'transits': return info.transits.length > 0;
       case 'dasha': return info.dasha.length > 0;
+      case 'important': return info.is_significant || info.personal_status === 'favorable' || info.personal_status === 'caution';
       default: return true;
     }
   };
@@ -388,39 +373,19 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
               {t.useCurrentLocation}
             </button>
           </div>
-          {locationError && locationStatus !== 'ready' && (
-            <div className="text-[11px] text-rose-600 bg-rose-50 border border-rose-100 rounded-lg px-3 py-2">
-              {locationError}
-            </div>
-          )}
 
           {/* Filters */}
           <div className="flex flex-wrap gap-2">
-            {(['all', 'favorable', 'caution', 'transits', 'dasha'] as FilterKey[]).map((key) => (
+            {(Object.keys(t.filters) as FilterKey[]).map((key) => (
               <button
                 key={key}
                 onClick={() => setFilter(key)}
-                className={`px-3 py-1.5 rounded-full text-xs font-medium border transition flex items-center gap-1.5 ${
+                className={`px-3 py-1.5 rounded-full text-xs font-medium border transition ${
                   filter === key
-                    ? key === 'favorable'
-                      ? 'bg-emerald-500 text-white border-emerald-500'
-                      : key === 'caution'
-                        ? 'bg-rose-500 text-white border-rose-500'
-                        : key === 'transits'
-                          ? 'bg-sky-500 text-white border-sky-500'
-                          : key === 'dasha'
-                            ? 'bg-violet-500 text-white border-violet-500'
-                            : 'bg-amber-500 text-white border-amber-500'
+                    ? 'bg-amber-500 text-white border-amber-500'
                     : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
                 }`}
               >
-                {key !== 'all' && (
-                  <span className={`w-1.5 h-1.5 rounded-full ${
-                    key === 'favorable' ? 'bg-emerald-500' :
-                    key === 'caution' ? 'bg-rose-500' :
-                    key === 'transits' ? 'bg-sky-500' : 'bg-violet-500'
-                  }`} />
-                )}
                 {t.filters[key]}
               </button>
             ))}
@@ -452,8 +417,8 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   if (day === null) return <div key={`b-${idx}`} />;
                   const info = monthData?.days[String(day)];
                   const visible = info ? dayMatchesFilter(info) : false;
-                  const hasFavorable = info?.personal_status === 'favorable';
-                  const hasCaution = info?.personal_status === 'caution';
+                  const hasGood = info?.personal_status === 'favorable';
+                  const hasAvoid = info?.personal_status === 'caution';
                   const hasTransit = !!info?.transits?.length;
                   const hasDasha = !!info?.dasha?.length;
                   const isToday = year === today.getFullYear() && month === today.getMonth() + 1 && day === today.getDate();
@@ -468,8 +433,8 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                     >
                       <span>{day}</span>
                       <span className="flex gap-0.5 mt-0.5">
-                        {hasFavorable && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
-                        {hasCaution && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-rose-500'}`} />}
+                        {hasGood && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
+                        {hasAvoid && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-rose-500'}`} />}
                         {hasTransit && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-sky-500'}`} />}
                         {hasDasha && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-violet-500'}`} />}
                       </span>
@@ -479,10 +444,10 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
               </div>
             )}
 
-            {!loading && monthData && (
+            {!loading && monthData?.has_muhurta_data && (
               <div className="flex flex-wrap gap-3 mt-4 pt-3 border-t border-slate-100 text-[10px] text-slate-400">
-                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {t.filters.favorable}</span>
-                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> {t.filters.caution}</span>
+                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {t.goodTimes}</span>
+                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> {t.avoidTimes}</span>
                 <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-sky-500" /> {t.significantTransits}</span>
                 <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-violet-500" /> {t.dashaEvents}</span>
               </div>

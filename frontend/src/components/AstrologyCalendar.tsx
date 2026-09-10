@@ -47,6 +47,8 @@ interface DayDetail {
   current_mahadasha?: string | null;
   current_antardasha?: string | null;
   significant_topics?: string[];
+  topic_significance?: Record<string, string>;
+  topic_factors?: Record<string, string[]>;
   is_auspicious_heuristic?: boolean;
   explanation?: string;
   swisseph_available?: boolean;
@@ -83,6 +85,21 @@ type LocationStatus = 'requesting' | 'ready' | 'denied' | 'unsupported' | 'manua
 
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const WEEKDAY_LABELS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
+
+const TOPIC_MEANINGS: Record<string, string> = {
+  career: 'Career, profession, work and public responsibilities.',
+  finance: 'Money, savings, resources and financial gains.',
+  marriage: 'Marriage, spouse, partnership and long-term relationships.',
+  health: 'Physical health, vitality and health-related matters.',
+  education: 'Education, learning, study and academic matters.',
+  family: 'Family, home and domestic matters.',
+  children: 'Children, creativity and matters of the 5th house.',
+  travel: 'Travel, movement and changes of place.',
+};
+
+function formatTopic(topic: string): string {
+  return topic.replace(/_/g, ' ').replace(/\w/g, (c) => c.toUpperCase());
+}
 
 const STRINGS: Record<string, {
   title: string; filters: Record<FilterKey, string>; monthAtGlance: string; significantDates: string;
@@ -743,14 +760,46 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   )}
 
                   {dayDetail.significant_topics && dayDetail.significant_topics.length > 0 && (
-                    <div>
-                      <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-1.5">{t.significantFor}</p>
-                      <div className="flex flex-wrap gap-1.5">
-                        {dayDetail.significant_topics.map((topic) => (
-                          <span key={topic} className="text-xs bg-amber-50 text-amber-700 border border-amber-200 rounded-full px-2.5 py-1 capitalize">
-                            ⭐ {topic}
-                          </span>
-                        ))}
+                    <div className="border-t border-slate-100 pt-3">
+                      <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-2">
+                        {t.whyImportant}
+                      </p>
+
+                      <div className="space-y-2.5">
+                        {dayDetail.significant_topics.map((topic) => {
+                          const meaning =
+                            dayDetail.topic_significance?.[topic] ||
+                            TOPIC_MEANINGS[topic.toLowerCase()] ||
+                            `This date has a chart-related indication for ${formatTopic(topic)}.`;
+
+                          const factors = dayDetail.topic_factors?.[topic] || [];
+
+                          return (
+                            <div
+                              key={topic}
+                              className="bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5"
+                            >
+                              <p className="text-xs font-semibold text-amber-800">
+                                ⭐ {formatTopic(topic)}
+                              </p>
+
+                              <p className="text-[11px] text-slate-700 mt-1 leading-relaxed">
+                                {meaning}
+                              </p>
+
+                              {factors.length > 0 && (
+                                <div className="mt-1.5">
+                                  <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-0.5">
+                                    Relevant chart factor
+                                  </p>
+                                  <p className="text-[11px] text-slate-600 leading-relaxed">
+                                    {factors.join(' • ')}
+                                  </p>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   )}
@@ -770,9 +819,14 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   )}
 
                   {dayDetail.explanation && (
-                    <p className="text-sm text-slate-700 leading-relaxed border-t border-slate-100 pt-3">
-                      {dayDetail.explanation}
-                    </p>
+                    <div className="border-t border-slate-100 pt-3">
+                      <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-1.5">
+                        {t.whyImportant}
+                      </p>
+                      <p className="text-sm text-slate-700 leading-relaxed">
+                        {dayDetail.explanation}
+                      </p>
+                    </div>
                   )}
 
                   <button
@@ -780,7 +834,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                     disabled={explaining}
                     className="text-xs font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg px-3 py-1.5 transition disabled:opacity-50"
                   >
-                    {explaining ? t.loading : t.whyImportant}
+                    {explaining ? t.loading : 'Explain these significant factors'}
                   </button>
                 </div>
               ) : (

@@ -59,6 +59,53 @@ HOUSE_ACTIVATION_PHRASE: Dict[int, str] = {
     12: "spirituality and foreign connections",
 }
 
+# Human-readable Vedic significance of each topic. These meanings explain the
+# already-identified significant topics; they do not decide whether a topic is
+# significant. The actual significance still comes from TOPIC_CHART_FACTORS and
+# the verified transit relevance calculated below.
+TOPIC_SIGNIFICANCE: Dict[str, str] = {
+    "career": "The 10th house signifies career, profession, work, status, and public standing.",
+    "finance": "The 2nd house signifies accumulated wealth, savings, family resources, and possessions; the 11th house also signifies gains and income.",
+    "health": "The 1st house signifies the body, vitality, and overall constitution; the 6th house is examined for illness and health-related challenges.",
+    "marriage": "The 7th house signifies marriage, spouse, partnerships, and long-term relationships.",
+    "children": "The 5th house signifies children, creativity, intelligence, and progeny-related matters.",
+    "education": "The 4th and 5th houses are important for education, learning, intelligence, and academic development.",
+    "relationships": "The 7th house signifies partnerships and marriage, while the 11th house can relate to social connections and fulfilment of desires.",
+    "travel": "The 3rd, 9th, and 12th houses are considered for travel, journeys, long-distance movement, and foreign connections.",
+    "business": "The 7th house signifies business partnerships and trade, while the 10th and 11th houses relate to profession and gains.",
+}
+
+
+def _topic_significance_for(topic: str) -> str:
+    key = (topic or "").strip().lower()
+    return TOPIC_SIGNIFICANCE.get(key, "This topic is connected to the relevant life area identified from the user's chart factors.")
+
+
+def _build_topic_factors(planetary_positions: List[Dict[str, Any]], significant_topics: List[str]) -> Dict[str, List[str]]:
+    """Build verified, date-specific factors for ONLY the topics already marked significant.
+
+    Each factor comes directly from the calculated transit planet -> sign -> natal house
+    relationship. No new topic is created here and no LLM-generated factor is used.
+    """
+    factors: Dict[str, List[str]] = {topic: [] for topic in significant_topics}
+    wanted = set(significant_topics)
+    for entry in planetary_positions:
+        relevance = entry.get("relevance") or {}
+        house = relevance.get("house")
+        topics = relevance.get("topics") or []
+        if house is None:
+            continue
+        for topic in topics:
+            if topic not in wanted:
+                continue
+            planet = entry.get("planet")
+            sign = entry.get("sign")
+            factor = f"{planet} is transiting your {_ordinal(int(house))} house in {sign}, which is connected with {topic}."
+            if factor not in factors[topic]:
+                factors[topic].append(factor)
+    return factors
+
+
 
 def _ordinal(n: int) -> str:
     if 10 <= (n % 100) <= 20:
@@ -803,34 +850,39 @@ def get_day_detail(
         "panchang": panchang,
         "personal_status": personal_status,
         "personal_supportive_reasons": supportive_reasons,
+        "topic_significance": {topic: _topic_significance_for(topic) for topic in sorted(significant_topics)},
+        "topic_factors": _build_topic_factors(planetary_positions, sorted(significant_topics)),
     }
 
 
 DAY_EXPLAIN_PROMPT = """You are a warm, experienced Indian Vedic Astrologer explaining why one specific
-calendar date matters for your client, using ONLY the verified facts below — never invent a planet,
-sign, house placement, or timing that isn't listed.
+calendar date matters for the client, using ONLY the verified facts below — never invent a planet,
+sign, house, topic, or timing that isn't listed.
 
 Rules:
 1. Respond STRICTLY in {language}.
-2. Length: 2-4 sentences, under 70 words. Plain prose, no bullet points, no headers.
-3. Never mention "calendar", "computed", "database", "score", or any technical process — speak as if
-   reading their chart directly.
-4. There are only TWO possible personal indications: "favorable" or "normal". NEVER describe a
-   "normal" day as needing care, caution, or extra attention — a normal day simply has no strongly
-   activated favorable factor right now. Describe it plainly and neutrally, and point to any favorable
-   timing windows (Muhurta) listed below for planning purposes. Only when the indication is
-   "favorable" should you name the specific supportive factor(s) behind it — and even then, frame it
-   as a supportive tendency, never a guarantee or a definite outcome.
-5. If Good/Avoid timings are listed below, you may mention them naturally (e.g. "the Rahu Kalam window
-   in the morning") but never invent a time that isn't given.
-6. If the facts below are sparse, keep the explanation brief and honest rather than padding it out.
+2. Length: 2-5 sentences, under 100 words. Plain prose, no bullet points, no headers.
+3. Never mention database, score, or technical implementation. Speak naturally as an astrologer.
+4. The explanation MUST directly address the topics listed in "Significant topics". Do not introduce
+   a different topic. For each listed topic, explain what it signifies in Vedic astrology using the
+   provided "Topic meanings", and then connect it to the provided "Verified topic factors".
+5. A verified factor must be repeated faithfully. Do not invent an aspect, conjunction, lordship,
+   dignity, yoga, or timing that is not explicitly provided.
+6. If a topic has no verified factor, say that the topic is identified from the chart relevance, but
+   avoid claiming a specific transit caused it.
+7. If the personal indication is "favorable", you may describe the listed factors as supportive
+   tendencies, never as a guarantee. If it is "normal", remain neutral and do not call it caution.
+8. If favorable timing windows are listed, they may be mentioned for planning, but they do not replace
+   the explanation of why the significant topics are relevant.
 
 Date: {date}
-Personal indication: {personal_status} (supportive factors: {supportive})
+Personal indication: {personal_status}
+Significant topics: {topics}
+Topic meanings: {topic_meanings}
+Verified topic factors: {topic_factors}
 Panchang: {panchang}
 Planetary movements on this date (verified): {transits}
 Current Dasha period (verified): {dasha}
-Life areas activated for this client (verified): {topics}
 Favorable timing windows today (verified): {good_muhurta}
 Timing windows to avoid today (verified): {avoid_muhurta}
 
@@ -858,7 +910,16 @@ def explain_day(
         f"Mahadasha {detail['current_mahadasha']}"
         + (f", Antardasha {detail['current_antardasha']}" if detail.get("current_antardasha") else "")
     ) if detail.get("current_mahadasha") else "Not available"
-    topics_str = ", ".join(detail.get("significant_topics", [])) or "None specifically activated"
+    significant_topic_list = detail.get("significant_topics", [])
+    topics_str = ", ".join(significant_topic_list) or "None specifically activated"
+    topic_meanings_str = "; ".join(
+        f"{topic}: {detail.get('topic_significance', {}).get(topic, _topic_significance_for(topic))}"
+        for topic in significant_topic_list
+    ) or "None"
+    topic_factors_str = "; ".join(
+        f"{topic}: {', '.join(detail.get('topic_factors', {}).get(topic, [])) or 'No specific transit factor listed'}"
+        for topic in significant_topic_list
+    ) or "None"
 
     muhurta = detail.get("muhurta")
 
@@ -894,22 +955,31 @@ def explain_day(
     prompt = DAY_EXPLAIN_PROMPT.format(
         language=language, date=date_str,
         personal_status=detail.get("personal_status", "normal"),
-        supportive=supportive_str,
+        topics=topics_str,
+        topic_meanings=topic_meanings_str,
+        topic_factors=topic_factors_str,
         panchang=panchang_str,
-        transits=transits_str, dasha=dasha_str, topics=topics_str,
+        transits=transits_str, dasha=dasha_str,
         good_muhurta=good_str, avoid_muhurta=avoid_str,
     )
 
     fallback = {
-        "English": "Based on the selected planetary movements and your chart, this date has a neutral "
-                    "overall indication. The favorable timing windows are shown above for planning "
-                    "important activities.",
-        "Hindi": "चयनित ग्रह गतियों और आपकी कुंडली के आधार पर, यह तिथि समग्र रूप से सामान्य संकेत देती है। "
-                 "महत्वपूर्ण कार्यों की योजना के लिए ऊपर दिखाए गए शुभ मुहूर्त देखें।",
-        "Hinglish": "Selected planetary movements aur aapki kundli ke hisaab se, yeh date overall neutral "
-                    "indication deti hai. Important kaamon ki planning ke liye upar diye gaye favorable "
-                    "Muhurta dekhein.",
-    }.get(language, "Is date ke liye koi khaas jaankari nahi hai.")
+        "English": (
+            f"This date is relevant to {topics_str}. "
+            f"{topic_factors_str if topic_factors_str != 'None' else 'No specific transit factor is listed for these topics.'} "
+            "The favorable timing windows are shown above for planning."
+        ),
+        "Hindi": (
+            f"यह तिथि {topics_str} से संबंधित है। "
+            f"{topic_factors_str if topic_factors_str != 'None' else 'इन विषयों के लिए कोई विशिष्ट गोचर कारक सूचीबद्ध नहीं है।'} "
+            "योजना के लिए ऊपर दिए गए शुभ मुहूर्त देखे जा सकते हैं।"
+        ),
+        "Hinglish": (
+            f"Yeh date {topics_str} se relevant hai. "
+            f"{topic_factors_str if topic_factors_str != 'None' else 'In topics ke liye koi specific transit factor listed nahi hai.'} "
+            "Planning ke liye upar diye gaye favorable Muhurta dekhein."
+        ),
+    }.get(language, "Is date ke liye koi specific explanation available nahi hai.")
 
     try:
         explanation = llm_service.generate(prompt=prompt, temperature=0.6).strip() or fallback

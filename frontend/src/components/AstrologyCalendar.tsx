@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { ArrowLeft, ChevronLeft, ChevronRight, Sparkles, Loader2, Sunrise, Sunset, MapPin, RefreshCw, Navigation, Search } from 'lucide-react';
+import { ArrowLeft, ChevronLeft, ChevronRight, Sparkles, Loader2, Sunrise, Sunset, MapPin, RefreshCw, Navigation, Search, CalendarPlus } from 'lucide-react';
 
 const API_BASE = ((import.meta as ImportMeta & { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE) || '/api';
 
@@ -40,6 +40,12 @@ interface MuhurtaDetail {
   gulika_kalam: MuhurtaWindow[];
   durmuhurtham: MuhurtaWindow[];
 }
+interface PlannerResult {
+  date: string;
+  time: string;
+  reason: string;
+}
+
 interface DayDetail {
   available: boolean;
   date?: string;
@@ -66,6 +72,8 @@ interface DayDetail {
   } | null;
   personal_status?: 'favorable' | 'normal';
   personal_supportive_reasons?: string[];
+  topic_significance?: Record<string, string>;
+  topic_factors?: Record<string, string[]>;
 }
 interface MonthSummary {
   transit_count: number;
@@ -83,6 +91,53 @@ type LocationStatus = 'requesting' | 'ready' | 'denied' | 'unsupported' | 'manua
 
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const WEEKDAY_LABELS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
+
+const TOPIC_SIGNIFICANCE: Record<string, string> = {
+  career: 'The 10th house signifies career, profession, work, status, and public standing.',
+  finance: 'The 2nd house signifies accumulated wealth, savings, family resources, and possessions; the 11th house also signifies gains and income.',
+  health: 'The 1st house signifies the body, vitality, and overall constitution; the 6th house is examined for illness and health-related challenges.',
+  marriage: 'The 7th house signifies marriage, spouse, partnerships, and long-term relationships.',
+  children: 'The 5th house signifies children, creativity, intelligence, and progeny-related matters.',
+  education: 'The 4th and 5th houses are important for education, learning, intelligence, and academic development.',
+  relationships: 'The 7th house signifies partnerships and marriage, while the 11th house can relate to social connections and fulfilment of desires.',
+  travel: 'The 3rd, 9th, and 12th houses are considered for travel, journeys, long-distance movement, and foreign connections.',
+  business: 'The 7th house signifies business partnerships and trade, while the 10th and 11th houses relate to profession and gains.',
+};
+
+const TOPIC_ALIASES: Record<string, string> = {
+  wealth: 'finance', money: 'finance', finances: 'finance', profession: 'career', work: 'career',
+  spouse: 'marriage', partnership: 'marriage', progeny: 'children', child: 'children',
+};
+
+function topicSignificance(topic: string): string | null {
+  const key = topic.toLowerCase().trim();
+  return TOPIC_SIGNIFICANCE[key] || TOPIC_SIGNIFICANCE[TOPIC_ALIASES[key]] || null;
+}
+
+function timeToMinutes(value: string): number {
+  const m = value.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (!m) return -1;
+  let h = Number(m[1]);
+  const min = Number(m[2]);
+  const ap = m[3].toUpperCase();
+  if (ap === 'AM' && h === 12) h = 0;
+  if (ap === 'PM' && h !== 12) h += 12;
+  return h * 60 + min;
+}
+
+function minutesToTime(minutes: number): string {
+  const total = Math.max(0, Math.min(1439, Math.round(minutes)));
+  const h24 = Math.floor(total / 60);
+  const mm = total % 60;
+  const ap = h24 >= 12 ? 'PM' : 'AM';
+  const h12 = h24 % 12 || 12;
+  return `${h12}:${String(mm).padStart(2, '0')} ${ap}`;
+}
+
+function dateToKey(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 
 const STRINGS: Record<string, {
   title: string; filters: Record<FilterKey, string>; monthAtGlance: string; significantDates: string;
@@ -213,6 +268,101 @@ function MuhurtaSection({
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function EventPlanner({ monthData, year, month }: { monthData: MonthData | null; year: number; month: number }) {
+  const [eventName, setEventName] = useState('Business meeting');
+  const [startDate, setStartDate] = useState(`${year}-${String(month).padStart(2, '0')}-01`);
+  const [endDate, setEndDate] = useState(`${year}-${String(month).padStart(2, '0')}-${String(new Date(year, month, 0).getDate()).padStart(2, '0')}`);
+  const [startTime, setStartTime] = useState('10:00');
+  const [endTime, setEndTime] = useState('16:00');
+  const [results, setResults] = useState<PlannerResult[]>([]);
+
+  useEffect(() => {
+    setStartDate(`${year}-${String(month).padStart(2, '0')}-01`);
+    setEndDate(`${year}-${String(month).padStart(2, '0')}-${String(new Date(year, month, 0).getDate()).padStart(2, '0')}`);
+    setResults([]);
+  }, [year, month]);
+
+  const findOptions = () => {
+    if (!monthData || startDate > endDate) { setResults([]); return; }
+    const preferredStart = Number(startTime.split(':')[0]) * 60 + Number(startTime.split(':')[1]);
+    const preferredEnd = Number(endTime.split(':')[0]) * 60 + Number(endTime.split(':')[1]);
+    const from = new Date(`${startDate}T00:00:00`);
+    const to = new Date(`${endDate}T00:00:00`);
+    const options: PlannerResult[] = [];
+
+    for (let d = new Date(from); d <= to; d.setDate(d.getDate() + 1)) {
+      if (d.getFullYear() !== year || d.getMonth() + 1 !== month) continue;
+      const key = dateToKey(d);
+      const info = monthData.days[String(d.getDate())];
+      if (!info) continue;
+
+      const avoid = (info.muhurta?.rahu_kalam || [])
+        .concat(info.muhurta?.yamaganda || [], info.muhurta?.gulika_kalam || [], info.muhurta?.durmuhurtham || [])
+        .map(w => [timeToMinutes(w.start), timeToMinutes(w.end)] as [number, number]);
+      const overlapsAvoid = (a: number, b: number) => avoid.some(([x, y]) => a < y && b > x);
+
+      const auspicious = (info.muhurta?.abhijit || []).concat(info.muhurta?.brahma || []);
+      const windows = auspicious
+        .map(w => {
+          const a = Math.max(preferredStart, timeToMinutes(w.start));
+          const b = Math.min(preferredEnd, timeToMinutes(w.end));
+          return { w, a, b };
+        })
+        .filter(x => x.a < x.b && !overlapsAvoid(x.a, x.b));
+
+      if (windows.length) {
+        const w = windows[0];
+        options.push({ date: key, time: minutesToTime(w.a), reason: `${w.w.name} falls within your preferred time and the date has ${info.personal_status === 'favorable' ? 'a favorable personal indication' : 'relevant chart factors'}.` });
+      } else if (info.personal_status === 'favorable' && preferredStart < preferredEnd && !overlapsAvoid(preferredStart, preferredEnd)) {
+        options.push({ date: key, time: minutesToTime(preferredStart), reason: 'Favorable personal indication, with the selected time range outside the listed avoid periods.' });
+      }
+    }
+
+    setResults(options.slice(0, 3));
+  };
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
+      <div className="flex items-center gap-2 mb-1">
+        <CalendarPlus size={16} className="text-amber-500" />
+        <h3 className="text-sm font-bold text-slate-800">Event Planner</h3>
+      </div>
+      <p className="text-[11px] text-slate-400 mb-4">Find suitable dates and times using the loaded month's personal indication and Muhurta windows.</p>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <input value={eventName} onChange={e => setEventName(e.target.value)} placeholder="Event (e.g. Business meeting)" className="rounded-lg border border-slate-200 px-3 py-2 text-xs" />
+        <div className="grid grid-cols-2 gap-2">
+          <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-2 text-xs" />
+          <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-2 text-xs" />
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <input type="time" value={startTime} onChange={e => setStartTime(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-2 text-xs" />
+          <input type="time" value={endTime} onChange={e => setEndTime(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-2 text-xs" />
+        </div>
+        <button type="button" onClick={findOptions} className="rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold px-3 py-2">Find Best Options</button>
+      </div>
+      {results.length > 0 && (
+        <div className="mt-4 pt-3 border-t border-slate-100">
+          <p className="text-[10px] uppercase tracking-wide text-emerald-700 font-semibold mb-2">Best options for {eventName || 'your event'}</p>
+          <div className="space-y-2">
+            {results.map(r => (
+              <div key={`${r.date}-${r.time}`} className="flex items-start justify-between gap-3 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                <div>
+                  <p className="text-xs font-semibold text-emerald-800">{r.date}</p>
+                  <p className="text-[11px] text-emerald-700">{r.time}</p>
+                </div>
+                <p className="text-[10px] text-emerald-700 text-right max-w-xs">{r.reason}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {results.length === 0 && monthData && (
+        <p className="text-[10px] text-slate-400 mt-3">Choose a date/time range and click Find Best Options. The planner searches the currently loaded month.</p>
+      )}
     </div>
   );
 }
@@ -555,6 +705,8 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
             ))}
           </div>
 
+          <EventPlanner monthData={monthData} year={year} month={month} />
+
           {/* Month navigation + grid */}
           <div className="bg-white border border-slate-200 rounded-2xl p-4 md:p-5 shadow-sm">
             <div className="flex items-center justify-between mb-4">
@@ -597,7 +749,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   // ------------------------------------------------------
                   const showTransitDot = (filter === 'all' || filter === 'transits') && hasTransit;
                   const showDashaDot = (filter === 'all' || filter === 'dasha') && hasDasha;
-                  const showFavorableDot = (filter === 'all' || filter === 'important') && favorable;
+                  const showFavorableDot = filter === 'all' || (filter === 'important' && favorable);
 
                   return (
                     <button
@@ -671,11 +823,12 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                     </div>
                   )}
 
-                  {dayDetail.muhurta && (dayDetail.muhurta.abhijit.length > 0 || dayDetail.muhurta.brahma.length > 0) && (
-                    <MuhurtaSection title={t.auspiciousWindows} items={[
-                      ...dayDetail.muhurta.abhijit,
-                      ...dayDetail.muhurta.brahma,
-                    ]} positive />
+                  {dayDetail.muhurta && dayDetail.muhurta.abhijit.length > 0 && (
+                    <MuhurtaSection title="Abhijit Muhurta" items={dayDetail.muhurta.abhijit} positive />
+                  )}
+
+                  {dayDetail.muhurta && dayDetail.muhurta.brahma.length > 0 && (
+                    <MuhurtaSection title="Brahma Muhurta" items={dayDetail.muhurta.brahma} positive />
                   )}
 
                   {dayDetail.muhurta && (
@@ -751,6 +904,25 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                             ⭐ {topic}
                           </span>
                         ))}
+                      </div>
+                      <div className="mt-2 space-y-2">
+                        {dayDetail.significant_topics.map((topic) => {
+                          const meaning = dayDetail.topic_significance?.[topic] || topicSignificance(topic);
+                          const factors = dayDetail.topic_factors?.[topic] || [];
+                          if (!meaning && !factors.length) return null;
+                          return (
+                            <div key={`meaning-${topic}`} className="text-[11px] text-slate-600">
+                              {meaning && (
+                                <p><span className="font-semibold text-slate-700 capitalize">{topic}:</span> {meaning}</p>
+                              )}
+                              {factors.length > 0 && (
+                                <p className="mt-0.5 text-slate-500">
+                                  <span className="font-medium text-slate-600">Current factor:</span> {factors[0]}
+                                </p>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   )}

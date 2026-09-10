@@ -1,5 +1,5 @@
-import { useEffect, useState, useCallback } from 'react';
-import { ArrowLeft, ChevronLeft, ChevronRight, Sparkles, Loader2, Sunrise, Sunset, MapPin, RefreshCw } from 'lucide-react';
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { ArrowLeft, ChevronLeft, ChevronRight, Sparkles, Loader2, Sunrise, Sunset, MapPin, RefreshCw, Navigation, Search } from 'lucide-react';
 
 const API_BASE = ((import.meta as ImportMeta & { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE) || '/api';
 
@@ -81,6 +81,8 @@ interface MonthSummary {
 }
 
 type FilterKey = 'all' | 'transits' | 'dasha' | 'important';
+type LocationMode = 'geolocation' | 'manual';
+type LocationStatus = 'requesting' | 'ready' | 'denied' | 'unsupported' | 'manual_pending' | 'manual_error';
 
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const WEEKDAY_LABELS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
@@ -94,6 +96,10 @@ const STRINGS: Record<string, {
   goodTimes: string; avoidTimes: string; sunrise: string; sunset: string;
   noMuhurtaData: string; goodDaysCount: string; avoidDaysCount: string;
   currentLocation: string; useCurrentLocation: string; locationPermission: string; locationDenied: string;
+  personalFavorable: string; personalNeedsCare: string; personalNormal: string;
+  enterLocationManually: string; manualPlaceholder: string; setLocation: string;
+  manualLocating: string; manualNotFound: string; liveTracking: string; manualLocationLabel: string;
+  switchToLive: string;
 }> = {
   English: {
     title: 'Astrology Calendar',
@@ -107,9 +113,14 @@ const STRINGS: Record<string, {
     swissephMissing: 'Transit calculations are not available yet on the server.',
     noChartYet: 'Chat with the astrologer once to unlock personalized relevance.', house: 'House',
     goodTimes: 'Good Times', avoidTimes: 'Avoid These Times', sunrise: 'Sunrise', sunset: 'Sunset',
-    noMuhurtaData: 'Timing calculations need your birth location — chat with the astrologer once to unlock them.',
+    noMuhurtaData: 'Timing calculations need a location — share your location below to unlock them.',
     goodDaysCount: 'days with a favorable Muhurta', avoidDaysCount: 'days with a period to avoid',
-    currentLocation: 'Current location', useCurrentLocation: 'Use current location', locationPermission: 'Getting your current location…', locationDenied: 'Using birth location',
+    currentLocation: 'Live location', useCurrentLocation: 'Refresh location', locationPermission: 'Getting your live location…', locationDenied: 'Using birth location',
+    personalFavorable: 'Favorable', personalNeedsCare: 'Needs Care', personalNormal: 'Normal',
+    enterLocationManually: 'Enter location manually', manualPlaceholder: 'e.g. Lucknow, India',
+    setLocation: 'Set', manualLocating: 'Finding…', manualNotFound: "Couldn't find that place — try a more specific name.",
+    liveTracking: 'Live tracking on', manualLocationLabel: 'Manual location',
+    switchToLive: 'Use live location instead',
   },
   Hindi: {
     title: 'ज्योतिष कैलेंडर',
@@ -123,9 +134,14 @@ const STRINGS: Record<string, {
     swissephMissing: 'गोचर गणना अभी सर्वर पर उपलब्ध नहीं है।',
     noChartYet: 'व्यक्तिगत जानकारी के लिए पहले ज्योतिषी से एक बार बात करें।', house: 'भाव',
     goodTimes: 'शुभ मुहूर्त', avoidTimes: 'इन समयों से बचें', sunrise: 'सूर्योदय', sunset: 'सूर्यास्त',
-    noMuhurtaData: 'मुहूर्त गणना के लिए जन्म स्थान चाहिए — पहले ज्योतिषी से एक बार बात करें।',
+    noMuhurtaData: 'मुहूर्त गणना के लिए स्थान चाहिए — नीचे अपना स्थान साझा करें।',
     goodDaysCount: 'शुभ मुहूर्त वाले दिन', avoidDaysCount: 'बचने योग्य समय वाले दिन',
-    currentLocation: 'वर्तमान स्थान', useCurrentLocation: 'वर्तमान स्थान उपयोग करें', locationPermission: 'वर्तमान स्थान प्राप्त किया जा रहा है…', locationDenied: 'जन्म स्थान उपयोग हो रहा है',
+    currentLocation: 'लाइव स्थान', useCurrentLocation: 'स्थान रीफ्रेश करें', locationPermission: 'आपका लाइव स्थान प्राप्त किया जा रहा है…', locationDenied: 'जन्म स्थान उपयोग हो रहा है',
+    personalFavorable: 'अनुकूल', personalNeedsCare: 'सावधानी आवश्यक', personalNormal: 'सामान्य',
+    enterLocationManually: 'स्थान मैन्युअल रूप से दर्ज करें', manualPlaceholder: 'जैसे लखनऊ, भारत',
+    setLocation: 'सेट करें', manualLocating: 'खोजा जा रहा है…', manualNotFound: 'यह स्थान नहीं मिला — अधिक स्पष्ट नाम आज़माएं।',
+    liveTracking: 'लाइव ट्रैकिंग चालू', manualLocationLabel: 'मैन्युअल स्थान',
+    switchToLive: 'लाइव स्थान उपयोग करें',
   },
   Hinglish: {
     title: 'Astrology Calendar',
@@ -139,9 +155,14 @@ const STRINGS: Record<string, {
     swissephMissing: 'Transit calculations abhi server par available nahi hain.',
     noChartYet: 'Personalized relevance ke liye pehle ek baar astrologer se baat karein.', house: 'House',
     goodTimes: 'Good Times', avoidTimes: 'Yeh Times Avoid Karein', sunrise: 'Sunrise', sunset: 'Sunset',
-    noMuhurtaData: 'Timing calculations ke liye birth location chahiye — pehle astrologer se ek baar baat karein.',
+    noMuhurtaData: 'Timing calculations ke liye location chahiye — neeche apna location share karein.',
     goodDaysCount: 'din jab favorable Muhurta hai', avoidDaysCount: 'din jab avoid karne wala period hai',
-    currentLocation: 'Current location', useCurrentLocation: 'Use current location', locationPermission: 'Current location li ja rahi hai…', locationDenied: 'Birth location use ho rahi hai',
+    currentLocation: 'Live location', useCurrentLocation: 'Location refresh karein', locationPermission: 'Aapka live location liya ja raha hai…', locationDenied: 'Birth location use ho rahi hai',
+    personalFavorable: 'Favorable', personalNeedsCare: 'Needs Care', personalNormal: 'Normal',
+    enterLocationManually: 'Location manually daalein', manualPlaceholder: 'jaise Lucknow, India',
+    setLocation: 'Set karein', manualLocating: 'Dhoondh rahe hain…', manualNotFound: 'Yeh jagah nahi mili — thoda specific naam try karein.',
+    liveTracking: 'Live tracking ON', manualLocationLabel: 'Manual location',
+    switchToLive: 'Live location use karein',
   },
 };
 
@@ -198,39 +219,86 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
   const [dayLoading, setDayLoading] = useState(false);
   const [explaining, setExplaining] = useState(false);
 
-  // Calendar location is separate from birth location.
-  // Kundli/Dasha stay based on birth details; sunrise/sunset/Muhurta use
-  // the user's current browser location when permission is granted.
   const [currentLocation, setCurrentLocation] = useState<{ latitude: number; longitude: number } | null>(null);
-  const [locationStatus, setLocationStatus] = useState<'requesting' | 'ready' | 'denied' | 'unsupported'>('requesting');
+  const [locationMode, setLocationMode] = useState<LocationMode>('geolocation');
+  const [locationStatus, setLocationStatus] = useState<LocationStatus>('requesting');
+  const [manualPlace, setManualPlace] = useState('');
+  const [manualLabel, setManualLabel] = useState<string | null>(null);
+  const [showManualInput, setShowManualInput] = useState(false);
+  const watchIdRef = useRef<number | null>(null);
 
-  const requestCurrentLocation = useCallback(() => {
+  const stopLiveTracking = useCallback(() => {
+    if (watchIdRef.current !== null && navigator.geolocation) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+  }, []);
+
+  const startLiveTracking = useCallback(() => {
     if (!navigator.geolocation) {
       setLocationStatus('unsupported');
+      setShowManualInput(true);
       return;
     }
 
+    stopLiveTracking();
+    setLocationMode('geolocation');
     setLocationStatus('requesting');
-    navigator.geolocation.getCurrentPosition(
+    setManualLabel(null);
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
         setCurrentLocation({
           latitude: position.coords.latitude,
           longitude: position.coords.longitude,
         });
         setLocationStatus('ready');
+        setShowManualInput(false);
       },
       (error) => {
-        console.warn('Current location unavailable:', error.message);
-        setCurrentLocation(null);
+        console.warn('Live location unavailable:', error.message);
         setLocationStatus(error.code === error.PERMISSION_DENIED ? 'denied' : 'unsupported');
+        setShowManualInput(true);
       },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 5 * 60 * 1000 },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 },
     );
-  }, []);
+  }, [stopLiveTracking]);
 
   useEffect(() => {
-    requestCurrentLocation();
-  }, [requestCurrentLocation]);
+    startLiveTracking();
+    return () => stopLiveTracking();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleSetManualLocation = async () => {
+    const place = manualPlace.trim();
+    if (!place || !sessionId) return;
+
+    stopLiveTracking();
+    setLocationMode('manual');
+    setLocationStatus('manual_pending');
+
+    try {
+      const res = await fetch(`${API_BASE}/session/${sessionId}/calendar/geocode?place=${encodeURIComponent(place)}`);
+      if (!res.ok) {
+        setLocationStatus('manual_error');
+        return;
+      }
+      const data = await res.json();
+      setCurrentLocation({ latitude: data.latitude, longitude: data.longitude });
+      setManualLabel(place);
+      setLocationStatus('ready');
+      setShowManualInput(false);
+    } catch (err) {
+      console.error('Manual geocoding failed:', err);
+      setLocationStatus('manual_error');
+    }
+  };
+
+  const switchBackToLive = () => {
+    setManualLabel(null);
+    startLiveTracking();
+  };
 
   const locationQuery = currentLocation
     ? `?latitude=${encodeURIComponent(currentLocation.latitude)}&longitude=${encodeURIComponent(currentLocation.longitude)}`
@@ -294,6 +362,11 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
     }
   };
 
+  // ------------------------------------------------------------------
+  // FILTER — top bar stays exactly: All | Transits | Dasha | For Me.
+  // No separate "Needs Care" filter button. "For Me" surfaces any day
+  // that's personally significant OR has a favorable/caution status.
+  // ------------------------------------------------------------------
   const dayMatchesFilter = (info: DayInfo): boolean => {
     switch (filter) {
       case 'transits': return info.transits.length > 0;
@@ -301,6 +374,20 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
       case 'important': return info.is_significant || info.personal_status === 'favorable' || info.personal_status === 'caution';
       default: return true;
     }
+  };
+
+  // personal_status is always exactly ONE of 'favorable' | 'caution' |
+  // 'normal' (see calendar_service._classify_personal_day) — so a date
+  // can never show both a green and a red dot at once. These two helpers
+  // are intentionally mutually exclusive by construction, not by extra
+  // guard logic.
+  const isFavorable = (info?: DayInfo) => info?.personal_status === 'favorable';
+  const isNeedsCare = (info?: DayInfo) => info?.personal_status === 'caution';
+
+  const personalStatusLabel = (status?: 'favorable' | 'caution' | 'normal' | null) => {
+    if (status === 'favorable') return t.personalFavorable;
+    if (status === 'caution') return t.personalNeedsCare;
+    return t.personalNormal;
   };
 
   const daysInMonth = new Date(year, month, 0).getDate();
@@ -312,6 +399,14 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
     ...Array.from({ length: daysInMonth }, (_, i) => i + 1),
   ];
   while (cells.length % 7 !== 0) cells.push(null);
+
+  const locationTitle = locationMode === 'manual' && manualLabel
+    ? `${t.manualLocationLabel}: ${manualLabel}`
+    : locationStatus === 'ready'
+      ? t.currentLocation
+      : locationStatus === 'requesting'
+        ? t.locationPermission
+        : t.locationDenied;
 
   return (
     <div className="flex flex-col h-full bg-slate-50">
@@ -344,37 +439,85 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
             </div>
           )}
 
-          {/* Current calendar location */}
-          <div className="bg-white border border-slate-200 rounded-xl px-3 py-2.5 flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2 min-w-0">
-              <MapPin size={15} className="text-amber-500 shrink-0" />
-              <div className="min-w-0">
-                <p className="text-xs font-semibold text-slate-700">
-                  {monthData?.location_source === 'current'
-                    ? t.currentLocation
-                    : locationStatus === 'requesting'
-                      ? t.locationPermission
-                      : t.locationDenied}
-                </p>
-                {currentLocation && (
-                  <p className="text-[10px] text-slate-400 truncate">
-                    {currentLocation.latitude.toFixed(5)}, {currentLocation.longitude.toFixed(5)}
-                  </p>
+          {/* Location card — live tracker + manual fallback */}
+          <div className="bg-white border border-slate-200 rounded-xl px-3 py-2.5">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 min-w-0">
+                {locationMode === 'geolocation' && locationStatus === 'ready' ? (
+                  <Navigation size={15} className="text-emerald-500 shrink-0" />
+                ) : (
+                  <MapPin size={15} className="text-amber-500 shrink-0" />
                 )}
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-slate-700 truncate">{locationTitle}</p>
+                  {locationMode === 'geolocation' && locationStatus === 'ready' && (
+                    <p className="text-[10px] text-emerald-600">{t.liveTracking}</p>
+                  )}
+                  {currentLocation && (
+                    <p className="text-[10px] text-slate-400 truncate">
+                      {currentLocation.latitude.toFixed(4)}, {currentLocation.longitude.toFixed(4)}
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1.5 shrink-0">
+                {locationMode === 'geolocation' ? (
+                  <button
+                    type="button"
+                    onClick={startLiveTracking}
+                    disabled={locationStatus === 'requesting'}
+                    className="flex items-center gap-1.5 text-[11px] font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg px-2.5 py-1.5 disabled:opacity-50"
+                  >
+                    <RefreshCw size={12} className={locationStatus === 'requesting' ? 'animate-spin' : ''} />
+                    {t.useCurrentLocation}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={switchBackToLive}
+                    className="flex items-center gap-1.5 text-[11px] font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg px-2.5 py-1.5"
+                  >
+                    <Navigation size={12} />
+                    {t.switchToLive}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setShowManualInput((v) => !v)}
+                  className="flex items-center gap-1.5 text-[11px] font-medium text-slate-600 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg px-2.5 py-1.5"
+                >
+                  <Search size={12} />
+                  {t.enterLocationManually}
+                </button>
               </div>
             </div>
-            <button
-              type="button"
-              onClick={requestCurrentLocation}
-              disabled={locationStatus === 'requesting'}
-              className="shrink-0 flex items-center gap-1.5 text-[11px] font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg px-2.5 py-1.5 disabled:opacity-50"
-            >
-              <RefreshCw size={12} className={locationStatus === 'requesting' ? 'animate-spin' : ''} />
-              {t.useCurrentLocation}
-            </button>
+
+            {showManualInput && (
+              <div className="mt-2.5 pt-2.5 border-t border-slate-100 flex gap-2">
+                <input
+                  value={manualPlace}
+                  onChange={(e) => setManualPlace(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSetManualLocation()}
+                  placeholder={t.manualPlaceholder}
+                  className="flex-1 rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                />
+                <button
+                  type="button"
+                  onClick={handleSetManualLocation}
+                  disabled={!manualPlace.trim() || locationStatus === 'manual_pending'}
+                  className="px-3 py-2 rounded-lg text-xs font-semibold bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 transition shrink-0"
+                >
+                  {locationStatus === 'manual_pending' ? t.manualLocating : t.setLocation}
+                </button>
+              </div>
+            )}
+            {locationStatus === 'manual_error' && (
+              <p className="text-[11px] text-rose-500 mt-1.5">{t.manualNotFound}</p>
+            )}
           </div>
 
-          {/* Filters */}
+          {/* Filters — unchanged: All | Transits | Dasha | For Me */}
           <div className="flex flex-wrap gap-2">
             {(Object.keys(t.filters) as FilterKey[]).map((key) => (
               <button
@@ -417,8 +560,9 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   if (day === null) return <div key={`b-${idx}`} />;
                   const info = monthData?.days[String(day)];
                   const visible = info ? dayMatchesFilter(info) : false;
-                  const hasGood = info?.personal_status === 'favorable';
-                  const hasAvoid = info?.personal_status === 'caution';
+                  // Mutually exclusive by construction — see isFavorable/isNeedsCare above.
+                  const favorable = isFavorable(info);
+                  const needsCare = isNeedsCare(info);
                   const hasTransit = !!info?.transits?.length;
                   const hasDasha = !!info?.dasha?.length;
                   const isToday = year === today.getFullYear() && month === today.getMonth() + 1 && day === today.getDate();
@@ -427,14 +571,15 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                     <button
                       key={day}
                       onClick={() => openDay(day)}
+                      title={filter === 'important' ? personalStatusLabel(info?.personal_status) : undefined}
                       className={`aspect-square rounded-lg flex flex-col items-center justify-center text-xs relative transition
                         ${selectedDay === day ? 'bg-amber-500 text-white' : isToday ? 'bg-amber-50 text-amber-700 font-semibold' : 'hover:bg-slate-50 text-slate-700'}
                         ${!visible && filter !== 'all' ? 'opacity-30' : ''}`}
                     >
                       <span>{day}</span>
                       <span className="flex gap-0.5 mt-0.5">
-                        {hasGood && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
-                        {hasAvoid && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-rose-500'}`} />}
+                        {favorable && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
+                        {needsCare && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-rose-500'}`} />}
                         {hasTransit && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-sky-500'}`} />}
                         {hasDasha && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-violet-500'}`} />}
                       </span>
@@ -444,10 +589,16 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
               </div>
             )}
 
-            {!loading && monthData?.has_muhurta_data && (
+            {!loading && filter === 'important' && (
+              <div className="flex flex-wrap gap-3 mt-4 pt-3 border-t border-slate-100 text-[10px] text-slate-500">
+                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {t.personalFavorable}</span>
+                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> {t.personalNeedsCare}</span>
+              </div>
+            )}
+            {!loading && filter !== 'important' && monthData?.has_muhurta_data && (
               <div className="flex flex-wrap gap-3 mt-4 pt-3 border-t border-slate-100 text-[10px] text-slate-400">
-                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {t.goodTimes}</span>
-                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> {t.avoidTimes}</span>
+                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {t.personalFavorable}</span>
+                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> {t.personalNeedsCare}</span>
                 <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-sky-500" /> {t.significantTransits}</span>
                 <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-violet-500" /> {t.dashaEvents}</span>
               </div>
@@ -462,7 +613,9 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
               </h3>
               <p className="text-[10px] text-slate-400 mb-3">
                 <MapPin size={10} className="inline mr-1" />
-                {dayDetail?.location_source === 'current' ? t.currentLocation : t.locationDenied}
+                {dayDetail?.location_source === 'current'
+                  ? (locationMode === 'manual' && manualLabel ? `${t.manualLocationLabel}: ${manualLabel}` : t.currentLocation)
+                  : t.locationDenied}
               </p>
 
               {dayLoading ? (
@@ -542,8 +695,8 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                       <p className="text-[10px] uppercase tracking-wide font-semibold mb-1">
                         {t.significantFor}
                       </p>
-                      <p className="text-xs font-medium capitalize">
-                        {dayDetail.personal_status}
+                      <p className="text-xs font-medium">
+                        {personalStatusLabel(dayDetail.personal_status)}
                       </p>
                       {dayDetail.personal_supportive_reasons?.length ? (
                         <p className="text-[11px] mt-1">{dayDetail.personal_supportive_reasons.join(' • ')}</p>
@@ -613,10 +766,10 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   </>
                 )}
                 {typeof summary.favorable_days === 'number' && (
-                  <li>• {summary.favorable_days} favorable personal days</li>
+                  <li>• {summary.favorable_days} {t.personalFavorable.toLowerCase()} {t.significantFor.toLowerCase()}</li>
                 )}
                 {typeof summary.caution_days === 'number' && (
-                  <li>• {summary.caution_days} personal caution days</li>
+                  <li>• {summary.caution_days} {t.personalNeedsCare.toLowerCase()} {t.significantFor.toLowerCase()}</li>
                 )}
                 <li>• {summary.transit_count} {t.significantTransits}</li>
                 <li>• {summary.dasha_event_count} {t.dashaEvents}</li>

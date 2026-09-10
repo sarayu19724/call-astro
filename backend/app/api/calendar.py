@@ -6,22 +6,38 @@ from app.services.calendar_service import (
     get_month_summary,
     explain_day,
 )
+from app.services.geocoding_service import geocoding_service
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/session", tags=["AstrologyCalendar"])
 
 
 def _coords(latitude: Optional[float], longitude: Optional[float]):
-    # Only use current coordinates when both are supplied. Otherwise the
-    # service falls back to the birth-location coordinates already stored
-    # in the session.
+
     if latitude is None or longitude is None:
         return None, None
     return latitude, longitude
 
 
-# IMPORTANT: keep /calendar/day/... before /calendar/{year}/{month}
-# so FastAPI does not interpret "day" as the year parameter.
+@router.get("/{session_id}/calendar/geocode")
+async def calendar_geocode_location(
+    session_id: str,
+    place: str = Query(..., min_length=2, description="Free-text place name to geocode"),
+):
+    try:
+        cleaned = place.strip()
+        coords = geocoding_service.geocode(cleaned)
+        if not coords:
+            raise HTTPException(status_code=404, detail=f"Could not find a location matching '{cleaned}'.")
+        lat, lon = coords
+        return {"latitude": lat, "longitude": lon, "query": cleaned}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error geocoding calendar location for {session_id}, place='{place}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/{session_id}/calendar/day/{date_str}")
 async def calendar_day(
     session_id: str,

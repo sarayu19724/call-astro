@@ -93,12 +93,12 @@ const TOPIC_MEANINGS: Record<string, string> = {
   health: 'Physical health, vitality and health-related matters.',
   education: 'Education, learning, study and academic matters.',
   family: 'Family, home and domestic matters.',
-  children: 'Children, creativity and matters of the 5th house.',
+  children: 'Children, creativity and 5th-house matters.',
   travel: 'Travel, movement and changes of place.',
 };
 
 function formatTopic(topic: string): string {
-  return topic.replace(/_/g, ' ').replace(/\w/g, (c) => c.toUpperCase());
+  return topic.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 const STRINGS: Record<string, {
@@ -767,11 +767,11 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
 
                       <div className="space-y-2.5">
                         {dayDetail.significant_topics.map((topic) => {
+                          const key = topic.toLowerCase();
                           const meaning =
                             dayDetail.topic_significance?.[topic] ||
-                            TOPIC_MEANINGS[topic.toLowerCase()] ||
+                            TOPIC_MEANINGS[key] ||
                             `This date has a chart-related indication for ${formatTopic(topic)}.`;
-
                           const factors = dayDetail.topic_factors?.[topic] || [];
 
                           return (
@@ -782,11 +782,9 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                               <p className="text-xs font-semibold text-amber-800">
                                 ⭐ {formatTopic(topic)}
                               </p>
-
                               <p className="text-[11px] text-slate-700 mt-1 leading-relaxed">
                                 {meaning}
                               </p>
-
                               {factors.length > 0 && (
                                 <div className="mt-1.5">
                                   <p className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-0.5">

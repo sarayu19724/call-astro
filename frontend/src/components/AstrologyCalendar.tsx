@@ -18,6 +18,7 @@ interface DayInfo {
   dasha: DashaEvent[];
   good: MuhurtaWindow[];
   avoid: MuhurtaWindow[];
+  topics?: string[];
   muhurta?: MuhurtaDetail | null;
   is_significant: boolean;
   personal_status?: 'favorable' | 'normal';
@@ -77,7 +78,7 @@ interface MonthSummary {
   most_significant_day: { day: number; topics: string[] } | null;
 }
 
-type FilterKey = 'all' | 'transits' | 'dasha' | 'important';
+type FilterKey = 'all' | 'transits' | 'dasha' | 'important'| 'career'| 'finance'| 'marriage'| 'health'| 'education';
 type LocationMode = 'geolocation' | 'manual';
 type LocationStatus = 'requesting' | 'ready' | 'denied' | 'unsupported' | 'manual_pending' | 'manual_error';
 
@@ -101,7 +102,7 @@ const STRINGS: Record<string, {
 }> = {
   English: {
     title: 'Astrology Calendar',
-    filters: { all: 'All', transits: 'Transits', dasha: 'Dasha', important: 'For Me' },
+    filters: { all: 'All', transits: 'Transits', dasha: 'Dasha', important: 'For Me', career: 'Career', finance: 'Finance', marriage: 'Marriage', health: 'Health', education: 'Education' },
     monthAtGlance: 'at a Glance', significantDates: 'potentially significant dates',
     significantTransits: 'planetary movements', dashaEvents: 'Dasha-related events',
     mostSignificant: 'Most significant', viewMonthly: 'View Monthly Analysis',
@@ -127,7 +128,7 @@ const STRINGS: Record<string, {
   },
   Hindi: {
     title: 'ज्योतिष कैलेंडर',
-    filters: { all: 'सभी', transits: 'गोचर', dasha: 'दशा', important: 'मेरे लिए' },
+    filters: { all: 'सभी', transits: 'गोचर', dasha: 'दशा', important: 'मेरे लिए', career: 'कैरियर', finance: 'वित्त', marriage: 'विवाह', health: 'स्वास्थ्य', education: 'शिक्षा' },
     monthAtGlance: 'की झलक', significantDates: 'संभावित महत्वपूर्ण तिथियाँ',
     significantTransits: 'ग्रह गोचर', dashaEvents: 'दशा से जुड़ी घटनाएँ',
     mostSignificant: 'सबसे महत्वपूर्ण', viewMonthly: 'मासिक विश्लेषण देखें',
@@ -153,7 +154,7 @@ const STRINGS: Record<string, {
   },
   Hinglish: {
     title: 'Astrology Calendar',
-    filters: { all: 'All', transits: 'Transits', dasha: 'Dasha', important: 'For Me' },
+    filters: { all: 'All', transits: 'Transits', dasha: 'Dasha', important: 'For Me', career: 'Career', finance: 'Finance', marriage: 'Marriage', health: 'Health', education: 'Education' },
     monthAtGlance: 'at a Glance', significantDates: 'potentially significant dates',
     significantTransits: 'planetary movements', dashaEvents: 'Dasha-related events',
     mostSignificant: 'Most significant', viewMonthly: 'View Monthly Analysis',
@@ -587,18 +588,14 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   const hasDasha = !!info?.dasha?.length;
                   const isToday = year === today.getFullYear() && month === today.getMonth() + 1 && day === today.getDate();
 
-                  // ------------------------------------------------------
-                  // DOT VISIBILITY — gated strictly by the active filter:
-                  //   All        -> transit (blue) + dasha (violet) only
-                  //   Transits   -> transit (blue) only
-                  //   Dasha      -> dasha (violet) only
-                  //   For Me     -> favorable (green) ONLY — never red,
-                  //                 never blue/violet in this mode.
-                  // ------------------------------------------------------
                   const showTransitDot = (filter === 'all' || filter === 'transits') && hasTransit;
                   const showDashaDot = (filter === 'all' || filter === 'dasha') && hasDasha;
                   const showFavorableDot = (filter === 'all' || filter === 'important') && favorable;
-
+                  const careerDot = (filter === 'career') && info?.topics?.includes('career');
+                  const financeDot = (filter === 'finance') && info?.topics?.includes('finance');
+                  const marriageDot = (filter === 'marriage') && info?.topics?.includes('marriage');
+                  const healthDot = (filter === 'health') && info?.topics?.includes('health');
+                  const educationDot = (filter === 'education') && info?.topics?.includes('education');
                   return (
                     <button
                       key={day}
@@ -613,6 +610,11 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                         {showFavorableDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
                         {showTransitDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-sky-500'}`} />}
                         {showDashaDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-violet-500'}`} />}
+                        {careerDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-amber-500'}`} />}
+                        {financeDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-600'}`} />}
+                        {marriageDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-pink-500'}`} />}
+                        {educationDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-indigo-500'}`} />}
+                        {healthDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-rose-500'}`} />}
                       </span>
                     </button>
                   );

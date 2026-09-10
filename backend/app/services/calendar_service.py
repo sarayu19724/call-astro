@@ -190,46 +190,41 @@ def _find_active_dasha(session: Dict, target_date: date) -> Optional[Dict[str, s
 
 
 # ------------------------------------------------------------------
-# PERSONAL DAY FAVORABILITY — separate from Panchang/Muhurta entirely.
+# PERSONAL DAY FAVORABILITY
+#
+# ONLY TWO STATES: "favorable" or "normal". There is no separate
+# "caution"/"needs care" state — a day with no relevant event, a purely
+# challenging event, or a mix of supportive and challenging events all
+# collapse into "normal". This is a deliberate simplification: a
+# three-way favorable/caution/normal split made ordinary, unremarkable
+# days look like a warning (nearly every day has *some* malefic transit
+# somewhere), which was misleading. Now the ONLY thing the calendar ever
+# flags positively is a day with a genuinely clean, supportive signal —
+# everything else is presented neutrally, with no dot and no red flag.
 #
 # For a given date, we look at:
 #   1. Every planet's transit sign that day -> house from the user's Lagna
 #      -> whether that placement is classically supportive (kendra/trikona)
-#      or challenging (dusthana), weighted by whether the planet is a
-#      natural benefic or malefic.
+#      for a life area, weighted by whether the planet is a natural
+#      benefic or malefic.
 #   2. The active Mahadasha lord's nature (benefic/malefic).
 #
-# This mirrors the exact same scoring philosophy already used in
-# topic_service._score_chart_signal() / _score_dasha_signal() for chat
-# responses — "favorable for you" here means the same thing it means when
-# the astrologer chatbot says it. The result is a soft classification, not
-# a prediction: language stays in "supportive indication" / "challenging
-# indication" terms, never "this will happen".
-#
 # STRICT RULE — enforced exactly as written, never relaxed:
-#   if favorable_signal and not challenging_signal:  -> "favorable"
-#   elif challenging_signal and not favorable_signal: -> "caution"
+#   if supportive_signal and not challenging_signal: -> "favorable"
 #   else:                                              -> "normal"
-# A day is NEVER both "favorable" and "caution" at once — the classifier
-# returns exactly one of the three strings, so every consumer downstream
-# (month grid dot, day panel, "Best dates this month") can render a single
-# dot/label with no extra deduplication logic needed.
+# A day is NEVER anything other than one of these two strings, so every
+# consumer downstream (month grid dot, day panel, "Best dates this
+# month") can render a single dot/label with no extra logic needed.
 # ------------------------------------------------------------------
 def _classify_personal_day(
     transit_events: List[Dict[str, Any]],
     dasha_events: List[Dict[str, Any]],
 ) -> str:
-    """Classify a day from actual personalized calendar events only.
-
-    No numeric score is used. A day is favorable when a relevant transit/Dasha
-    event is directly supportive and there is no directly challenging event.
-    A day is caution when the relevant event is challenging and there is no
-    supportive event. Mixed/no relevant events remain normal.
-
-    This intentionally mirrors the earlier calendar behavior: only actual
-    sign-change/Dasha events that are relevant to the user's chart contribute
-    to the 'For Me' view; ordinary daily planetary positions are not scored.
-    """
+    """Classify a day from actual personalized calendar events only —
+    two states, 'favorable' or 'normal'. No numeric score is used. A day
+    is favorable only when a relevant transit/Dasha event is directly
+    supportive AND nothing relevant is challenging. Mixed or purely
+    challenging signals are 'normal', same as no signal at all."""
     supportive = False
     challenging = False
 
@@ -252,23 +247,20 @@ def _classify_personal_day(
 
     if supportive and not challenging:
         return "favorable"
-    if challenging and not supportive:
-        return "caution"
     return "normal"
 
 
 def _build_personal_reasons(
     transit_events: List[Dict[str, Any]],
     dasha_events: List[Dict[str, Any]],
-) -> Tuple[List[str], List[str]]:
-    """Turns the exact same sparse events _classify_personal_day looks at
-    into plain-language 'Why?' bullets for the day panel — never a numeric
-    score, never an invented factor. Each qualifying transit contributes up
-    to three short bullets (what moved, whether it's benefic/malefic, and
-    which life area it touches); each qualifying Dasha boundary contributes
-    two (which period, and its nature). Returns (supportive, challenging)."""
+) -> List[str]:
+    """Turns the same sparse events _classify_personal_day looks at into
+    plain-language 'Why?' bullets for a FAVORABLE day — never a numeric
+    score, never an invented factor. Only genuinely supportive factors
+    are surfaced; 'normal' days simply have nothing conclusive to point
+    to, so they get no bullets (and the explanation prompt is instructed
+    to describe them plainly instead)."""
     supportive: List[str] = []
-    challenging: List[str] = []
 
     for event in transit_events:
         relevance = event.get("relevance", {})
@@ -277,36 +269,26 @@ def _build_personal_reasons(
         if not topics:
             continue
         planet = event.get("planet")
-        sign = event.get("new_sign")
+        if planet not in NATURAL_BENEFICS:
+            continue
         phrase = HOUSE_ACTIVATION_PHRASE.get(house, "this area of life") if house else "this area of life"
-        house_str = f"your {_ordinal(house)} house" if house else f"{sign}"
-
-        if planet in NATURAL_BENEFICS:
-            supportive.append(f"{planet} enters {house_str}")
-            supportive.append(f"{planet} is naturally benefic")
-            supportive.append(f"This activates topics related to {phrase}")
-        elif planet in NATURAL_MALEFICS:
-            challenging.append(f"{planet} enters {house_str}")
-            challenging.append(f"{planet} is a natural malefic")
-            challenging.append(f"This may require more attention in {phrase}")
+        house_str = f"your {_ordinal(house)} house" if house else f"{event.get('new_sign')}"
+        supportive.append(f"{planet} enters {house_str}")
+        supportive.append(f"{planet} is naturally benefic")
+        supportive.append(f"This activates topics related to {phrase}")
 
     for event in dasha_events:
         lord = event.get("mahadasha")
         antar = event.get("antardasha")
         boundary = event.get("boundary")
-        if not lord:
+        if not lord or lord not in NATURAL_BENEFICS:
             continue
         period_label = f"{lord} Mahadasha" + (f" ({antar} Antardasha)" if antar else "")
         verb = "begins" if boundary == "start" else "is in its closing phase" if boundary == "end" else "is active"
+        supportive.append(f"{period_label} {verb}")
+        supportive.append(f"{lord} is naturally benefic")
 
-        if lord in NATURAL_BENEFICS:
-            supportive.append(f"{period_label} {verb}")
-            supportive.append(f"{lord} is naturally benefic")
-        elif lord in NATURAL_MALEFICS:
-            challenging.append(f"{period_label} {verb}")
-            challenging.append(f"{lord} is a natural malefic")
-
-    return supportive, challenging
+    return supportive
 
 
 # ------------------------------------------------------------------
@@ -424,6 +406,15 @@ def compute_panchang(target_date: date) -> Optional[Dict[str, Any]]:
 # well agreed upon; the exact muhurta index used below is a best-effort
 # reading of commonly published tables, flagged here rather than presented
 # as beyond dispute.
+#
+# NOTE: Abhijit and Brahma Muhurta occur on nearly every calendar day by
+# classical construction — that's expected and correct, NOT a bug. What
+# was misleading before was the MONTH-LEVEL SUMMARY counting these as
+# "N days with a favorable Muhurta", which made it look like the calendar
+# was singling out special days when it was really just describing a
+# routine daily window. That aggregate count has been removed from
+# get_month_summary() below; the per-day timings themselves are still
+# shown (factually, with real computed times) in the day panel.
 # ------------------------------------------------------------------
 IST_OFFSET_HOURS = 5.5
 
@@ -690,8 +681,8 @@ def get_month_events(
 
     # --- Personal day classification: event-based, no numeric score ---
     # Only actual personalized sign-change/Dasha events contribute. Every
-    # day gets EXACTLY ONE of 'favorable' / 'caution' / 'normal' — see
-    # _classify_personal_day's strict if/elif/else above.
+    # day gets EXACTLY ONE of 'favorable' / 'normal' — see
+    # _classify_personal_day's strict logic above. There is no third state.
     if ascendant_sign:
         for day in range(1, days_in_month + 1):
             info = days[str(day)]
@@ -783,8 +774,10 @@ def get_day_detail(
     personal_status = _classify_personal_day(day_transit_events, day_dasha_events)
 
     # "Why?" bullets — built from the SAME sparse events that decided the
-    # classification above, never a separate/invented explanation.
-    supportive_reasons, challenging_reasons = _build_personal_reasons(day_transit_events, day_dasha_events)
+    # classification above, never a separate/invented explanation. Only
+    # populated for favorable days; a 'normal' day has nothing conclusive
+    # to list, which is fine and expected.
+    supportive_reasons = _build_personal_reasons(day_transit_events, day_dasha_events)
 
     is_auspicious = bool(
         maha_lord and maha_lord in NATURAL_BENEFICS
@@ -810,7 +803,6 @@ def get_day_detail(
         "panchang": panchang,
         "personal_status": personal_status,
         "personal_supportive_reasons": supportive_reasons,
-        "personal_challenging_reasons": challenging_reasons,
     }
 
 
@@ -823,14 +815,18 @@ Rules:
 2. Length: 2-4 sentences, under 70 words. Plain prose, no bullet points, no headers.
 3. Never mention "calendar", "computed", "database", "score", or any technical process — speak as if
    reading their chart directly.
-4. Frame the personal indication as "supportive" or "needs a bit more care" — NEVER as a guarantee or
-   a definite outcome. This is a tendency to be aware of, not a prediction.
+4. There are only TWO possible personal indications: "favorable" or "normal". NEVER describe a
+   "normal" day as needing care, caution, or extra attention — a normal day simply has no strongly
+   activated favorable factor right now. Describe it plainly and neutrally, and point to any favorable
+   timing windows (Muhurta) listed below for planning purposes. Only when the indication is
+   "favorable" should you name the specific supportive factor(s) behind it — and even then, frame it
+   as a supportive tendency, never a guarantee or a definite outcome.
 5. If Good/Avoid timings are listed below, you may mention them naturally (e.g. "the Rahu Kalam window
    in the morning") but never invent a time that isn't given.
 6. If the facts below are sparse, keep the explanation brief and honest rather than padding it out.
 
 Date: {date}
-Personal indication: {personal_status} (supportive factors: {supportive}; factors needing care: {challenging})
+Personal indication: {personal_status} (supportive factors: {supportive})
 Panchang: {panchang}
 Planetary movements on this date (verified): {transits}
 Current Dasha period (verified): {dasha}
@@ -894,21 +890,25 @@ def explain_day(
     ) if panchang else "Not available"
 
     supportive_str = "; ".join(detail.get("personal_supportive_reasons", [])) or "None specifically identified"
-    challenging_str = "; ".join(detail.get("personal_challenging_reasons", [])) or "None specifically identified"
 
     prompt = DAY_EXPLAIN_PROMPT.format(
         language=language, date=date_str,
         personal_status=detail.get("personal_status", "normal"),
-        supportive=supportive_str, challenging=challenging_str,
+        supportive=supportive_str,
         panchang=panchang_str,
         transits=transits_str, dasha=dasha_str, topics=topics_str,
         good_muhurta=good_str, avoid_muhurta=avoid_str,
     )
 
     fallback = {
-        "English": "This date doesn't show any strongly activated factors in your chart right now.",
-        "Hindi": "इस तिथि के लिए आपकी कुंडली में फिलहाल कोई विशेष सक्रिय कारक नहीं दिख रहा।",
-        "Hinglish": "Is date ke liye aapki kundli mein abhi koi khaas activated factor nahi dikh raha.",
+        "English": "Based on the selected planetary movements and your chart, this date has a neutral "
+                    "overall indication. The favorable timing windows are shown above for planning "
+                    "important activities.",
+        "Hindi": "चयनित ग्रह गतियों और आपकी कुंडली के आधार पर, यह तिथि समग्र रूप से सामान्य संकेत देती है। "
+                 "महत्वपूर्ण कार्यों की योजना के लिए ऊपर दिखाए गए शुभ मुहूर्त देखें।",
+        "Hinglish": "Selected planetary movements aur aapki kundli ke hisaab se, yeh date overall neutral "
+                    "indication deti hai. Important kaamon ki planning ke liye upar diye gaye favorable "
+                    "Muhurta dekhein.",
     }.get(language, "Is date ke liye koi khaas jaankari nahi hai.")
 
     try:
@@ -936,34 +936,19 @@ def get_month_summary(
     transit_count = sum(len(d["transits"]) for d in days.values())
     dasha_event_count = sum(len(d["dasha"]) for d in days.values())
 
-    # "Best dates this month" — plain lists of day numbers, NOT a score.
-    # personal_status is mutually exclusive per day (see
-    # _classify_personal_day), so a day can appear in at most one of these
-    # two lists, never both.
+    # "Favorable dates this month" — plain list of day numbers, NOT a
+    # score. This is now the ONLY personal-status count in the summary;
+    # the old "N days with a favorable Muhurta" / "N days with a period
+    # to avoid" counts have been removed entirely, since Abhijit/Brahma
+    # and Rahu Kalam/Yamaganda/Gulika occur on nearly every single day by
+    # classical construction — counting them at the month level made
+    # ordinary days look either universally auspicious or universally
+    # inauspicious, which was misleading. The real per-day timings are
+    # still shown, with actual computed times, in the day detail panel.
     favorable_dates = sorted(
         int(day) for day, info in days.items() if info.get("personal_status") == "favorable"
     )
-    needs_care_dates = sorted(
-        int(day) for day, info in days.items() if info.get("personal_status") == "caution"
-    )
     favorable_days = len(favorable_dates)
-    caution_days = len(needs_care_dates)
-
-    good_muhurta_days = sum(
-        1 for d in days.values()
-        if d.get("muhurta") and (
-            d["muhurta"].get("abhijit") or d["muhurta"].get("brahma")
-        )
-    )
-    avoid_muhurta_days = sum(
-        1 for d in days.values()
-        if d.get("muhurta") and (
-            d["muhurta"].get("rahu_kalam")
-            or d["muhurta"].get("yamaganda")
-            or d["muhurta"].get("gulika_kalam")
-            or d["muhurta"].get("durmuhurtham")
-        )
-    )
 
     significant_days = [
         {
@@ -995,11 +980,7 @@ def get_month_summary(
         "dasha_event_count": dasha_event_count,
         "significant_day_count": len(significant_days),
         "favorable_days": favorable_days,
-        "caution_days": caution_days,
         "favorable_dates": favorable_dates,
-        "needs_care_dates": needs_care_dates,
-        "good_muhurta_days": good_muhurta_days,
-        "avoid_muhurta_days": avoid_muhurta_days,
         "most_significant_day": most_significant,
         "swisseph_available": month_data["swisseph_available"],
         "has_dasha_data": month_data["has_dasha_data"],

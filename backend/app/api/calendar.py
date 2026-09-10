@@ -38,6 +38,22 @@ async def calendar_geocode_location(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/{session_id}/calendar/reverse-geocode")
+async def calendar_reverse_geocode_location(
+    session_id: str,
+    latitude: float = Query(...),
+    longitude: float = Query(...),
+):
+    """Turns live/manual coordinates into a short place label (e.g.
+    'Guntakal, Andhra Pradesh') for display, instead of raw lat/lon."""
+    try:
+        label = geocoding_service.reverse_geocode(latitude, longitude)
+        return {"label": label}
+    except Exception as e:
+        logger.error(f"Error reverse geocoding for {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/{session_id}/calendar/day/{date_str}")
 async def calendar_day(
     session_id: str,

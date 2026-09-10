@@ -20,7 +20,7 @@ interface DayInfo {
   avoid: MuhurtaWindow[];
   muhurta?: MuhurtaDetail | null;
   is_significant: boolean;
-  personal_status?: 'favorable' | 'caution' | 'normal';
+  personal_status?: 'favorable' | 'normal';
 }
 interface MonthData {
   year: number; month: number; swisseph_available: boolean;
@@ -64,18 +64,15 @@ interface DayDetail {
     yoga: string;
     karana: string;
   } | null;
-  personal_status?: 'favorable' | 'caution' | 'normal';
+  personal_status?: 'favorable' | 'normal';
   personal_supportive_reasons?: string[];
-  personal_challenging_reasons?: string[];
 }
 interface MonthSummary {
   transit_count: number;
   dasha_event_count: number;
   significant_day_count: number;
-  good_muhurta_days: number;
-  avoid_muhurta_days: number;
-  favorable_days?: number;
-  caution_days?: number;
+  favorable_days: number;
+  favorable_dates?: number[];
   has_muhurta_data: boolean;
   most_significant_day: { day: number; topics: string[] } | null;
 }
@@ -93,18 +90,19 @@ const STRINGS: Record<string, {
   viewMonthly: string; whyImportant: string; askAstrologer: string; noData: string; loading: string;
   planetaryEvents: string; yourChart: string; currentDasha: string; significantFor: string;
   swissephMissing: string; noChartYet: string; house: string;
-  goodTimes: string; avoidTimes: string; sunrise: string; sunset: string;
-  noMuhurtaData: string; goodDaysCount: string; avoidDaysCount: string;
+  auspiciousWindows: string; avoidTimes: string; sunrise: string; sunset: string;
+  noMuhurtaData: string;
   currentLocation: string; useCurrentLocation: string; locationPermission: string; locationDenied: string;
-  personalFavorable: string; personalNeedsCare: string; personalNormal: string;
+  personalFavorable: string; personalNormal: string;
   enterLocationManually: string; manualPlaceholder: string; setLocation: string;
   manualLocating: string; manualNotFound: string; liveTracking: string; manualLocationLabel: string;
-  switchToLive: string;
+  switchToLive: string; usingCurrentLocation: string; locationUsedFor: string;
+  favorableForYou: string; planetaryMovementsShort: string; dashaEventsShort: string; significantDatesShort: string;
 }> = {
   English: {
     title: 'Astrology Calendar',
     filters: { all: 'All', transits: 'Transits', dasha: 'Dasha', important: 'For Me' },
-    monthAtGlance: 'Month at a Glance', significantDates: 'potentially significant dates',
+    monthAtGlance: 'at a Glance', significantDates: 'potentially significant dates',
     significantTransits: 'planetary movements', dashaEvents: 'Dasha-related events',
     mostSignificant: 'Most significant', viewMonthly: 'View Monthly Analysis',
     whyImportant: 'Why is this important?', askAstrologer: 'Ask Astrologer', noData: 'No events on this day.',
@@ -112,20 +110,25 @@ const STRINGS: Record<string, {
     currentDasha: 'Current Dasha', significantFor: 'Significant For You',
     swissephMissing: 'Transit calculations are not available yet on the server.',
     noChartYet: 'Chat with the astrologer once to unlock personalized relevance.', house: 'House',
-    goodTimes: 'Good Times', avoidTimes: 'Avoid These Times', sunrise: 'Sunrise', sunset: 'Sunset',
+    auspiciousWindows: "Today's Auspicious Windows", avoidTimes: 'Avoid These Times', sunrise: 'Sunrise', sunset: 'Sunset',
     noMuhurtaData: 'Timing calculations need a location — share your location below to unlock them.',
-    goodDaysCount: 'days with a favorable Muhurta', avoidDaysCount: 'days with a period to avoid',
     currentLocation: 'Live location', useCurrentLocation: 'Refresh location', locationPermission: 'Getting your live location…', locationDenied: 'Using birth location',
-    personalFavorable: 'Favorable', personalNeedsCare: 'Needs Care', personalNormal: 'Normal',
+    personalFavorable: 'Favorable', personalNormal: 'Normal',
     enterLocationManually: 'Enter location manually', manualPlaceholder: 'e.g. Lucknow, India',
     setLocation: 'Set', manualLocating: 'Finding…', manualNotFound: "Couldn't find that place — try a more specific name.",
     liveTracking: 'Live tracking on', manualLocationLabel: 'Manual location',
     switchToLive: 'Use live location instead',
+    usingCurrentLocation: 'Using your current location',
+    locationUsedFor: 'Used for sunrise, sunset and local Muhurta timings.',
+    favorableForYou: 'favorable dates for you',
+    planetaryMovementsShort: 'planetary movements',
+    dashaEventsShort: 'Dasha events',
+    significantDatesShort: 'significant dates',
   },
   Hindi: {
     title: 'ज्योतिष कैलेंडर',
     filters: { all: 'सभी', transits: 'गोचर', dasha: 'दशा', important: 'मेरे लिए' },
-    monthAtGlance: 'माह की झलक', significantDates: 'संभावित महत्वपूर्ण तिथियाँ',
+    monthAtGlance: 'की झलक', significantDates: 'संभावित महत्वपूर्ण तिथियाँ',
     significantTransits: 'ग्रह गोचर', dashaEvents: 'दशा से जुड़ी घटनाएँ',
     mostSignificant: 'सबसे महत्वपूर्ण', viewMonthly: 'मासिक विश्लेषण देखें',
     whyImportant: 'यह महत्वपूर्ण क्यों है?', askAstrologer: 'ज्योतिषी से पूछें', noData: 'इस दिन कोई घटना नहीं है।',
@@ -133,20 +136,25 @@ const STRINGS: Record<string, {
     currentDasha: 'वर्तमान दशा', significantFor: 'आपके लिए महत्वपूर्ण',
     swissephMissing: 'गोचर गणना अभी सर्वर पर उपलब्ध नहीं है।',
     noChartYet: 'व्यक्तिगत जानकारी के लिए पहले ज्योतिषी से एक बार बात करें।', house: 'भाव',
-    goodTimes: 'शुभ मुहूर्त', avoidTimes: 'इन समयों से बचें', sunrise: 'सूर्योदय', sunset: 'सूर्यास्त',
+    auspiciousWindows: 'आज के शुभ मुहूर्त', avoidTimes: 'इन समयों से बचें', sunrise: 'सूर्योदय', sunset: 'सूर्यास्त',
     noMuhurtaData: 'मुहूर्त गणना के लिए स्थान चाहिए — नीचे अपना स्थान साझा करें।',
-    goodDaysCount: 'शुभ मुहूर्त वाले दिन', avoidDaysCount: 'बचने योग्य समय वाले दिन',
     currentLocation: 'लाइव स्थान', useCurrentLocation: 'स्थान रीफ्रेश करें', locationPermission: 'आपका लाइव स्थान प्राप्त किया जा रहा है…', locationDenied: 'जन्म स्थान उपयोग हो रहा है',
-    personalFavorable: 'अनुकूल', personalNeedsCare: 'सावधानी आवश्यक', personalNormal: 'सामान्य',
+    personalFavorable: 'अनुकूल', personalNormal: 'सामान्य',
     enterLocationManually: 'स्थान मैन्युअल रूप से दर्ज करें', manualPlaceholder: 'जैसे लखनऊ, भारत',
     setLocation: 'सेट करें', manualLocating: 'खोजा जा रहा है…', manualNotFound: 'यह स्थान नहीं मिला — अधिक स्पष्ट नाम आज़माएं।',
     liveTracking: 'लाइव ट्रैकिंग चालू', manualLocationLabel: 'मैन्युअल स्थान',
     switchToLive: 'लाइव स्थान उपयोग करें',
+    usingCurrentLocation: 'आपके वर्तमान स्थान का उपयोग',
+    locationUsedFor: 'सूर्योदय, सूर्यास्त और स्थानीय मुहूर्त के लिए उपयोग किया जाता है।',
+    favorableForYou: 'आपके लिए अनुकूल तिथियाँ',
+    planetaryMovementsShort: 'ग्रह गोचर',
+    dashaEventsShort: 'दशा घटनाएँ',
+    significantDatesShort: 'महत्वपूर्ण तिथियाँ',
   },
   Hinglish: {
     title: 'Astrology Calendar',
     filters: { all: 'All', transits: 'Transits', dasha: 'Dasha', important: 'For Me' },
-    monthAtGlance: 'Month at a Glance', significantDates: 'potentially significant dates',
+    monthAtGlance: 'at a Glance', significantDates: 'potentially significant dates',
     significantTransits: 'planetary movements', dashaEvents: 'Dasha-related events',
     mostSignificant: 'Most significant', viewMonthly: 'View Monthly Analysis',
     whyImportant: 'Yeh important kyun hai?', askAstrologer: 'Astrologer se poochein', noData: 'Is din koi event nahi hai.',
@@ -154,15 +162,20 @@ const STRINGS: Record<string, {
     currentDasha: 'Current Dasha', significantFor: 'Aapke liye significant',
     swissephMissing: 'Transit calculations abhi server par available nahi hain.',
     noChartYet: 'Personalized relevance ke liye pehle ek baar astrologer se baat karein.', house: 'House',
-    goodTimes: 'Good Times', avoidTimes: 'Yeh Times Avoid Karein', sunrise: 'Sunrise', sunset: 'Sunset',
+    auspiciousWindows: "Aaj Ke Shubh Muhurta", avoidTimes: 'Yeh Times Avoid Karein', sunrise: 'Sunrise', sunset: 'Sunset',
     noMuhurtaData: 'Timing calculations ke liye location chahiye — neeche apna location share karein.',
-    goodDaysCount: 'din jab favorable Muhurta hai', avoidDaysCount: 'din jab avoid karne wala period hai',
     currentLocation: 'Live location', useCurrentLocation: 'Location refresh karein', locationPermission: 'Aapka live location liya ja raha hai…', locationDenied: 'Birth location use ho rahi hai',
-    personalFavorable: 'Favorable', personalNeedsCare: 'Needs Care', personalNormal: 'Normal',
+    personalFavorable: 'Favorable', personalNormal: 'Normal',
     enterLocationManually: 'Location manually daalein', manualPlaceholder: 'jaise Lucknow, India',
     setLocation: 'Set karein', manualLocating: 'Dhoondh rahe hain…', manualNotFound: 'Yeh jagah nahi mili — thoda specific naam try karein.',
     liveTracking: 'Live tracking ON', manualLocationLabel: 'Manual location',
     switchToLive: 'Live location use karein',
+    usingCurrentLocation: 'Aapki current location use ho rahi hai',
+    locationUsedFor: 'Sunrise, sunset aur local Muhurta timings ke liye use hoti hai.',
+    favorableForYou: 'favorable dates aapke liye',
+    planetaryMovementsShort: 'planetary movements',
+    dashaEventsShort: 'Dasha events',
+    significantDatesShort: 'significant dates',
   },
 };
 
@@ -220,6 +233,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
   const [explaining, setExplaining] = useState(false);
 
   const [currentLocation, setCurrentLocation] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [locationLabel, setLocationLabel] = useState<string | null>(null);
   const [locationMode, setLocationMode] = useState<LocationMode>('geolocation');
   const [locationStatus, setLocationStatus] = useState<LocationStatus>('requesting');
   const [manualPlace, setManualPlace] = useState('');
@@ -245,6 +259,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
     setLocationMode('geolocation');
     setLocationStatus('requesting');
     setManualLabel(null);
+    setLocationLabel(null);
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
@@ -269,6 +284,24 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
     return () => stopLiveTracking();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Resolve live coordinates into a real place name (e.g. "Guntakal,
+  // Andhra Pradesh") instead of showing raw lat/lon to the user. Manual
+  // entries already carry a human-typed label (manualLabel), so this only
+  // runs for the geolocation path.
+  useEffect(() => {
+    if (!currentLocation || !sessionId || locationMode !== 'geolocation') return;
+    let cancelled = false;
+    fetch(`${API_BASE}/session/${sessionId}/calendar/reverse-geocode?latitude=${encodeURIComponent(currentLocation.latitude)}&longitude=${encodeURIComponent(currentLocation.longitude)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!cancelled && data?.label) setLocationLabel(data.label);
+      })
+      .catch(() => {
+        // Silent — falls back to the generic "Live location" label.
+      });
+    return () => { cancelled = true; };
+  }, [currentLocation, sessionId, locationMode]);
 
   const handleSetManualLocation = async () => {
     const place = manualPlace.trim();
@@ -364,28 +397,22 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
 
   // ------------------------------------------------------------------
   // FILTER — top bar stays exactly: All | Transits | Dasha | For Me.
-  // No separate "Needs Care" filter button. "For Me" surfaces any day
-  // that's personally significant OR has a favorable/caution status.
+  // "For Me" now surfaces ONLY favorable days — there is no "Needs Care"
+  // state anymore, so nothing else qualifies for this filter.
   // ------------------------------------------------------------------
   const dayMatchesFilter = (info: DayInfo): boolean => {
     switch (filter) {
       case 'transits': return info.transits.length > 0;
       case 'dasha': return info.dasha.length > 0;
-      case 'important': return info.is_significant || info.personal_status === 'favorable' || info.personal_status === 'caution';
+      case 'important': return info.personal_status === 'favorable';
       default: return true;
     }
   };
 
-  // personal_status is always exactly ONE of 'favorable' | 'caution' |
-  // 'normal' (see calendar_service._classify_personal_day) — so a date
-  // can never show both a green and a red dot at once. These two helpers
-  // are intentionally mutually exclusive by construction, not by extra
-  // guard logic.
   const isFavorable = (info?: DayInfo) => info?.personal_status === 'favorable';
 
-  const personalStatusLabel = (status?: 'favorable' | 'caution' | 'normal' | null) => {
+  const personalStatusLabel = (status?: 'favorable' | 'normal' | null) => {
     if (status === 'favorable') return t.personalFavorable;
-    if (status === 'caution') return t.personalNeedsCare;
     return t.personalNormal;
   };
 
@@ -402,7 +429,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
   const locationTitle = locationMode === 'manual' && manualLabel
     ? `${t.manualLocationLabel}: ${manualLabel}`
     : locationStatus === 'ready'
-      ? t.currentLocation
+      ? (locationLabel ? `${t.usingCurrentLocation}: ${locationLabel}` : t.currentLocation)
       : locationStatus === 'requesting'
         ? t.locationPermission
         : t.locationDenied;
@@ -449,13 +476,8 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                 )}
                 <div className="min-w-0">
                   <p className="text-xs font-semibold text-slate-700 truncate">{locationTitle}</p>
-                  {locationMode === 'geolocation' && locationStatus === 'ready' && (
-                    <p className="text-[10px] text-emerald-600">{t.liveTracking}</p>
-                  )}
-                  {currentLocation && (
-                    <p className="text-[10px] text-slate-400 truncate">
-                      {currentLocation.latitude.toFixed(4)}, {currentLocation.longitude.toFixed(4)}
-                    </p>
+                  {locationStatus === 'ready' && (
+                    <p className="text-[10px] text-slate-400 truncate">{t.locationUsedFor}</p>
                   )}
                 </div>
               </div>
@@ -560,11 +582,19 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   const info = monthData?.days[String(day)];
                   const visible = info ? dayMatchesFilter(info) : false;
 
-                  // Mutually exclusive by construction — see isFavorable/isNeedsCare above.
                   const favorable = isFavorable(info);
                   const hasTransit = !!info?.transits?.length;
                   const hasDasha = !!info?.dasha?.length;
                   const isToday = year === today.getFullYear() && month === today.getMonth() + 1 && day === today.getDate();
+
+                  // ------------------------------------------------------
+                  // DOT VISIBILITY — gated strictly by the active filter:
+                  //   All        -> transit (blue) + dasha (violet) only
+                  //   Transits   -> transit (blue) only
+                  //   Dasha      -> dasha (violet) only
+                  //   For Me     -> favorable (green) ONLY — never red,
+                  //                 never blue/violet in this mode.
+                  // ------------------------------------------------------
                   const showTransitDot = (filter === 'all' || filter === 'transits') && hasTransit;
                   const showDashaDot = (filter === 'all' || filter === 'dasha') && hasDasha;
                   const showFavorableDot = filter === 'important' && favorable;
@@ -594,7 +624,6 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
             {!loading && filter === 'important' && (
               <div className="flex flex-wrap gap-3 mt-4 pt-3 border-t border-slate-100 text-[10px] text-slate-500">
                 <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {t.personalFavorable}</span>
-                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> {t.personalNeedsCare}</span>
               </div>
             )}
             {!loading && filter === 'all' && (
@@ -624,7 +653,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
               <p className="text-[10px] text-slate-400 mb-3">
                 <MapPin size={10} className="inline mr-1" />
                 {dayDetail?.location_source === 'current'
-                  ? (locationMode === 'manual' && manualLabel ? `${t.manualLocationLabel}: ${manualLabel}` : t.currentLocation)
+                  ? (locationMode === 'manual' && manualLabel ? `${t.manualLocationLabel}: ${manualLabel}` : (locationLabel || t.currentLocation))
                   : t.locationDenied}
               </p>
 
@@ -641,8 +670,8 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                     </div>
                   )}
 
-                  {dayDetail.muhurta && dayDetail.muhurta.abhijit.length > 0 && (
-                    <MuhurtaSection title="Favorable Muhurta" items={[
+                  {dayDetail.muhurta && (dayDetail.muhurta.abhijit.length > 0 || dayDetail.muhurta.brahma.length > 0) && (
+                    <MuhurtaSection title={t.auspiciousWindows} items={[
                       ...dayDetail.muhurta.abhijit,
                       ...dayDetail.muhurta.brahma,
                     ]} positive />
@@ -698,9 +727,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                     <div className={`rounded-xl px-3 py-2 border ${
                       dayDetail.personal_status === 'favorable'
                         ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
-                        : dayDetail.personal_status === 'caution'
-                          ? 'bg-rose-50 border-rose-200 text-rose-700'
-                          : 'bg-slate-50 border-slate-200 text-slate-600'
+                        : 'bg-slate-50 border-slate-200 text-slate-600'
                     }`}>
                       <p className="text-[10px] uppercase tracking-wide font-semibold mb-1">
                         {t.significantFor}
@@ -710,9 +737,6 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                       </p>
                       {dayDetail.personal_supportive_reasons?.length ? (
                         <p className="text-[11px] mt-1">{dayDetail.personal_supportive_reasons.join(' • ')}</p>
-                      ) : null}
-                      {dayDetail.personal_challenging_reasons?.length ? (
-                        <p className="text-[11px] mt-1">{dayDetail.personal_challenging_reasons.join(' • ')}</p>
                       ) : null}
                     </div>
                   )}
@@ -764,26 +788,17 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
             </div>
           )}
 
-          {/* Month at a glance */}
+          {/* Month at a Glance */}
           {!loading && summary && (
             <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
-              <h3 className="text-sm font-bold text-slate-800 mb-3">{t.monthAtGlance.toUpperCase()} — {MONTH_NAMES[month - 1]} {year}</h3>
+              <h3 className="text-sm font-bold text-slate-800 mb-3">
+                {MONTH_NAMES[month - 1]} {year} {t.monthAtGlance}
+              </h3>
               <ul className="text-sm text-slate-700 space-y-1.5">
-                {summary.has_muhurta_data && (
-                  <>
-                    <li>• {summary.good_muhurta_days} {t.goodDaysCount}</li>
-                    <li>• {summary.avoid_muhurta_days} {t.avoidDaysCount}</li>
-                  </>
-                )}
-                {typeof summary.favorable_days === 'number' && (
-                  <li>• {summary.favorable_days} {t.personalFavorable.toLowerCase()} {t.significantFor.toLowerCase()}</li>
-                )}
-                {typeof summary.caution_days === 'number' && (
-                  <li>• {summary.caution_days} {t.personalNeedsCare.toLowerCase()} {t.significantFor.toLowerCase()}</li>
-                )}
-                <li>• {summary.transit_count} {t.significantTransits}</li>
-                <li>• {summary.dasha_event_count} {t.dashaEvents}</li>
-                <li>• {summary.significant_day_count} {t.significantDates}</li>
+                <li>🟢 {summary.favorable_days} {t.favorableForYou}</li>
+                <li>🔵 {summary.transit_count} {t.planetaryMovementsShort}</li>
+                <li>🟣 {summary.dasha_event_count} {t.dashaEventsShort}</li>
+                <li>⭐ {summary.significant_day_count} {t.significantDatesShort}</li>
               </ul>
               {summary.most_significant_day && (
                 <div className="mt-3 pt-3 border-t border-slate-100">

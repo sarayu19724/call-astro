@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { ArrowLeft, ChevronLeft, ChevronRight, Sparkles, Loader2, Sunrise, Sunset } from 'lucide-react';
+import { ArrowLeft, ChevronLeft, ChevronRight, Sparkles, Loader2, Sunrise, Sunset, MapPin, RefreshCw } from 'lucide-react';
 
 const API_BASE = ((import.meta as ImportMeta & { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE) || '/api';
 
@@ -16,6 +16,8 @@ interface MuhurtaWindow { name: string; start: string; end: string; note: string
 interface DayInfo {
   transits: TransitEvent[];
   dasha: DashaEvent[];
+  good: MuhurtaWindow[];
+  avoid: MuhurtaWindow[];
   muhurta?: MuhurtaDetail | null;
   is_significant: boolean;
   personal_status?: 'favorable' | 'caution' | 'normal';
@@ -23,6 +25,9 @@ interface DayInfo {
 interface MonthData {
   year: number; month: number; swisseph_available: boolean;
   has_dasha_data: boolean; has_chart_data: boolean; has_muhurta_data: boolean;
+  location_source?: 'current' | 'birth' | 'unavailable';
+  calendar_latitude?: number | null;
+  calendar_longitude?: number | null;
   days: Record<string, DayInfo>;
 }
 interface MuhurtaDetail {
@@ -48,6 +53,9 @@ interface DayDetail {
   has_dasha_data?: boolean;
   muhurta?: MuhurtaDetail | null;
   has_muhurta_data?: boolean;
+  location_source?: 'current' | 'birth' | 'unavailable';
+  calendar_latitude?: number | null;
+  calendar_longitude?: number | null;
   panchang?: {
     tithi: string;
     paksha: string;
@@ -64,10 +72,10 @@ interface MonthSummary {
   transit_count: number;
   dasha_event_count: number;
   significant_day_count: number;
+  good_muhurta_days: number;
+  avoid_muhurta_days: number;
   favorable_days?: number;
   caution_days?: number;
-  good_muhurta_days?: number;
-  avoid_muhurta_days?: number;
   has_muhurta_data: boolean;
   most_significant_day: { day: number; topics: string[] } | null;
 }
@@ -85,6 +93,7 @@ const STRINGS: Record<string, {
   swissephMissing: string; noChartYet: string; house: string;
   goodTimes: string; avoidTimes: string; sunrise: string; sunset: string;
   noMuhurtaData: string; goodDaysCount: string; avoidDaysCount: string;
+  currentLocation: string; useCurrentLocation: string; locationPermission: string; locationDenied: string;
 }> = {
   English: {
     title: 'Astrology Calendar',
@@ -100,6 +109,7 @@ const STRINGS: Record<string, {
     goodTimes: 'Good Times', avoidTimes: 'Avoid These Times', sunrise: 'Sunrise', sunset: 'Sunset',
     noMuhurtaData: 'Timing calculations need your birth location — chat with the astrologer once to unlock them.',
     goodDaysCount: 'days with a favorable Muhurta', avoidDaysCount: 'days with a period to avoid',
+    currentLocation: 'Current location', useCurrentLocation: 'Use current location', locationPermission: 'Getting your current location…', locationDenied: 'Using birth location',
   },
   Hindi: {
     title: 'ज्योतिष कैलेंडर',
@@ -115,6 +125,7 @@ const STRINGS: Record<string, {
     goodTimes: 'शुभ मुहूर्त', avoidTimes: 'इन समयों से बचें', sunrise: 'सूर्योदय', sunset: 'सूर्यास्त',
     noMuhurtaData: 'मुहूर्त गणना के लिए जन्म स्थान चाहिए — पहले ज्योतिषी से एक बार बात करें।',
     goodDaysCount: 'शुभ मुहूर्त वाले दिन', avoidDaysCount: 'बचने योग्य समय वाले दिन',
+    currentLocation: 'वर्तमान स्थान', useCurrentLocation: 'वर्तमान स्थान उपयोग करें', locationPermission: 'वर्तमान स्थान प्राप्त किया जा रहा है…', locationDenied: 'जन्म स्थान उपयोग हो रहा है',
   },
   Hinglish: {
     title: 'Astrology Calendar',
@@ -130,6 +141,7 @@ const STRINGS: Record<string, {
     goodTimes: 'Good Times', avoidTimes: 'Yeh Times Avoid Karein', sunrise: 'Sunrise', sunset: 'Sunset',
     noMuhurtaData: 'Timing calculations ke liye birth location chahiye — pehle astrologer se ek baar baat karein.',
     goodDaysCount: 'din jab favorable Muhurta hai', avoidDaysCount: 'din jab avoid karne wala period hai',
+    currentLocation: 'Current location', useCurrentLocation: 'Use current location', locationPermission: 'Current location li ja rahi hai…', locationDenied: 'Birth location use ho rahi hai',
   },
 };
 
@@ -186,12 +198,50 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
   const [dayLoading, setDayLoading] = useState(false);
   const [explaining, setExplaining] = useState(false);
 
+  // Calendar location is separate from birth location.
+  // Kundli/Dasha stay based on birth details; sunrise/sunset/Muhurta use
+  // the user's current browser location when permission is granted.
+  const [currentLocation, setCurrentLocation] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [locationStatus, setLocationStatus] = useState<'requesting' | 'ready' | 'denied' | 'unsupported'>('requesting');
+
+  const requestCurrentLocation = useCallback(() => {
+    if (!navigator.geolocation) {
+      setLocationStatus('unsupported');
+      return;
+    }
+
+    setLocationStatus('requesting');
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        setCurrentLocation({
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        });
+        setLocationStatus('ready');
+      },
+      (error) => {
+        console.warn('Current location unavailable:', error.message);
+        setCurrentLocation(null);
+        setLocationStatus(error.code === error.PERMISSION_DENIED ? 'denied' : 'unsupported');
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 5 * 60 * 1000 },
+    );
+  }, []);
+
+  useEffect(() => {
+    requestCurrentLocation();
+  }, [requestCurrentLocation]);
+
+  const locationQuery = currentLocation
+    ? `?latitude=${encodeURIComponent(currentLocation.latitude)}&longitude=${encodeURIComponent(currentLocation.longitude)}`
+    : '';
+
   const loadMonth = useCallback(async () => {
     setLoading(true);
     try {
       const [monthRes, summaryRes] = await Promise.all([
-        fetch(`${API_BASE}/session/${sessionId}/calendar/${year}/${month}`),
-        fetch(`${API_BASE}/session/${sessionId}/calendar/${year}/${month}/summary`),
+        fetch(`${API_BASE}/session/${sessionId}/calendar/${year}/${month}${locationQuery}`),
+        fetch(`${API_BASE}/session/${sessionId}/calendar/${year}/${month}/summary${locationQuery}`),
       ]);
       if (monthRes.ok) setMonthData(await monthRes.json());
       if (summaryRes.ok) setSummary(await summaryRes.json());
@@ -200,7 +250,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
     } finally {
       setLoading(false);
     }
-  }, [sessionId, year, month]);
+  }, [sessionId, year, month, locationQuery]);
 
   useEffect(() => { loadMonth(); }, [loadMonth]);
 
@@ -221,7 +271,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
     setDayLoading(true);
     try {
       const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-      const res = await fetch(`${API_BASE}/session/${sessionId}/calendar/day/${dateStr}`);
+      const res = await fetch(`${API_BASE}/session/${sessionId}/calendar/day/${dateStr}${locationQuery}`);
       if (res.ok) setDayDetail(await res.json());
     } catch (err) {
       console.error('Failed to load day detail:', err);
@@ -235,7 +285,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
     setExplaining(true);
     try {
       const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(selectedDay).padStart(2, '0')}`;
-      const res = await fetch(`${API_BASE}/session/${sessionId}/calendar/day/${dateStr}?explain=true`);
+      const res = await fetch(`${API_BASE}/session/${sessionId}/calendar/day/${dateStr}?explain=true${currentLocation ? `&latitude=${encodeURIComponent(currentLocation.latitude)}&longitude=${encodeURIComponent(currentLocation.longitude)}` : ''}`);
       if (res.ok) setDayDetail(await res.json());
     } catch (err) {
       console.error('Failed to explain day:', err);
@@ -248,7 +298,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
     switch (filter) {
       case 'transits': return info.transits.length > 0;
       case 'dasha': return info.dasha.length > 0;
-      case 'important': return info.is_significant;
+      case 'important': return info.is_significant || info.personal_status === 'favorable' || info.personal_status === 'caution';
       default: return true;
     }
   };
@@ -294,6 +344,36 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
             </div>
           )}
 
+          {/* Current calendar location */}
+          <div className="bg-white border border-slate-200 rounded-xl px-3 py-2.5 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              <MapPin size={15} className="text-amber-500 shrink-0" />
+              <div className="min-w-0">
+                <p className="text-xs font-semibold text-slate-700">
+                  {monthData?.location_source === 'current'
+                    ? t.currentLocation
+                    : locationStatus === 'requesting'
+                      ? t.locationPermission
+                      : t.locationDenied}
+                </p>
+                {currentLocation && (
+                  <p className="text-[10px] text-slate-400 truncate">
+                    {currentLocation.latitude.toFixed(5)}, {currentLocation.longitude.toFixed(5)}
+                  </p>
+                )}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={requestCurrentLocation}
+              disabled={locationStatus === 'requesting'}
+              className="shrink-0 flex items-center gap-1.5 text-[11px] font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg px-2.5 py-1.5 disabled:opacity-50"
+            >
+              <RefreshCw size={12} className={locationStatus === 'requesting' ? 'animate-spin' : ''} />
+              {t.useCurrentLocation}
+            </button>
+          </div>
+
           {/* Filters */}
           <div className="flex flex-wrap gap-2">
             {(Object.keys(t.filters) as FilterKey[]).map((key) => (
@@ -337,19 +417,10 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   if (day === null) return <div key={`b-${idx}`} />;
                   const info = monthData?.days[String(day)];
                   const visible = info ? dayMatchesFilter(info) : false;
-                  const hasForMeGood = info?.personal_status === 'favorable';
-                  const hasForMeCaution = info?.personal_status === 'caution';
-                  const hasMuhurtaGood = !!info?.muhurta && (
-                    info.muhurta.abhijit.length > 0 || info.muhurta.brahma.length > 0
-                  );
-                  const hasMuhurtaAvoid = !!info?.muhurta && (
-                    info.muhurta.rahu_kalam.length > 0 ||
-                    info.muhurta.yamaganda.length > 0 ||
-                    info.muhurta.gulika_kalam.length > 0 ||
-                    info.muhurta.durmuhurtham.length > 0
-                  );
-                  const hasTransit = !!info?.transits.length;
-                  const hasDasha = !!info?.dasha.length;
+                  const hasGood = info?.personal_status === 'favorable';
+                  const hasAvoid = info?.personal_status === 'caution';
+                  const hasTransit = !!info?.transits?.length;
+                  const hasDasha = !!info?.dasha?.length;
                   const isToday = year === today.getFullYear() && month === today.getMonth() + 1 && day === today.getDate();
 
                   return (
@@ -362,10 +433,8 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                     >
                       <span>{day}</span>
                       <span className="flex gap-0.5 mt-0.5">
-                        {hasForMeGood && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
-                        {hasForMeCaution && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-rose-500'}`} />}
-                        {hasMuhurtaGood && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-lime-500'}`} />}
-                        {hasMuhurtaAvoid && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-orange-500'}`} />}
+                        {hasGood && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
+                        {hasAvoid && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-rose-500'}`} />}
                         {hasTransit && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-sky-500'}`} />}
                         {hasDasha && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-violet-500'}`} />}
                       </span>
@@ -377,10 +446,8 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
 
             {!loading && monthData?.has_muhurta_data && (
               <div className="flex flex-wrap gap-3 mt-4 pt-3 border-t border-slate-100 text-[10px] text-slate-400">
-                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> Favorable for Me</span>
-                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> Needs Care</span>
-                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-lime-500" /> Good Muhurta</span>
-                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-orange-500" /> Avoid Times</span>
+                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {t.goodTimes}</span>
+                <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> {t.avoidTimes}</span>
                 <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-sky-500" /> {t.significantTransits}</span>
                 <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-violet-500" /> {t.dashaEvents}</span>
               </div>
@@ -390,9 +457,13 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
           {/* Day detail panel */}
           {selectedDay && (
             <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
-              <h3 className="text-sm font-bold text-slate-800 mb-3">
+              <h3 className="text-sm font-bold text-slate-800 mb-1">
                 {MONTH_NAMES[month - 1]} {selectedDay}, {year}
               </h3>
+              <p className="text-[10px] text-slate-400 mb-3">
+                <MapPin size={10} className="inline mr-1" />
+                {dayDetail?.location_source === 'current' ? t.currentLocation : t.locationDenied}
+              </p>
 
               {dayLoading ? (
                 <div className="flex items-center gap-2 text-slate-400 text-sm py-4">
@@ -419,11 +490,8 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                       ...dayDetail.muhurta.rahu_kalam,
                       ...dayDetail.muhurta.yamaganda,
                       ...dayDetail.muhurta.gulika_kalam,
+                      ...dayDetail.muhurta.durmuhurtham,
                     ]} />
-                  )}
-
-                  {dayDetail.muhurta && dayDetail.muhurta.durmuhurtham.length > 0 && (
-                    <MuhurtaSection title="Durmuhurtham" items={dayDetail.muhurta.durmuhurtham} />
                   )}
 
                   {dayDetail.panchang && (
@@ -538,17 +606,17 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
             <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
               <h3 className="text-sm font-bold text-slate-800 mb-3">{t.monthAtGlance.toUpperCase()} — {MONTH_NAMES[month - 1]} {year}</h3>
               <ul className="text-sm text-slate-700 space-y-1.5">
+                {summary.has_muhurta_data && (
+                  <>
+                    <li>• {summary.good_muhurta_days} {t.goodDaysCount}</li>
+                    <li>• {summary.avoid_muhurta_days} {t.avoidDaysCount}</li>
+                  </>
+                )}
                 {typeof summary.favorable_days === 'number' && (
-                  <li>• {summary.favorable_days} favorable days for you</li>
+                  <li>• {summary.favorable_days} favorable personal days</li>
                 )}
                 {typeof summary.caution_days === 'number' && (
-                  <li>• {summary.caution_days} days needing more care</li>
-                )}
-                {summary.has_muhurta_data && typeof summary.good_muhurta_days === 'number' && (
-                  <li>• {summary.good_muhurta_days} {t.goodDaysCount}</li>
-                )}
-                {summary.has_muhurta_data && typeof summary.avoid_muhurta_days === 'number' && (
-                  <li>• {summary.avoid_muhurta_days} {t.avoidDaysCount}</li>
+                  <li>• {summary.caution_days} personal caution days</li>
                 )}
                 <li>• {summary.transit_count} {t.significantTransits}</li>
                 <li>• {summary.dasha_event_count} {t.dashaEvents}</li>

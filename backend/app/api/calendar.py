@@ -1,110 +1,76 @@
 from fastapi import APIRouter, HTTPException, Query
-
+from typing import Optional
 from app.services.calendar_service import (
     get_month_events,
     get_day_detail,
     get_month_summary,
     explain_day,
 )
-
 from app.utils.logger import logger
 
-
-router = APIRouter(
-    prefix="/session",
-    tags=["AstrologyCalendar"],
-)
+router = APIRouter(prefix="/session", tags=["AstrologyCalendar"])
 
 
-# =========================================================
-# DAY DETAIL
-# IMPORTANT:
-# Keep this route BEFORE /{year}/{month}
-# =========================================================
+def _coords(latitude: Optional[float], longitude: Optional[float]):
+    # Only use current coordinates when both are supplied. Otherwise the
+    # service falls back to the birth-location coordinates already stored
+    # in the session.
+    if latitude is None or longitude is None:
+        return None, None
+    return latitude, longitude
+
+
+# IMPORTANT: keep /calendar/day/... before /calendar/{year}/{month}
+# so FastAPI does not interpret "day" as the year parameter.
 @router.get("/{session_id}/calendar/day/{date_str}")
 async def calendar_day(
     session_id: str,
     date_str: str,
     explain: bool = Query(False),
+    latitude: Optional[float] = Query(None),
+    longitude: Optional[float] = Query(None),
 ):
     try:
+        lat, lon = _coords(latitude, longitude)
         if explain:
-            return explain_day(session_id, date_str)
-
-        return get_day_detail(session_id, date_str)
-
+            return explain_day(session_id, date_str, lat, lon)
+        return get_day_detail(session_id, date_str, lat, lon)
     except Exception as e:
-        logger.error(
-            f"Error building calendar day detail "
-            f"for {session_id}, {date_str}: {e}"
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=str(e),
-        )
+        logger.error(f"Error building calendar day detail for {session_id}, {date_str}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# =========================================================
-# MONTH SUMMARY
-# =========================================================
 @router.get("/{session_id}/calendar/{year}/{month}/summary")
 async def calendar_month_summary(
     session_id: str,
     year: int,
     month: int,
+    latitude: Optional[float] = Query(None),
+    longitude: Optional[float] = Query(None),
 ):
     if month < 1 or month > 12:
-        raise HTTPException(
-            status_code=400,
-            detail="month must be between 1 and 12",
-        )
-
+        raise HTTPException(status_code=400, detail="month must be between 1 and 12")
     try:
-        return get_month_summary(
-            session_id,
-            year,
-            month,
-        )
-
+        lat, lon = _coords(latitude, longitude)
+        return get_month_summary(session_id, year, month, lat, lon)
     except Exception as e:
-        logger.error(
-            f"Error building calendar month summary "
-            f"for {session_id}, {year}-{month}: {e}"
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=str(e),
-        )
+        logger.error(f"Error building calendar month summary for {session_id}, {year}-{month}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# =========================================================
-# MONTH
-# =========================================================
 @router.get("/{session_id}/calendar/{year}/{month}")
 async def calendar_month(
     session_id: str,
     year: int,
     month: int,
+    latitude: Optional[float] = Query(None),
+    longitude: Optional[float] = Query(None),
 ):
     if month < 1 or month > 12:
-        raise HTTPException(
-            status_code=400,
-            detail="month must be between 1 and 12",
-        )
-
+        raise HTTPException(status_code=400, detail="month must be between 1 and 12")
     try:
-        return get_month_events(
-            session_id,
-            year,
-            month,
-        )
-
+        lat, lon = _coords(latitude, longitude)
+        return get_month_events(session_id, year, month, lat, lon)
     except Exception as e:
-        logger.error(
-            f"Error building calendar month view "
-            f"for {session_id}, {year}-{month}: {e}"
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=str(e),
-        )
+        logger.error(f"Error building calendar month view for {session_id}, {year}-{month}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

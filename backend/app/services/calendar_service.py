@@ -496,10 +496,14 @@ def compute_muhurta_periods(target_date: date, latitude: float, longitude: float
 
     muhurta_len = day_duration / 15.0
 
-    abhijit = {
-        "start": _minutes_to_hhmm(sunrise + 7 * muhurta_len),
-        "end": _minutes_to_hhmm(sunrise + 8 * muhurta_len),
-    }
+    # The selected reference table used for this calendar does not list
+    # Abhijit Muhurta on Wednesday. Keep it separate from Durmuhurtham.
+    abhijit = None
+    if weekday != 2:  # Wednesday
+        abhijit = {
+            "start": _minutes_to_hhmm(sunrise + 7 * muhurta_len),
+            "end": _minutes_to_hhmm(sunrise + 8 * muhurta_len),
+        }
 
     brahma = {
         "start": _minutes_to_hhmm(sunrise - 96),
@@ -515,12 +519,12 @@ def compute_muhurta_periods(target_date: date, latitude: float, longitude: float
     return {
         "sunrise": _minutes_to_hhmm(sunrise),
         "sunset": _minutes_to_hhmm(sunset),
-        "abhijit": [{
+        "abhijit": ([{
             "name": "Abhijit Muhurta",
             "start": abhijit["start"],
             "end": abhijit["end"],
             "note": "Traditionally favorable for beginning important work.",
-        }],
+        }] if abhijit else []),
         "brahma": [{
             "name": "Brahma Muhurta",
             "start": brahma["start"],
@@ -550,14 +554,63 @@ def compute_muhurta_periods(target_date: date, latitude: float, longitude: float
 
 
 # ------------------------------------------------------------------
+# CALENDAR LOCATION
+# ------------------------------------------------------------------
+# Birth coordinates remain authoritative for the natal Kundli/Dasha.
+# The calendar can receive current browser coordinates for location-dependent
+# sunrise/sunset and Muhurta calculations. If current coordinates are absent,
+# the existing birth-location coordinates are used as a fallback.
+# ------------------------------------------------------------------
+def _valid_coordinate(value: Any, minimum: float, maximum: float) -> bool:
+    try:
+        numeric = float(value)
+        return minimum <= numeric <= maximum
+    except (TypeError, ValueError):
+        return False
+
+
+def _resolve_calendar_location(
+    session: Dict[str, Any],
+    current_latitude: Optional[float] = None,
+    current_longitude: Optional[float] = None,
+) -> Tuple[Optional[float], Optional[float], str]:
+    if (
+        current_latitude is not None
+        and current_longitude is not None
+        and _valid_coordinate(current_latitude, -90.0, 90.0)
+        and _valid_coordinate(current_longitude, -180.0, 180.0)
+    ):
+        return float(current_latitude), float(current_longitude), "current"
+
+    birth_latitude = session.get("latitude")
+    birth_longitude = session.get("longitude")
+    if (
+        birth_latitude is not None
+        and birth_longitude is not None
+        and _valid_coordinate(birth_latitude, -90.0, 90.0)
+        and _valid_coordinate(birth_longitude, -180.0, 180.0)
+    ):
+        return float(birth_latitude), float(birth_longitude), "birth"
+
+    return None, None, "unavailable"
+
+
+# ------------------------------------------------------------------
 # MONTH / DAY VIEWS
 # ------------------------------------------------------------------
-def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
+def get_month_events(
+    session_id: str,
+    year: int,
+    month: int,
+    current_latitude: Optional[float] = None,
+    current_longitude: Optional[float] = None,
+) -> Dict[str, Any]:
     session = db.get_or_create_session(session_id)
     chart = _get_natal_chart(session)
     ascendant_sign = chart["ascendant_sign"] if chart else None
-    latitude = session.get("latitude")
-    longitude = session.get("longitude")
+    latitude, longitude, location_source = _resolve_calendar_location(
+        session, current_latitude, current_longitude
+    )
 
     days_in_month = pycalendar.monthrange(year, month)[1]
     daily_signs = _daily_signs_for_month(year, month)
@@ -616,11 +669,19 @@ def get_month_events(session_id: str, year: int, month: int) -> Dict[str, Any]:
         "has_dasha_data": bool(session.get("dasha_tree_raw")),
         "has_chart_data": chart is not None,
         "has_muhurta_data": has_muhurta_data,
+        "location_source": location_source,
+        "calendar_latitude": latitude,
+        "calendar_longitude": longitude,
         "days": days,
     }
 
 
-def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
+def get_day_detail(
+    session_id: str,
+    date_str: str,
+    current_latitude: Optional[float] = None,
+    current_longitude: Optional[float] = None,
+) -> Dict[str, Any]:
     try:
         target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
@@ -629,8 +690,9 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
     session = db.get_or_create_session(session_id)
     chart = _get_natal_chart(session)
     ascendant_sign = chart["ascendant_sign"] if chart else None
-    latitude = session.get("latitude")
-    longitude = session.get("longitude")
+    latitude, longitude, location_source = _resolve_calendar_location(
+        session, current_latitude, current_longitude
+    )
 
     planetary_positions: List[Dict[str, Any]] = []
     day_signs: Dict[str, Optional[str]] = {}
@@ -712,6 +774,9 @@ def get_day_detail(session_id: str, date_str: str) -> Dict[str, Any]:
         "has_dasha_data": bool(session.get("dasha_tree_raw")),
         "muhurta": muhurta,
         "has_muhurta_data": muhurta is not None,
+        "location_source": location_source,
+        "calendar_latitude": latitude,
+        "calendar_longitude": longitude,
         "panchang": panchang,
         "personal_status": personal_status,
         "personal_supportive_reasons": supportive_reasons,
@@ -748,8 +813,13 @@ Write the explanation now:
 """
 
 
-def explain_day(session_id: str, date_str: str) -> Dict[str, Any]:
-    detail = get_day_detail(session_id, date_str)
+def explain_day(
+    session_id: str,
+    date_str: str,
+    current_latitude: Optional[float] = None,
+    current_longitude: Optional[float] = None,
+) -> Dict[str, Any]:
+    detail = get_day_detail(session_id, date_str, current_latitude, current_longitude)
     if not detail.get("available"):
         return detail
 
@@ -822,8 +892,16 @@ def explain_day(session_id: str, date_str: str) -> Dict[str, Any]:
     return detail
 
 
-def get_month_summary(session_id: str, year: int, month: int) -> Dict[str, Any]:
-    month_data = get_month_events(session_id, year, month)
+def get_month_summary(
+    session_id: str,
+    year: int,
+    month: int,
+    current_latitude: Optional[float] = None,
+    current_longitude: Optional[float] = None,
+) -> Dict[str, Any]:
+    month_data = get_month_events(
+        session_id, year, month, current_latitude, current_longitude
+    )
     days = month_data["days"]
 
     transit_count = sum(len(d["transits"]) for d in days.values())
@@ -890,4 +968,7 @@ def get_month_summary(session_id: str, year: int, month: int) -> Dict[str, Any]:
         "has_dasha_data": month_data["has_dasha_data"],
         "has_chart_data": month_data["has_chart_data"],
         "has_muhurta_data": month_data.get("has_muhurta_data", False),
+        "location_source": month_data.get("location_source", "unavailable"),
+        "calendar_latitude": month_data.get("calendar_latitude"),
+        "calendar_longitude": month_data.get("calendar_longitude"),
     }

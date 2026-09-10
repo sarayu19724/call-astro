@@ -597,7 +597,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   // ------------------------------------------------------
                   const showTransitDot = (filter === 'all' || filter === 'transits') && hasTransit;
                   const showDashaDot = (filter === 'all' || filter === 'dasha') && hasDasha;
-                  const showFavorableDot = filter === 'important' && favorable;
+                  const showFavorableDot = (filter === 'all' || filter === 'important') && favorable;
 
                   return (
                     <button

@@ -18,6 +18,7 @@ interface DayInfo {
   dasha: DashaEvent[];
   good: MuhurtaWindow[];
   avoid: MuhurtaWindow[];
+  topics?: string[];
   muhurta?: MuhurtaDetail | null;
   is_significant: boolean;
   personal_status?: 'favorable' | 'normal';
@@ -77,29 +78,12 @@ interface MonthSummary {
   most_significant_day: { day: number; topics: string[] } | null;
 }
 
-type FilterKey =
-  | 'all'
-  | 'transits'
-  | 'dasha'
-  | 'important'
-  | 'career'
-  | 'finance'
-  | 'marriage'
-  | 'health'
-  | 'education';
+type FilterKey = 'all' | 'transits' | 'dasha' | 'important'| 'career'| 'finance'| 'marriage'| 'health'| 'education';
 type LocationMode = 'geolocation' | 'manual';
 type LocationStatus = 'requesting' | 'ready' | 'denied' | 'unsupported' | 'manual_pending' | 'manual_error';
 
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const WEEKDAY_LABELS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
-
-const HOUSE_TOPIC_FILTERS: Record<Exclude<FilterKey, 'all' | 'transits' | 'dasha' | 'important'>, string[]> = {
-  career: ['career', 'profession', 'work', 'job'],
-  finance: ['finance', 'finances', 'financial', 'wealth', 'money', 'income', 'gains'],
-  marriage: ['marriage', 'spouse', 'partnership', 'relationship', 'relationships'],
-  health: ['health', 'illness', 'disease', 'wellness'],
-  education: ['education', 'learning', 'study', 'studies', 'academic'],
-};
 
 const STRINGS: Record<string, {
   title: string; filters: Record<FilterKey, string>; monthAtGlance: string; significantDates: string;
@@ -413,46 +397,16 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
   };
 
   // ------------------------------------------------------------------
-  // FILTERS
-  // All | Transits | Dasha | For Me | Career | Finance | Marriage |
-  // Health | Education
-  //
-  // House-wise filters use the backend's existing transit relevance data.
-  // A day matches a topic when one of that day's transit events is tagged
-  // with the selected topic in event.relevance.topics.
+  // FILTER — top bar stays exactly: All | Transits | Dasha | For Me.
+  // "For Me" now surfaces ONLY favorable days — there is no "Needs Care"
+  // state anymore, so nothing else qualifies for this filter.
   // ------------------------------------------------------------------
-  const transitMatchesTopic = (
-    info: DayInfo,
-    topic: Exclude<FilterKey, 'all' | 'transits' | 'dasha' | 'important'>
-  ): boolean => {
-    const keywords = HOUSE_TOPIC_FILTERS[topic];
-
-    return info.transits.some((event) =>
-      event.relevance?.topics?.some((eventTopic) => {
-        const normalized = eventTopic.toLowerCase().trim();
-        return keywords.some((keyword) =>
-          normalized === keyword || normalized.includes(keyword) || keyword.includes(normalized)
-        );
-      })
-    );
-  };
-
   const dayMatchesFilter = (info: DayInfo): boolean => {
     switch (filter) {
-      case 'transits':
-        return info.transits.length > 0;
-      case 'dasha':
-        return info.dasha.length > 0;
-      case 'important':
-        return info.personal_status === 'favorable';
-      case 'career':
-      case 'finance':
-      case 'marriage':
-      case 'health':
-      case 'education':
-        return transitMatchesTopic(info, filter);
-      default:
-        return true;
+      case 'transits': return info.transits.length > 0;
+      case 'dasha': return info.dasha.length > 0;
+      case 'important': return info.personal_status === 'favorable';
+      default: return true;
     }
   };
 
@@ -585,7 +539,7 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
             )}
           </div>
 
-          {/* Filters — All | Transits | Dasha | For Me | Career | Finance | Marriage | Health | Education */}
+          {/* Filters — All | Transits | Dasha | For Me */}
           <div className="flex flex-wrap gap-2">
             {(Object.keys(t.filters) as FilterKey[]).map((key) => (
               <button
@@ -637,12 +591,11 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                   const showTransitDot = (filter === 'all' || filter === 'transits') && hasTransit;
                   const showDashaDot = (filter === 'all' || filter === 'dasha') && hasDasha;
                   const showFavorableDot = (filter === 'all' || filter === 'important') && favorable;
-
-                  const careerDot = filter === 'career' && !!info && transitMatchesTopic(info, 'career');
-                  const financeDot = filter === 'finance' && !!info && transitMatchesTopic(info, 'finance');
-                  const marriageDot = filter === 'marriage' && !!info && transitMatchesTopic(info, 'marriage');
-                  const healthDot = filter === 'health' && !!info && transitMatchesTopic(info, 'health');
-                  const educationDot = filter === 'education' && !!info && transitMatchesTopic(info, 'education');
+                  const careerDot = (filter === 'career') && info?.topics?.includes('career');
+                  const financeDot = (filter === 'finance') && info?.topics?.includes('finance');
+                  const marriageDot = (filter === 'marriage') && info?.topics?.includes('marriage');
+                  const healthDot = (filter === 'health') && info?.topics?.includes('health');
+                  const educationDot = (filter === 'education') && info?.topics?.includes('education');
                   return (
                     <button
                       key={day}
@@ -657,11 +610,11 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                         {showFavorableDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
                         {showTransitDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-sky-500'}`} />}
                         {showDashaDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-violet-500'}`} />}
-                        {careerDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
-                        {financeDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
-                        {marriageDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
-                        {educationDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
-                        {healthDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
+                        {careerDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-amber-500'}`} />}
+                        {financeDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-600'}`} />}
+                        {marriageDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-pink-500'}`} />}
+                        {educationDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-indigo-500'}`} />}
+                        {healthDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-rose-500'}`} />}
                       </span>
                     </button>
                   );
@@ -690,15 +643,6 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
             {!loading && filter === 'dasha' && (
               <div className="flex flex-wrap gap-3 mt-4 pt-3 border-t border-slate-100 text-[10px] text-slate-400">
                 <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-violet-500" /> {t.dashaEvents}</span>
-              </div>
-            )}
-
-            {(!loading && ['career', 'finance', 'marriage', 'health', 'education'].includes(filter)) && (
-              <div className="flex flex-wrap gap-3 mt-4 pt-3 border-t border-slate-100 text-[10px] text-slate-500">
-                <span className="flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                  {t.personalFavorable}
-                </span>
               </div>
             )}
           </div>

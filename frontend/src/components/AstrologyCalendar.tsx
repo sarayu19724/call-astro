@@ -382,7 +382,6 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
   // are intentionally mutually exclusive by construction, not by extra
   // guard logic.
   const isFavorable = (info?: DayInfo) => info?.personal_status === 'favorable';
-  const isNeedsCare = (info?: DayInfo) => info?.personal_status === 'caution';
 
   const personalStatusLabel = (status?: 'favorable' | 'caution' | 'normal' | null) => {
     if (status === 'favorable') return t.personalFavorable;
@@ -563,26 +562,12 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
 
                   // Mutually exclusive by construction — see isFavorable/isNeedsCare above.
                   const favorable = isFavorable(info);
-                  const needsCare = isNeedsCare(info);
                   const hasTransit = !!info?.transits?.length;
                   const hasDasha = !!info?.dasha?.length;
                   const isToday = year === today.getFullYear() && month === today.getMonth() + 1 && day === today.getDate();
-
-                  // ------------------------------------------------------
-                  // DOT VISIBILITY — gated strictly by the active filter so
-                  // a date never shows a dot type that isn't relevant to
-                  // the tab currently selected:
-                  //   All        -> transit (blue) + dasha (violet) only
-                  //   Transits   -> transit (blue) only
-                  //   Dasha      -> dasha (violet) only
-                  //   For Me     -> favorable (green) / needs-care (red) only
-                  // Personal-status dots NEVER render outside "For Me", and
-                  // transit/dasha dots NEVER render inside "For Me".
-                  // ------------------------------------------------------
                   const showTransitDot = (filter === 'all' || filter === 'transits') && hasTransit;
                   const showDashaDot = (filter === 'all' || filter === 'dasha') && hasDasha;
                   const showFavorableDot = filter === 'important' && favorable;
-                  const showNeedsCareDot = filter === 'important' && needsCare;
 
                   return (
                     <button
@@ -596,7 +581,6 @@ export default function AstrologyCalendar({ sessionId, language, onBack }: Astro
                       <span>{day}</span>
                       <span className="flex gap-0.5 mt-0.5">
                         {showFavorableDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-emerald-500'}`} />}
-                        {showNeedsCareDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-rose-500'}`} />}
                         {showTransitDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-sky-500'}`} />}
                         {showDashaDot && <span className={`w-1 h-1 rounded-full ${selectedDay === day ? 'bg-white' : 'bg-violet-500'}`} />}
                       </span>

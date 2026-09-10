@@ -60,6 +60,55 @@ HOUSE_ACTIVATION_PHRASE: Dict[int, str] = {
 }
 
 
+TOPIC_SIGNIFICANCE: Dict[str, str] = {
+    "career": "Career, profession, work and public responsibilities.",
+    "finance": "Money, savings, resources and financial gains.",
+    "marriage": "Marriage, spouse, partnership and long-term relationships.",
+    "health": "Physical health, vitality and health-related matters.",
+    "education": "Education, learning, study and academic matters.",
+    "family": "Family, home and domestic matters.",
+    "children": "Children, creativity and 5th-house matters.",
+    "travel": "Travel, movement and changes of place.",
+}
+
+
+def _build_topic_significance(
+    planetary_positions: List[Dict[str, Any]],
+    significant_topics: List[str],
+) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
+    """Build topic meanings and verified transit/house factors only."""
+    meanings: Dict[str, str] = {}
+    factors: Dict[str, List[str]] = {}
+
+    for topic in significant_topics:
+        key = topic.lower()
+        if key in TOPIC_SIGNIFICANCE:
+            meanings[topic] = TOPIC_SIGNIFICANCE[key]
+
+        topic_factors: List[str] = []
+        for entry in planetary_positions:
+            relevance = entry.get("relevance") or {}
+            topics = relevance.get("topics") or []
+            if topic not in topics:
+                continue
+
+            planet = entry.get("planet")
+            sign = entry.get("sign")
+            house = relevance.get("house")
+
+            if planet and sign and house:
+                topic_factors.append(
+                    f"{planet} is transiting {sign} in your {_ordinal(house)} house"
+                )
+            elif planet and sign:
+                topic_factors.append(f"{planet} is transiting {sign}")
+
+        if topic_factors:
+            factors[topic] = list(dict.fromkeys(topic_factors))[:3]
+
+    return meanings, factors
+
+
 def _ordinal(n: int) -> str:
     if 10 <= (n % 100) <= 20:
         suffix = "th"
@@ -785,6 +834,10 @@ def get_day_detail(
         and significant_topics
     )
 
+    topic_meanings, topic_factors = _build_topic_significance(
+        planetary_positions, sorted(significant_topics)
+    )
+
     return {
         "available": True,
         "date": date_str,
@@ -792,6 +845,8 @@ def get_day_detail(
         "current_mahadasha": maha_lord,
         "current_antardasha": antar_lord,
         "significant_topics": sorted(significant_topics),
+        "topic_significance": topic_meanings,
+        "topic_factors": topic_factors,
         "is_auspicious_heuristic": is_auspicious,
         "swisseph_available": SWISSEPH_AVAILABLE,
         "has_dasha_data": bool(session.get("dasha_tree_raw")),
@@ -806,36 +861,36 @@ def get_day_detail(
     }
 
 
-DAY_EXPLAIN_PROMPT = """You are a warm, experienced Indian Vedic Astrologer explaining why one specific
-calendar date matters for your client, using ONLY the verified facts below — never invent a planet,
-sign, house placement, or timing that isn't listed.
+DAY_EXPLAIN_PROMPT = """You are a warm, experienced Indian Vedic Astrologer explaining why specific
+life areas are significant on one date, using ONLY the verified facts below. Never invent a planet,
+sign, house placement, aspect, lordship, yoga, or timing.
 
 Rules:
 1. Respond STRICTLY in {language}.
-2. Length: 2-4 sentences, under 70 words. Plain prose, no bullet points, no headers.
-3. Never mention "calendar", "computed", "database", "score", or any technical process — speak as if
-   reading their chart directly.
-4. There are only TWO possible personal indications: "favorable" or "normal". NEVER describe a
-   "normal" day as needing care, caution, or extra attention — a normal day simply has no strongly
-   activated favorable factor right now. Describe it plainly and neutrally, and point to any favorable
-   timing windows (Muhurta) listed below for planning purposes. Only when the indication is
-   "favorable" should you name the specific supportive factor(s) behind it — and even then, frame it
-   as a supportive tendency, never a guarantee or a definite outcome.
-5. If Good/Avoid timings are listed below, you may mention them naturally (e.g. "the Rahu Kalam window
-   in the morning") but never invent a time that isn't given.
-6. If the facts below are sparse, keep the explanation brief and honest rather than padding it out.
+2. Length: 3-5 sentences, under 110 words. Plain prose, no bullet points or headers.
+3. Do not mention technical implementation, databases, scores, or calculations.
+4. For EACH significant life area listed below, explain what that area represents in Vedic astrology
+   and then connect it to the verified chart factor listed for that area.
+5. Use only the exact verified planet/sign/house facts supplied below. Do not create a new factor.
+6. If a current Dasha is supplied, mention it only as context unless the supplied facts explicitly
+   establish a connection to the topic.
+7. A significant topic is an indication for interpretation, not a guarantee of an event.
+8. If no significant topics are listed, explain the date neutrally and mention supplied Muhurta timing.
 
 Date: {date}
-Personal indication: {personal_status} (supportive factors: {supportive})
+Personal indication: {personal_status}
+Significant life areas: {topics}
+Meaning of each area: {topic_meanings}
+Verified chart factors for those areas: {topic_factors}
 Panchang: {panchang}
-Planetary movements on this date (verified): {transits}
-Current Dasha period (verified): {dasha}
-Life areas activated for this client (verified): {topics}
-Favorable timing windows today (verified): {good_muhurta}
-Timing windows to avoid today (verified): {avoid_muhurta}
+Planetary positions on this date: {transits}
+Current Dasha period: {dasha}
+Favorable timing windows: {good_muhurta}
+Timing windows to avoid: {avoid_muhurta}
 
 Write the explanation now:
 """
+
 
 
 def explain_day(
@@ -859,6 +914,17 @@ def explain_day(
         + (f", Antardasha {detail['current_antardasha']}" if detail.get("current_antardasha") else "")
     ) if detail.get("current_mahadasha") else "Not available"
     topics_str = ", ".join(detail.get("significant_topics", [])) or "None specifically activated"
+
+    topic_meanings_str = "; ".join(
+        f"{topic}: {meaning}"
+        for topic, meaning in (detail.get("topic_significance") or {}).items()
+    ) or "None specifically activated"
+
+    topic_factors_str = "; ".join(
+        f"{topic}: {', '.join(factors)}"
+        for topic, factors in (detail.get("topic_factors") or {}).items()
+        if factors
+    ) or "No specific transit factor identified"
 
     muhurta = detail.get("muhurta")
 
@@ -897,6 +963,7 @@ def explain_day(
         supportive=supportive_str,
         panchang=panchang_str,
         transits=transits_str, dasha=dasha_str, topics=topics_str,
+        topic_meanings=topic_meanings_str, topic_factors=topic_factors_str,
         good_muhurta=good_str, avoid_muhurta=avoid_str,
     )
 

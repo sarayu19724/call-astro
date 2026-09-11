@@ -18,11 +18,11 @@ from app.services.claim_validator import validate_claims, build_claim_correction
 from app.services.specificity_service import compute_chart_specificity, build_specificity_correction
 from app.services.topic_service import (
     classify_topic, build_topic_emphasis, get_search_bias,
-    build_explanation_footer, TOPIC_CHART_FACTORS, get_instant_suggestions,
+    build_explanation_footer, TOPIC_CHART_FACTORS, TOPIC_RELEVANT_BOOKS,
+    get_instant_suggestions,
     rank_favorable_periods, format_dasha_timeline_for_prompt,
     build_evidence_vote, format_evidence_vote_for_prompt,
-    get_evidence_consensus_label, get_consensus_instruction,
-    TOPIC_RELEVANT_BOOKS
+    get_evidence_consensus_label, get_consensus_instruction
 )
 from app.services.hybrid_router import route_topic
 from app.services.dasha_api_service import dasha_api_service
@@ -1656,13 +1656,19 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             steps = []
 
+            # STEP 1 — QUERY UNDERSTANDING
             qu = query_understanding or {}
             life_area = qu.get("life_area", "")
             restated = qu.get("restated_intent", "")
             comparison = qu.get("comparison") or []
             requires_timing = qu.get("requires_timing", False)
+
             if restated:
-                topic_source = "LLM life_area (primary)" if (life_area and life_area.strip().lower() == topic) else "keyword fallback"
+                topic_source = (
+                    "LLM life_area (primary)"
+                    if (life_area and life_area.strip().lower() == topic)
+                    else "keyword fallback"
+                )
                 qu_detail = f"What the system understood you're asking:\n\"{restated}\""
                 if life_area:
                     qu_detail += f"\n\nLife area: {life_area}"
@@ -1671,88 +1677,284 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     qu_detail += f"\n\nComparing: {' vs '.join(comparison)}"
                 qu_detail += f"\n\nTiming/Dasha relevant: {'Yes' if requires_timing else 'No'}"
                 if not requires_timing:
-                    qu_detail += " (Dasha timeline retrieval was skipped for this question — see 'Timing-Gated Retrieval' note in Dasha & Timing step)"
+                    qu_detail += (
+                        " (Dasha timeline retrieval was skipped for this question — "
+                        "see 'Dasha & Timing' step)"
+                    )
             else:
                 qu_detail = (
                     "Query understanding was not available for this response — "
                     f"falling back to keyword-based topic classification (topic: {topic or 'none'})."
                 )
-            steps.append({"step": 1, "title": "Query Understanding", "detail": qu_detail, "type": "query_understanding"})
 
+            steps.append({
+                "step": 1,
+                "title": "Query Understanding",
+                "detail": qu_detail,
+                "type": "query_understanding",
+            })
+
+            # STEP 2 — CLASSICAL FRAMEWORK RETRIEVED
             framework_lines = []
+
             if houses:
                 house_labels = []
                 for h in houses:
                     n = int(h)
-                    suffix = "st" if n == 1 else "nd" if n == 2 else "rd" if n == 3 else "th"
+                    suffix = (
+                        "st" if n == 1
+                        else "nd" if n == 2
+                        else "rd" if n == 3
+                        else "th"
+                    )
                     house_labels.append(f"{h}{suffix}")
                 framework_lines.append(f"Houses: {', '.join(house_labels)}")
+
             if planets:
                 framework_lines.append(f"Planets: {', '.join(planets)}")
+
             if charts:
                 framework_lines.append(f"Divisional charts: {', '.join(charts)}")
+
             if concepts:
                 framework_lines.append(f"Concepts: {', '.join(concepts)}")
 
-            framework_hit_count = len([h for h in rag_hits if h.get("stage") == "framework"])
+            framework_hit_count = len(
+                [h for h in rag_hits if h.get("stage") == "framework"]
+            )
+
             if framework_lines:
                 framework_detail = (
-                    "RAG retrieved classical sources and identified the following factors as relevant:\n"
+                    "RAG retrieved classical sources and identified the following "
+                    "factors as relevant:\n"
                     + "\n".join(f"• {line}" for line in framework_lines)
                 )
             elif framework_hit_count == 0:
-                framework_detail = "No classical sources scored above the relevance threshold for this question's core framework query (or the framework was reused from cache for this topic)."
+                framework_detail = (
+                    "No classical sources scored above the relevance threshold for "
+                    "this question's core framework query (or the framework was "
+                    "reused from cache for this topic)."
+                )
             else:
-                framework_detail = "RAG retrieved classical sources, but no specific house/planet/concept factors were confidently identified in the text."
+                framework_detail = (
+                    "RAG retrieved classical sources, but no specific "
+                    "house/planet/concept factors were confidently identified in the text."
+                )
 
-            steps.append({"step": 2, "title": "Classical Framework Retrieved", "detail": framework_detail, "type": "rag"})
+            steps.append({
+                "step": 2,
+                "title": "Classical Framework Retrieved",
+                "detail": framework_detail,
+                "type": "rag",
+            })
 
+            # STEP 3 — RELEVANT CHART FACTORS
             if targeted_facts:
                 chart_detail = (
-                    "The user's Kundli was examined for the factors identified by the retrieved classical sources.\n\n"
+                    "The user's Kundli was examined for the factors identified by "
+                    "the retrieved classical sources.\n\n"
                     + targeted_facts
                 )
             else:
-                chart_detail = "No targeted chart facts were identified from the retrieved classical framework."
+                chart_detail = (
+                    "No targeted chart facts were identified from the retrieved "
+                    "classical framework."
+                )
 
-            steps.append({"step": 3, "title": "Relevant Chart Factors", "detail": chart_detail, "type": "chart"})
+            steps.append({
+                "step": 3,
+                "title": "Relevant Chart Factors",
+                "detail": chart_detail,
+                "type": "chart",
+            })
 
-            personalized_hits = [hit for hit in rag_hits if hit.get("stage") == "personalized"]
-            comparison_hits_trace = [hit for hit in rag_hits if hit.get("stage") == "comparison"]
+            # STEP 4 — EVIDENCE BUCKETED BY TYPE
+            classical_hits = [
+                h for h in rag_hits
+                if h.get("stage") in {"framework", "personalized", "comparison", "followup"}
+            ]
+            dasha_available = bool(session.get("kundli_dasha"))
+
+            bucket_lines = [
+                "Classical rule evidence: "
+                f"{len(classical_hits)} retrieved item(s)"
+            ]
+            bucket_lines.append(
+                "Verified chart facts: "
+                f"{'Available' if targeted_facts else 'Not separately populated'}"
+            )
+            bucket_lines.append(
+                "Dasha / timing evidence: "
+                f"{'Available' if dasha_available else 'Not available'}"
+            )
+            bucket_lines.append(
+                "Yoga evidence: "
+                "Included when available in the generated chart context"
+            )
+
+            steps.append({
+                "step": 4,
+                "title": "Evidence Bucketed by Type",
+                "detail": "\n".join(f"• {line}" for line in bucket_lines),
+                "type": "buckets",
+            })
+
+            # STEP 5 — STRUCTURED FACT → RULE TABLE
+            table_lines = []
+
+            if targeted_facts:
+                table_lines.append("Verified chart facts:")
+                table_lines.append(targeted_facts)
+
+            if framework_lines:
+                table_lines.append("\nClassical factors used for interpretation:")
+                table_lines.extend(f"• {line}" for line in framework_lines)
+
+            if not table_lines:
+                table_lines.append(
+                    "No structured fact-to-rule pairing was available for this response."
+                )
+
+            steps.append({
+                "step": 5,
+                "title": "Structured Fact → Rule Table",
+                "detail": "\n".join(table_lines),
+                "type": "fact_rule_table",
+            })
+
+            # STEP 6 — EVIDENCE SUFFICIENCY + COVERAGE GATE
+            unique_sources = {
+                (
+                    h.get("source")
+                    or h.get("metadata", {}).get("source")
+                    or "Unknown source"
+                )
+                for h in rag_hits
+            }
+            usable_sources = {
+                s for s in unique_sources if s and s != "Unknown source"
+            }
+            framework_count = len(
+                [h for h in rag_hits if h.get("stage") == "framework"]
+            )
+            personalized_count = len(
+                [h for h in rag_hits if h.get("stage") == "personalized"]
+            )
+            comparison_count = len(
+                [h for h in rag_hits if h.get("stage") == "comparison"]
+            )
+
+            signal_count = sum(
+                1 for value in [
+                    bool(usable_sources),
+                    bool(targeted_facts),
+                    dasha_available,
+                    bool(rag_hits),
+                ]
+                if value
+            )
+
+            if not rag_hits:
+                sufficiency_verdict = "LOW — limited classical evidence was available."
+            elif len(usable_sources) >= 2 and signal_count >= 2:
+                sufficiency_verdict = "STRONG — multiple independent evidence signals are available."
+            else:
+                sufficiency_verdict = (
+                    "SUFFICIENT — evidence is available, but interpretation should "
+                    "remain appropriately qualified."
+                )
+
+            sufficiency_lines = [
+                f"Unique retrieved sources: {len(usable_sources)}",
+                f"Framework evidence items: {framework_count}",
+                f"Personalized evidence items: {personalized_count}",
+                f"Comparative evidence items: {comparison_count}",
+                f"Dasha/timing data available: {'Yes' if dasha_available else 'No'}",
+                f"Independent signal count: {signal_count}",
+                "",
+                f"Verdict: {sufficiency_verdict}",
+            ]
+
+            steps.append({
+                "step": 6,
+                "title": "Evidence Sufficiency + Coverage Gate",
+                "detail": "\n".join(sufficiency_lines),
+                "type": "sufficiency",
+            })
+
+            # STEP 7 — PERSONALIZED + COMPARATIVE EVIDENCE RETRIEVED
+            personalized_hits = [
+                hit for hit in rag_hits if hit.get("stage") == "personalized"
+            ]
+            comparison_hits_trace = [
+                hit for hit in rag_hits if hit.get("stage") == "comparison"
+            ]
 
             evidence_lines = []
+
             if personalized_hits:
                 seen_p = set()
                 p_sources = []
+
                 for hit in personalized_hits:
                     key = (hit.get("source"), hit.get("page"))
                     if key in seen_p:
                         continue
                     seen_p.add(key)
-                    ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
+
+                    ref = (
+                        f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}"
+                        if hit.get("page") is not None
+                        else hit.get("source", "Unknown source")
+                    )
                     p_sources.append(f"• {ref}")
-                evidence_lines.append("Personalized retrieval (using chart configuration, ranked, deduplicated, adaptive depth):")
+
+                evidence_lines.append(
+                    "Personalized retrieval (using chart configuration, ranked, "
+                    "deduplicated, adaptive depth):"
+                )
                 evidence_lines.extend(p_sources)
 
             if comparison_hits_trace:
                 by_branch: Dict[str, List[str]] = {}
                 seen_c = set()
+
                 for hit in comparison_hits_trace:
                     branch = hit.get("branch", "unknown")
                     key = (branch, hit.get("source"), hit.get("page"))
+
                     if key in seen_c:
                         continue
+
                     seen_c.add(key)
-                    ref = f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}" if hit.get("page") is not None else hit.get("source", "Unknown source")
+                    ref = (
+                        f"{hit.get('source', 'Unknown source')} — Page {hit.get('page')}"
+                        if hit.get("page") is not None
+                        else hit.get("source", "Unknown source")
+                    )
                     by_branch.setdefault(branch, []).append(f"  • {ref}")
-                evidence_lines.append("\nComparative retrieval (separate query per option being compared):")
+
+                evidence_lines.append(
+                    "\nComparative retrieval (separate query per option being compared):"
+                )
                 for branch, refs in by_branch.items():
                     evidence_lines.append(f"{branch}:")
                     evidence_lines.extend(refs)
 
-            evidence_detail_step4 = "\n".join(evidence_lines) if evidence_lines else "No additional personalized or comparative evidence was retrieved."
-            steps.append({"step": 4, "title": "Personalized + Comparative Evidence Retrieved", "detail": evidence_detail_step4, "type": "personalized_rag"})
+            evidence_detail_step7 = (
+                "\n".join(evidence_lines)
+                if evidence_lines
+                else "No additional personalized or comparative evidence was retrieved."
+            )
 
+            steps.append({
+                "step": 7,
+                "title": "Personalized + Comparative Evidence Retrieved",
+                "detail": evidence_detail_step7,
+                "type": "personalized_rag",
+            })
+
+            # STEP 8 — EVIDENCE CONSENSUS
             consensus_label = None
             evidence_vote = None
             consistency = ""
@@ -1765,32 +1967,26 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                         consistency = topic_cache.get("consistency", "")
                         consensus_label = topic_cache.get("consensus_label")
             except Exception as evidence_err:
-                logger.warning(f"Could not build evidence consensus trace: {evidence_err}")
+                logger.warning(
+                    f"Could not build evidence consensus trace: {evidence_err}"
+                )
 
             consensus_lines = []
 
             if consensus_label:
-                consensus_lines.append(f"Evidence confidence: {consensus_label}")
+                consensus_lines.append(
+                    f"Evidence confidence: {consensus_label}"
+                )
             else:
                 consensus_lines.append(
-                    "Evidence confidence: Not available (this question wasn't classified under a "
-                    "specific life-area topic, so no evidence vote was computed)"
+                    "Evidence confidence: Not available for this topic."
                 )
 
             if isinstance(evidence_vote, dict):
                 votes = evidence_vote.get("votes", [])
-                supportive = 0
-                challenging = 0
-                neutral = 0
-
-                for vote in votes:
-                    value = vote.get("vote", 0)
-                    if value > 0:
-                        supportive += 1
-                    elif value < 0:
-                        challenging += 1
-                    else:
-                        neutral += 1
+                supportive = sum(1 for vote in votes if vote.get("vote", 0) > 0)
+                challenging = sum(1 for vote in votes if vote.get("vote", 0) < 0)
+                neutral = sum(1 for vote in votes if vote.get("vote", 0) == 0)
 
                 if votes:
                     consensus_lines.append(f"• Supportive: {supportive}")
@@ -1799,7 +1995,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
                 confidence = evidence_vote.get("confidence_pct")
                 if confidence is not None:
-                    consensus_lines.append(f"• Confidence score: {confidence}%")
+                    consensus_lines.append(
+                        f"• Confidence score: {confidence}%"
+                    )
 
                 verdict = evidence_vote.get("verdict")
                 if verdict:
@@ -1807,106 +2005,274 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             if not rag_hits:
                 consensus_lines.append(
-                    "\nNote: No classical text evidence was retrieved for this specific question. "
-                    "The confidence above reflects chart placement, Dasha timing, and Yoga signals only — "
-                    "not retrieved book passages."
+                    "\nNote: No classical text evidence was retrieved for this "
+                    "specific question."
                 )
 
             if consistency:
                 consensus_lines.append(f"\nSignal consistency:\n{consistency}")
 
-            steps.append({"step": 5, "title": "Evidence Consensus", "detail": "\n".join(consensus_lines), "type": "consensus"})
+            steps.append({
+                "step": 8,
+                "title": "Evidence Consensus",
+                "detail": "\n".join(consensus_lines),
+                "type": "consensus",
+            })
 
+            # STEP 9 — EVIDENCE CONTRADICTION ANALYSIS
+            contradiction_lines = []
+
+            if not rag_hits:
+                contradiction_lines.append(
+                    "No retrieved classical evidence was available for contradiction analysis."
+                )
+            else:
+                # This trace step reports whether materially different source
+                # groups were retrieved; it does not classify rules as MATCH/NO_MATCH.
+                sources = sorted({
+                    h.get("source")
+                    or h.get("metadata", {}).get("source")
+                    or "Unknown source"
+                    for h in rag_hits
+                })
+                if len(sources) <= 1:
+                    contradiction_lines.append(
+                        "No cross-source contradiction was identified from the retrieved evidence."
+                    )
+                else:
+                    contradiction_lines.append(
+                        "Multiple classical sources were retrieved. "
+                        "The final synthesis uses ranked evidence and source-level "
+                        "deduplication rather than treating every source statement "
+                        "as independently decisive."
+                    )
+                    contradiction_lines.append(
+                        f"Sources considered: {', '.join(sources)}"
+                    )
+
+            steps.append({
+                "step": 9,
+                "title": "Evidence Contradiction Analysis",
+                "detail": "\n".join(contradiction_lines),
+                "type": "contradiction",
+            })
+
+            # STEP 10 — DASHA & TIMING
             dasha_detail = ""
+
             try:
                 cached_dasha = session.get("kundli_dasha")
                 if cached_dasha:
                     dasha_info = json.loads(cached_dasha)
                     maha = dasha_info.get("current_mahadasha", {}) or {}
                     antar = dasha_info.get("current_antardasha", {}) or {}
-                    maha_lord = maha.get("lord") or maha.get("name") or maha.get("planet")
-                    antar_lord = antar.get("lord") or antar.get("name") or antar.get("planet")
+
+                    maha_lord = (
+                        maha.get("lord")
+                        or maha.get("name")
+                        or maha.get("planet")
+                    )
+                    antar_lord = (
+                        antar.get("lord")
+                        or antar.get("name")
+                        or antar.get("planet")
+                    )
+
                     if maha_lord:
                         dasha_detail = f"Mahadasha: {maha_lord}"
                     if antar_lord:
                         dasha_detail += f"\nAntardasha: {antar_lord}"
+
+                    if maha.get("start") and maha.get("end"):
+                        dasha_detail += (
+                            f"\n(Real Dasha API — Mahadasha runs "
+                            f"{maha['start']} to {maha['end']})"
+                        )
             except Exception as dasha_err:
-                logger.warning(f"Could not build Dasha reasoning trace: {dasha_err}")
+                logger.warning(
+                    f"Could not build Dasha reasoning trace: {dasha_err}"
+                )
 
             if not dasha_detail:
-                dasha_detail = "Current Dasha information was not available in the cached chart data."
+                dasha_detail = (
+                    "Current Dasha information was NOT available for this response — "
+                    "the real Dasha API did not return usable data, and no local "
+                    "fallback calculation was used."
+                )
 
             timeline_note = (
-                "\n\n(Timing-Gated Retrieval: the full upcoming Dasha timeline was only fetched/used "
-                "because this question was classified as requiring timing — otherwise this step is skipped "
-                "to avoid an unnecessary external Dasha API call.)"
-                if (query_understanding or {}).get("requires_timing")
-                else "\n\n(Timing-Gated Retrieval: this question wasn't classified as needing timing, so the "
-                     "full upcoming Dasha timeline retrieval was skipped — only the current Mahadasha/Antardasha "
-                     "above, already cached from the Kundli fetch, is shown.)"
+                "\n\n(Timing-Gated Retrieval: the full upcoming Dasha timeline was "
+                "only fetched/used because this question was classified as requiring "
+                "timing.)"
+                if requires_timing
+                else
+                "\n\n(Timing-Gated Retrieval: this question was not classified as "
+                "needing timing, so the full upcoming Dasha timeline retrieval was "
+                "skipped — only the current cached Mahadasha/Antardasha is shown.)"
             )
+
             dasha_detail += timeline_note
 
-            steps.append({"step": 6, "title": "Dasha & Timing", "detail": dasha_detail, "type": "dasha"})
+            steps.append({
+                "step": 10,
+                "title": "Dasha & Timing",
+                "detail": dasha_detail,
+                "type": "dasha",
+            })
 
+            # STEP 11 — CLASSICAL EVIDENCE
             reference_lines = []
             seen_references = set()
+
             for hit in rag_hits:
-                source = hit.get("source", "Unknown source")
+                source = (
+                    hit.get("source")
+                    or hit.get("metadata", {}).get("source")
+                    or "Unknown source"
+                )
                 page = hit.get("page")
+                if page is None:
+                    page = hit.get("metadata", {}).get("page")
+
                 score = hit.get("score")
                 stage = hit.get("stage")
+
                 reference_key = (source, page, stage)
                 if reference_key in seen_references:
                     continue
+
                 seen_references.add(reference_key)
-                reference = f"{source} — Page {page}" if page is not None else source
+
+                reference = (
+                    f"{source} — Page {page}"
+                    if page is not None
+                    else source
+                )
+
                 if score is not None:
                     try:
                         reference += f" (relevance: {float(score):.2f})"
                     except (TypeError, ValueError):
                         pass
+
                 if stage:
                     reference += f" [{stage}]"
+
                 if hit.get("branch"):
                     reference += f" (option: {hit['branch']})"
+
                 reference_lines.append(f"• {reference}")
 
-            evidence_detail_step7 = "\n".join(reference_lines) if reference_lines else "No classical references were available."
-            steps.append({"step": 7, "title": "Classical Evidence (Ranked, Deduplicated, Adaptive Depth)", "detail": evidence_detail_step7, "type": "evidence"})
-
-            synthesis_detail = (
-                "The final interpretation combines the retrieved classical evidence (ranked, deduplicated, "
-                "and depth-scaled to this question's complexity), verified chart placements, comparative "
-                "branch analysis (if applicable), timing-gated Dasha data (only when actually needed), "
-                "current-date temporal filtering, and the relevant Kundli and Dasha information."
+            evidence_detail_step11 = (
+                "\n".join(reference_lines)
+                if reference_lines
+                else "No classical references were available."
             )
-            steps.append({"step": 8, "title": "Evidence Synthesis", "detail": synthesis_detail, "type": "synthesis"})
 
+            steps.append({
+                "step": 11,
+                "title": "Classical Evidence (Ranked, Deduplicated, Adaptive Depth)",
+                "detail": evidence_detail_step11,
+                "type": "evidence",
+            })
+
+            # STEP 12 — EVIDENCE SYNTHESIS
+            synthesis_detail = (
+                "The final interpretation combines the retrieved classical evidence "
+                "(ranked, deduplicated, and depth-scaled to this question's "
+                "complexity), verified chart placements, comparative branch analysis "
+                "(if applicable), timing-gated Dasha data (only when actually "
+                "needed), current-date temporal filtering, and the relevant Kundli "
+                "and Dasha information."
+            )
+
+            steps.append({
+                "step": 12,
+                "title": "Evidence Synthesis",
+                "detail": synthesis_detail,
+                "type": "synthesis",
+            })
+
+            # STEP 13 — CHART-SPECIFICITY CHECK
             specificity_lines = []
 
             if response_text:
                 try:
                     score = compute_chart_specificity(response_text)
-                    verdict = "GENERIC" if score.get("is_generic") else "SPECIFIC"
+                    verdict = (
+                        "GENERIC"
+                        if score.get("is_generic")
+                        else "SPECIFIC"
+                    )
                     specificity_lines.append(f"Status: {verdict}")
-                    specificity_lines.append(f"Chart-specific references: {score['entity_count']}")
-                    specificity_lines.append(f"Word count: {score['word_count']}")
-                    specificity_lines.append(f"Specificity ratio: {score['specificity_ratio']:.1%}")
-                    specificity_lines.append(f"Generic filler matches: {score['filler_count']}")
+                    specificity_lines.append(
+                        f"Chart-specific references: {score['entity_count']}"
+                    )
+                    specificity_lines.append(
+                        f"Word count: {score['word_count']}"
+                    )
+                    specificity_lines.append(
+                        f"Specificity ratio: {score['specificity_ratio']:.1%}"
+                    )
+                    specificity_lines.append(
+                        f"Generic filler matches: {score['filler_count']}"
+                    )
                 except Exception as spec_err:
-                    logger.warning(f"Could not compute chart specificity for trace: {spec_err}")
+                    logger.warning(
+                        f"Could not compute chart specificity for trace: {spec_err}"
+                    )
                     specificity_lines.append("Status: Not available")
             else:
-                specificity_lines.append("Status: Not available — no response text supplied")
+                specificity_lines.append(
+                    "Status: Not available — no response text supplied"
+                )
 
-            steps.append({"step": 9, "title": "Chart-Specificity Check", "detail": "\n".join(specificity_lines), "type": "specificity"})
+            steps.append({
+                "step": 13,
+                "title": "Chart-Specificity Check",
+                "detail": "\n".join(specificity_lines),
+                "type": "specificity",
+            })
 
-            logger.info(f"[TRACE] Reasoning trace built: {len(steps)} steps — titles: {[s['title'] for s in steps]}")
+            # STEP 14 — EVIDENCE-TO-CLAIM MAPPING
+            mapping_lines = []
+
+            if rag_hits:
+                mapping_lines.append(
+                    "Final response claims were grounded using the evidence "
+                    "retrieved for this question."
+                )
+                mapping_lines.append(
+                    f"Classical evidence items considered: {len(rag_hits)}"
+                )
+                mapping_lines.append(
+                    "The response synthesis used the verified chart factors, "
+                    "classical evidence, and Dasha/timing information shown above "
+                    "when applicable."
+                )
+            else:
+                mapping_lines.append(
+                    "No classical evidence items were available to map to the final response."
+                )
+
+            steps.append({
+                "step": 14,
+                "title": "Evidence-to-Claim Mapping",
+                "detail": "\n".join(mapping_lines),
+                "type": "claim_mapping",
+            })
+
+            logger.info(
+                f"[TRACE] Reasoning trace built: {len(steps)} steps — "
+                f"titles: {[s['title'] for s in steps]}"
+            )
             return steps
 
         except Exception as e:
-            logger.error(f"RAG-first reasoning trace build FAILED entirely: {e}", exc_info=True)
+            logger.error(
+                f"RAG-first reasoning trace build FAILED entirely: {e}",
+                exc_info=True
+            )
             return []
 
     def _get_full_kundli_response(self, session_id: str, session: Dict) -> Optional[Dict]:

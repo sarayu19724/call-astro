@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react';
-
 import {
   Sparkles,
   ChevronDown,
@@ -10,15 +9,11 @@ import {
   ShieldCheck,
   Brain,
   Search,
-  Gauge,
-  FileCheck2,
   ListOrdered,
-  MessageCircleQuestion,
+  FileCheck2,
+  Scale,
+  Gauge,
 } from 'lucide-react';
-/// <reference types="vite/client" />
-export const API_BASE = import.meta.env.VITE_API_URL 
-  ? `${import.meta.env.VITE_API_URL}/api`
-  : '/api';
 
 interface TraceStep {
   step: number;
@@ -28,25 +23,24 @@ interface TraceStep {
     | 'query_understanding'
     | 'rag'
     | 'chart'
-    | 'activation'
+    | 'buckets'
+    | 'fact_rule_table'
+    | 'sufficiency'
     | 'personalized_rag'
     | 'consensus'
+    | 'contradiction'
     | 'dasha'
     | 'evidence'
     | 'synthesis'
     | 'specificity'
-    | 'buckets'
-    | 'fact_rule_table'
-    | 'sufficiency'
-    | 'contradiction'
     | 'claim_mapping'
     | 'general';
 }
 
 interface ReasoningTraceProps {
   sessionId: string;
-  refreshKey?: number;
-  language?: string;
+  refreshKey: number;
+  language: string;
 }
 
 const STRINGS: Record<
@@ -81,112 +75,70 @@ const STRINGS: Record<
 };
 
 const STEP_ICONS = {
-  query_understanding: MessageCircleQuestion,
+  query_understanding: Search,
   rag: BookOpen,
   chart: CircleUserRound,
-  activation: ListOrdered,
   buckets: ListOrdered,
   fact_rule_table: FileCheck2,
-  sufficiency: ShieldCheck,
-  personalized_rag: Search,
-  consensus: Gauge,
-  contradiction: Gauge,
+  sufficiency: Gauge,
+  personalized_rag: BookOpen,
+  consensus: Scale,
+  contradiction: ShieldCheck,
   dasha: Clock3,
   evidence: ShieldCheck,
   synthesis: Brain,
-  specificity: FileCheck2,
-  claim_mapping: ListOrdered,
+  specificity: CircleUserRound,
+  claim_mapping: FileCheck2,
   general: Sparkles,
 };
 
-const CONSENSUS_STYLES: Record<string, string> = {
-  HIGH: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-  MEDIUM: 'bg-amber-50 text-amber-700 border-amber-200',
-  LOW: 'bg-slate-100 text-slate-500 border-slate-200',
-  CONFLICTING: 'bg-rose-50 text-rose-700 border-rose-200',
-};
-
-function extractConsensusLabel(detail: string): string | null {
-  const match = detail.match(/Evidence confidence:\s*(HIGH|MEDIUM|LOW|CONFLICTING)/i);
-  return match ? match[1].toUpperCase() : null;
-}
-
-function hasContradiction(detail: string): boolean {
-  return detail.startsWith('CONTRADICTION DETECTED');
-}
-
-const SPECIFICITY_STYLES: Record<string, string> = {
-  SPECIFIC: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-  GENERIC: 'bg-rose-50 text-rose-700 border-rose-200',
-};
-
-function extractSpecificityLabel(detail: string): string | null {
-  const match = detail.match(/Status:\s*(SPECIFIC|GENERIC)/i);
-  return match ? match[1].toUpperCase() : null;
-}
-
 export default function ReasoningTrace({
   sessionId,
-  refreshKey = 0,
-  language = 'Hinglish',
+  refreshKey,
+  language,
 }: ReasoningTraceProps) {
   const [steps, setSteps] = useState<TraceStep[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [expanded, setExpanded] = useState(false);
-  const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [expanded, setExpanded] = useState(true);
 
   const t = STRINGS[language] || STRINGS.Hinglish;
-
-  const fetchTrace = async () => {
-    if (!sessionId) return;
-
-    setLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/session/${sessionId}/reasoning-trace`);
-      if (!res.ok) {
-        throw new Error('Failed to fetch reasoning trace');
-      }
-
-      const data = await res.json();
-      setSteps(data.available ? data.steps || data.trace || [] : data.steps || data.trace || []);
-    } catch (err) {
-      console.error('Failed to load reasoning trace:', err);
-      setSteps([]);
-    } finally {
-      setLoading(false);
-      setLoaded(true);
-    }
-  };
 
   useEffect(() => {
     if (!sessionId) return;
 
-    setLoaded(false);
-    setSteps([]);
+    setLoading(true);
 
-    if (expanded) {
-      fetchTrace();
-    }
+    fetch(`/api/session/${sessionId}/reasoning-trace`)
+      .then((res) => {
+        if (!res.ok) {
+          throw new Error('Failed to fetch reasoning trace');
+        }
+        return res.json();
+      })
+      .then((data) => {
+        const receivedSteps: TraceStep[] = data.available ? data.steps || [] : [];
+        receivedSteps.sort((a, b) => a.step - b.step);
+        setSteps(receivedSteps);
+      })
+      .catch(() => {
+        setSteps([]);
+      })
+      .finally(() => {
+        setLoading(false);
+      });
   }, [sessionId, refreshKey]);
-
-  const handleToggle = () => {
-    if (!expanded && !loaded) {
-      fetchTrace();
-    }
-    setExpanded(!expanded);
-  };
-
-  if (!sessionId) return null;
 
   return (
     <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+      {/* Header */}
       <button
-        onClick={handleToggle}
+        onClick={() => setExpanded((e) => !e)}
         className="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 transition"
         aria-expanded={expanded}
       >
         <div className="flex items-center gap-2">
           <Sparkles size={14} className="text-amber-500" />
+
           <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
             {t.title}
           </h3>
@@ -199,6 +151,7 @@ export default function ReasoningTrace({
         )}
       </button>
 
+      {/* Content */}
       {expanded && (
         <div className="px-5 pb-5">
           {loading ? (
@@ -234,57 +187,22 @@ export default function ReasoningTrace({
           ) : (
             <ol className="space-y-4">
               {steps.map((s, index) => {
-                const stepType = s.type || 'general';
-                const Icon = STEP_ICONS[stepType as keyof typeof STEP_ICONS] ?? Sparkles;
-
-                if (!(stepType in STEP_ICONS)) {
-                  console.warn('Unknown reasoning step type:', stepType, s);
-                }
-
-                const consensusLabel =
-                  stepType === 'consensus' ? extractConsensusLabel(s.detail) : null;
-                const specificityLabel =
-                  stepType === 'specificity' ? extractSpecificityLabel(s.detail) : null;
-                const isContradiction =
-                  stepType === 'contradiction' && hasContradiction(s.detail);
+                const Icon = STEP_ICONS[s.type || 'general'];
 
                 return (
-                  <li key={`${s.step}-${index}`} className="flex gap-3">
+                  <li
+                    key={`${s.step}-${index}`}
+                    className="flex gap-3"
+                  >
+                    {/* Step icon */}
                     <div className="shrink-0 w-7 h-7 rounded-full bg-slate-100 text-slate-600 flex items-center justify-center mt-0.5">
                       <Icon size={14} />
                     </div>
 
+                    {/* Step content */}
                     <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="text-xs font-semibold text-slate-700">
-                          {s.step}. {s.title}
-                        </span>
-
-                        {consensusLabel && (
-                          <span
-                            className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
-                              CONSENSUS_STYLES[consensusLabel] || CONSENSUS_STYLES.LOW
-                            }`}
-                          >
-                            {consensusLabel} CONFIDENCE
-                          </span>
-                        )}
-
-                        {isContradiction && (
-                          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full border bg-amber-50 text-amber-700 border-amber-200">
-                            CONFLICT DETECTED
-                          </span>
-                        )}
-
-                        {specificityLabel && (
-                          <span
-                            className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
-                              SPECIFICITY_STYLES[specificityLabel] || SPECIFICITY_STYLES.GENERIC
-                            }`}
-                          >
-                            {specificityLabel}
-                          </span>
-                        )}
+                      <div className="text-xs font-semibold text-slate-700">
+                        {s.step}. {s.title}
                       </div>
 
                       <div className="text-xs text-slate-500 mt-1 leading-relaxed whitespace-pre-line">

@@ -225,5 +225,20 @@ class MemoryDatabase:
             cursor.execute("UPDATE sessions SET topic_memory = NULL, updated_at = ? WHERE session_id = ?",
                            (datetime.utcnow().isoformat(), session_id))
             conn.commit()
+    
+    def get_all_valid_profiles(self) -> List[Dict]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT session_id, name, relation, dob, birth_time, birth_place, gender, language, updated_at
+                FROM sessions
+                WHERE name IS NOT NULL AND dob IS NOT NULL AND birth_place IS NOT NULL
+                ORDER BY updated_at DESC
+                """
+            )
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
 
 db = MemoryDatabase()

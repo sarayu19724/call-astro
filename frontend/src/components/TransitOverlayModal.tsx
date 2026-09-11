@@ -1,9 +1,10 @@
+/// <reference types="vite/client" />
+
 import { useState, useEffect } from 'react';
 import { X, Globe2, Compass, Sparkles, MessageCircle, RefreshCw } from 'lucide-react';
 
 import { Profile } from './ProfileSwitcher';
 
-/// <reference types="vite/client" />
 export const API_BASE = import.meta.env.VITE_API_URL 
   ? `${import.meta.env.VITE_API_URL}/api`
   : '/api';

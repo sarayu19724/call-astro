@@ -18,10 +18,15 @@ import ReasoningTrace from './components/ReasoningTrace';
 import KundliReportButton from './components/KundliReportButton';
 import CouplePage from './components/CouplePage';
 import AstrologyCalendar from './components/AstrologyCalendar';
-import { API_BASE } from './api';
+
 
 interface Message { role: 'user' | 'assistant' | 'system'; content: string; timestamp?: string; }
 interface IngestStatus { indexing_completed: boolean; total_chunks: number; loading: boolean; }
+
+/// <reference types="vite/client" />
+export const API_BASE = import.meta.env.VITE_API_URL 
+  ? `${import.meta.env.VITE_API_URL}/api`
+  : '/api';
 
 const GREETINGS: Record<string, (name: string) => string> = {
   English: (name) => `Hey ${name}!`,

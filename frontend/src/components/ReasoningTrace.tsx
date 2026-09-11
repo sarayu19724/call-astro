@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { API_BASE } from '../api';
+
 import {
   Sparkles,
   ChevronDown,
@@ -15,6 +15,10 @@ import {
   ListOrdered,
   MessageCircleQuestion,
 } from 'lucide-react';
+/// <reference types="vite/client" />
+export const API_BASE = import.meta.env.VITE_API_URL 
+  ? `${import.meta.env.VITE_API_URL}/api`
+  : '/api';
 
 interface TraceStep {
   step: number;

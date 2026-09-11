@@ -256,6 +256,21 @@ OWN_SIGNS = {
 KENDRA_TRIKONA = {1, 4, 5, 7, 9, 10, 11}
 DUSTHANA = {6, 8, 12}
 
+# Vimshottari lords for the 27 nakshatras, in zodiacal order.
+NAKSHATRA_LORDS = [
+    "Ketu", "Venus", "Sun", "Moon", "Mars", "Rahu", "Jupiter", "Saturn", "Mercury",
+    "Ketu", "Venus", "Sun", "Moon", "Mars", "Rahu", "Jupiter", "Saturn", "Mercury",
+    "Ketu", "Venus", "Sun", "Moon", "Mars", "Rahu", "Jupiter", "Saturn", "Mercury",
+]
+
+DASHA_SEQUENCE = [
+    "Ketu", "Venus", "Sun", "Moon", "Mars", "Rahu", "Jupiter", "Saturn", "Mercury",
+]
+DASHA_YEARS = {
+    "Ketu": 7, "Venus": 20, "Sun": 6, "Moon": 10, "Mars": 7,
+    "Rahu": 18, "Jupiter": 16, "Saturn": 19, "Mercury": 17,
+}
+
 def get_house_lord(house_number: int, ascendant_sign: str) -> Optional[str]:
     try:
         asc_idx = ZODIAC_SIGNS_ORDER.index(ascendant_sign)

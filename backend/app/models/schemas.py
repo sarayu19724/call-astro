@@ -19,6 +19,7 @@ class SessionInfoResponse(BaseModel):
     birth_time: Optional[str] = None
     birth_place: Optional[str] = None
     name: Optional[str] = None
+    relation: Optional[str] = "Self"
     gender: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None

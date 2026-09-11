@@ -21,6 +21,22 @@ except ImportError:
 class LLMService:
 
     def __init__(self):
+        self.provider = getattr(settings, "LLM_PROVIDER", "ollama")
+        
+        # ============================================================
+        # OPENAI CLOUD
+        # ============================================================
+        self.openai_api_key = getattr(settings, "OPENAI_API_KEY", "")
+        self.openai_model = getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
+        self.openai_base_url = getattr(settings, "OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+        # ============================================================
+        # GROQ CLOUD
+        # ============================================================
+        self.groq_api_key = getattr(settings, "GROQ_API_KEY", "")
+        self.groq_model = getattr(settings, "GROQ_MODEL", "llama-3.1-8b-instant")
+        self.groq_base_url = getattr(settings, "GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+        
         # ============================================================
         # LOCAL OLLAMA
         # ============================================================
@@ -61,6 +77,66 @@ class LLMService:
     ) -> str:
 
         try:
+
+            # ========================================================
+            # OPENAI
+            # ========================================================
+            if self.provider == "openai" and self.openai_api_key:
+                url = f"{self.openai_base_url}/chat/completions"
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": prompt})
+                
+                payload = {
+                    "model": self.openai_model,
+                    "messages": messages,
+                    "temperature": temperature,
+                }
+                if json_format:
+                    payload["response_format"] = {"type": "json_object"}
+                    
+                headers = {
+                    "Authorization": f"Bearer {self.openai_api_key}",
+                    "Content-Type": "application/json"
+                }
+                
+                response = requests.post(url, json=payload, headers=headers, timeout=30)
+                if response.status_code == 200:
+                    return response.json()["choices"][0]["message"]["content"]
+                else:
+                    logger.error(f"OpenAI error: {response.text}")
+                    raise Exception(f"OpenAI API error: {response.text}")
+
+            # ========================================================
+            # GROQ
+            # ========================================================
+            if self.provider == "groq" and self.groq_api_key:
+                url = f"{self.groq_base_url}/chat/completions"
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": prompt})
+                
+                payload = {
+                    "model": self.groq_model,
+                    "messages": messages,
+                    "temperature": temperature,
+                }
+                if json_format:
+                    payload["response_format"] = {"type": "json_object"}
+                    
+                headers = {
+                    "Authorization": f"Bearer {self.groq_api_key}",
+                    "Content-Type": "application/json"
+                }
+                
+                response = requests.post(url, json=payload, headers=headers, timeout=30)
+                if response.status_code == 200:
+                    return response.json()["choices"][0]["message"]["content"]
+                else:
+                    logger.error(f"Groq error: {response.text}")
+                    raise Exception(f"Groq API error: {response.text}")
 
             # ========================================================
             # OLLAMA CLOUD
@@ -208,6 +284,72 @@ class LLMService:
     ):
 
         try:
+
+            # ========================================================
+            # OPENAI STREAMING
+            # ========================================================
+            if self.provider == "openai" and self.openai_api_key:
+                url = f"{self.openai_base_url}/chat/completions"
+                payload = {
+                    "model": self.openai_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature,
+                    "stream": True
+                }
+                headers = {
+                    "Authorization": f"Bearer {self.openai_api_key}",
+                    "Content-Type": "application/json"
+                }
+                
+                response = requests.post(url, json=payload, headers=headers, stream=True, timeout=30)
+                for line in response.iter_lines():
+                    if line:
+                        decoded = line.decode('utf-8')
+                        if decoded.startswith('data: '):
+                            data_str = decoded[6:]
+                            if data_str.strip() == '[DONE]':
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                                delta = chunk['choices'][0].get('delta', {})
+                                if 'content' in delta:
+                                    yield delta['content']
+                            except Exception:
+                                continue
+                return
+
+            # ========================================================
+            # GROQ STREAMING
+            # ========================================================
+            if self.provider == "groq" and self.groq_api_key:
+                url = f"{self.groq_base_url}/chat/completions"
+                payload = {
+                    "model": self.groq_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature,
+                    "stream": True
+                }
+                headers = {
+                    "Authorization": f"Bearer {self.groq_api_key}",
+                    "Content-Type": "application/json"
+                }
+                
+                response = requests.post(url, json=payload, headers=headers, stream=True, timeout=30)
+                for line in response.iter_lines():
+                    if line:
+                        decoded = line.decode('utf-8')
+                        if decoded.startswith('data: '):
+                            data_str = decoded[6:]
+                            if data_str.strip() == '[DONE]':
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                                delta = chunk['choices'][0].get('delta', {})
+                                if 'content' in delta:
+                                    yield delta['content']
+                            except Exception:
+                                continue
+                return
 
             # ========================================================
             # OLLAMA CLOUD STREAMING

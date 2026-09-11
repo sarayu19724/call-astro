@@ -29,6 +29,7 @@ class MemoryDatabase:
                     birth_place TEXT,
                     gender TEXT,
                     name TEXT,
+                    relation TEXT DEFAULT 'Self',
                     language TEXT DEFAULT 'Hinglish',
                     pending_field TEXT,
                     kundli_data TEXT,
@@ -66,6 +67,7 @@ class MemoryDatabase:
             for col_name, col_type in [
                 ("latitude", "REAL"),
                 ("longitude", "REAL"),
+                ("relation", "TEXT DEFAULT 'Self'"),
                 ("pending_field", "TEXT"),
                 ("kundli_data", "TEXT"),
                 ("kundli_raw", "TEXT"),
@@ -119,7 +121,7 @@ class MemoryDatabase:
             now_str = datetime.utcnow().isoformat()
             cursor.execute(
                 """
-                INSERT INTO sessions (session_id, dob, birth_time, birth_place, language,
+                INSERT INTO sessions (session_id, dob, birth_time, birth_place, relation, language,
                                        pending_field, kundli_data, kundli_raw, kundli_dasha, kundli_divisional,
                                        kundli_full_raw, topic_memory, last_reasoning_trace, dashboard_prediction,
                                        dashboard_lucky_color, dashboard_date, yoga_text, dasha_tree_raw, topic_cache,
@@ -129,7 +131,7 @@ class MemoryDatabase:
                                        latitude, longitude, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, None, None, None, 'Hinglish', None, None, None, None, None,
+                (session_id, None, None, None, 'Self', 'Hinglish', None, None, None, None,
                  None, None, None, None, None, None, None, None, None, None,
                  "idle", None, None,
                  "idle", None, None, None, None,
@@ -139,7 +141,7 @@ class MemoryDatabase:
 
             return {
                 "session_id": session_id, "dob": None, "birth_time": None, "birth_place": None,
-                "gender": None, "name": None, "language": "Hinglish", "pending_field": None,
+                "gender": None, "name": None, "relation": "Self", "language": "Hinglish", "pending_field": None,
                 "kundli_data": None, "kundli_raw": None, "kundli_dasha": None, "kundli_divisional": None,
                 "kundli_full_raw": None,
                 "topic_memory": None, "last_reasoning_trace": None,
@@ -157,7 +159,7 @@ class MemoryDatabase:
             return self.get_or_create_session(session_id)
 
         allowed_fields = {
-            "dob", "birth_time", "birth_place", "gender", "name", "language",
+            "dob", "birth_time", "birth_place", "gender", "name", "relation", "language",
             "latitude", "longitude", "pending_field", "kundli_data", "kundli_raw", "kundli_dasha",
             "kundli_divisional", "kundli_full_raw", "topic_memory", "last_reasoning_trace",
             "dashboard_prediction", "dashboard_lucky_color", "dashboard_date",

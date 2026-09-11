@@ -7,14 +7,61 @@ from app.models.schemas import SessionInfoResponse
 from app.memory.database import db
 from app.services.geocoding_service import geocoding_service
 from app.services.dashboard_service import get_lucky_color, generate_daily_prediction, generate_weekly_guidance
+from app.services.transit_service import transit_service
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/session", tags=["Session"])
 
-# How long a "pending" status is trusted before we allow a new fetch to
-# start anyway (guards against a crashed background thread leaving the
-# session stuck in "pending" forever).
 PENDING_STALE_AFTER_SECONDS = 240
+
+
+@router.get("/profiles/all")
+async def get_all_profiles():
+    """Returns all profiles saved in database so frontend can restore and sync charts."""
+    try:
+        profiles = db.get_all_valid_profiles()
+        return {"profiles": profiles}
+    except Exception as e:
+        logger.error(f"Error fetching all profiles: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/transits/live")
+async def get_live_transits():
+    """Returns real-time sky planetary positions and multi-profile transit overlays."""
+    try:
+        current_transits = transit_service.get_current_transits()
+        profiles = db.get_all_valid_profiles()
+        
+        multi_overlays = []
+        for p in profiles:
+            sid = p.get("session_id")
+            s = db.get_or_create_session(sid)
+            overlay = transit_service.calculate_gochar_overlay(s, current_transits)
+            if overlay.get("available"):
+                multi_overlays.append(overlay)
+
+        return {
+            "date": current_transits.get("date"),
+            "sky_planets": current_transits.get("planets", []),
+            "overlays": multi_overlays
+        }
+    except Exception as e:
+        logger.error(f"Error fetching live transits: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{session_id}/transits")
+async def get_session_transits(session_id: str):
+    """Returns real-time Gochar transit overlay for a specific session/chart."""
+    try:
+        session = db.get_or_create_session(session_id)
+        current_transits = transit_service.get_current_transits()
+        overlay = transit_service.calculate_gochar_overlay(session, current_transits)
+        return overlay
+    except Exception as e:
+        logger.error(f"Error calculating session transits: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/{session_id}", response_model=SessionInfoResponse)
@@ -24,7 +71,7 @@ async def get_session_info(session_id: str):
         return SessionInfoResponse(
             session_id=session["session_id"], dob=session.get("dob"),
             birth_time=session.get("birth_time"), birth_place=session.get("birth_place"),
-            gender=session.get("gender"), name=session.get("name"),
+            gender=session.get("gender"), name=session.get("name"), relation=session.get("relation", "Self"),
             latitude=session.get("latitude"), longitude=session.get("longitude"),
             language=session.get("language", "Hinglish"), updated_at=session.get("updated_at")
         )
@@ -38,6 +85,11 @@ async def get_kundli_chart(session_id: str):
     try:
         session = db.get_or_create_session(session_id)
         raw = session.get("kundli_raw")
+        if not raw and session.get("dob") and session.get("birth_place"):
+            from app.services.chat_service import chat_service
+            chat_service._fetch_and_cache_kundli(session_id, session)
+            session = db.get_or_create_session(session_id)
+            raw = session.get("kundli_raw")
         if not raw:
             return {"available": False, "planets": [], "ascendant_sign": None}
         parsed = json.loads(raw)
@@ -49,17 +101,12 @@ async def get_kundli_chart(session_id: str):
 
 @router.get("/{session_id}/kundli-status")
 async def get_kundli_status(session_id: str):
-    """Polled by the frontend instead of hammering /kundli-chart repeatedly.
-    Distinguishes 'still working' from 'actually failed' with a real reason,
-    instead of the frontend guessing after a fixed timeout."""
+    """Return the real background Kundli calculation status for frontend polling."""
     try:
         session = db.get_or_create_session(session_id)
         status = session.get("kundli_fetch_status") or "idle"
         started_at = session.get("kundli_fetch_started_at")
 
-        # Self-heal: if a previous background thread died without updating
-        # status (server restart, unhandled crash), don't leave the user
-        # stuck on "pending" forever.
         if status == "pending" and started_at:
             try:
                 started = datetime.fromisoformat(started_at)
@@ -85,6 +132,8 @@ async def get_kundli_status(session_id: str):
 
 @router.get("/{session_id}/reasoning-trace")
 async def get_reasoning_trace(session_id: str):
+    """Powers the 'How I Reached This' panel — returns the cached step-by-step
+    reasoning trace from the most recent astrology response."""
     try:
         session = db.get_or_create_session(session_id)
         raw = session.get("last_reasoning_trace")
@@ -244,7 +293,7 @@ async def recalculate_kundli(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/{session_id}/kundli-report")
+
 async def download_kundli_report(session_id: str, language: str = None):
     """Generates the 3-page professional PDF Kundli report on demand."""
     from app.services.kundli_report_service import generate_kundli_report_pdf
@@ -316,7 +365,7 @@ async def update_session_info(session_id: str, profile_update: dict):
         return SessionInfoResponse(
             session_id=updated["session_id"], dob=updated.get("dob"),
             birth_time=updated.get("birth_time"), birth_place=updated.get("birth_place"),
-            gender=updated.get("gender"), name=updated.get("name"),
+            gender=updated.get("gender"), name=updated.get("name"), relation=updated.get("relation", "Self"),
             latitude=updated.get("latitude"), longitude=updated.get("longitude"),
             language=updated.get("language", "Hinglish"), updated_at=updated.get("updated_at")
         )

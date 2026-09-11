@@ -179,6 +179,10 @@ class DashaApiService:
         return tree, current_period
 
     def flatten_periods(self, dasha_tree: List[Dict], level: str = "antardasha") -> List[Dict]:
+        """Flattens the nested Mahadasha -> Antardasha tree into a single
+        chronological list of periods at the requested level. Each period
+        includes which Mahadasha it belongs to, so downstream code can
+        reason about combinations (e.g. 'Venus Mahadasha + Jupiter Antardasha')."""
         flat = []
         for maha in dasha_tree:
             maha_lord = maha.get("mahadasha") or maha.get("mahadasha_display")
@@ -201,6 +205,9 @@ class DashaApiService:
         return flat
 
     def get_upcoming_periods(self, dasha_tree: List[Dict], months_ahead: int = 60) -> List[Dict]:
+        """Returns Antardasha-level periods from today through `months_ahead`
+        months into the future — the practical window for 'when will X happen'
+        questions (5 years by default)."""
         now = datetime.now()
         cutoff = now.replace(year=now.year + (months_ahead // 12))
 

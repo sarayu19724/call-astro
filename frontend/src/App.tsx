@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ChatWindow } from './components/ChatWindow';
 import { ChatInput } from './components/ChatInput';
 import { ProfileCard } from './components/ProfileCard';
@@ -179,7 +180,7 @@ function App() {
 
           // Update profiles list in memory & localStorage
           if (hasDetails) {
-            setProfiles(prev => {
+            setProfiles((prev: Profile[]) => {
               const index = prev.findIndex(p => p.id === sessionId);
               let updated: Profile[];
               if (index >= 0) {
@@ -350,7 +351,7 @@ function App() {
   useEffect(() => {
     if (!sessionId || chartStatus === 'ready') return;
     if (messages.length === 0) return;
-    fetchChartData(sessionId).then((ready) => {
+    fetchChartData(sessionId).then((ready: boolean) => {
       if (ready) {
         stopChartPolling();
         setChartStatus('ready');
@@ -946,7 +947,7 @@ function App() {
                 setMessages(history.messages || []);
               }
               pollChartStatus(sessionId);
-              setTraceRefreshKey(prev => prev + 1);
+              setTraceRefreshKey((prev: number) => prev + 1);
             }
 
             setProfileToEdit(null);

@@ -129,9 +129,9 @@ class MemoryDatabase:
                                        kundli_fetch_status, kundli_fetch_error, kundli_fetch_started_at,
                                        report_status, report_error, report_progress, report_started_at, report_file_path,
                                        latitude, longitude, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, None, None, None, 'Self', 'Hinglish', None, None, None, None,
+                (session_id, None, None, None, None, None, 'Self', 'Hinglish', None, None,
                  None, None, None, None, None, None, None, None, None, None,
                  None, "idle", None, None,
                  "idle", None, None, None, None,
@@ -153,6 +153,21 @@ class MemoryDatabase:
                 "report_started_at": None, "report_file_path": None,
                 "latitude": None, "longitude": None, "updated_at": now_str
             }
+
+    def get_all_valid_profiles(self) -> List[Dict]:
+        """Return all saved profiles that contain enough information to be usable."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT *
+                FROM sessions
+                WHERE dob IS NOT NULL
+                  AND birth_time IS NOT NULL
+                  AND birth_place IS NOT NULL
+                ORDER BY updated_at DESC
+            """)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
 
     def update_session(self, session_id: str, updates: Dict) -> Dict:
         if not updates:

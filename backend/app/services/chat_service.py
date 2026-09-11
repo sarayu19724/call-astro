@@ -73,15 +73,10 @@ class ChatService:
         if not time_str:
             return ""
         try:
-            from dateutil import parser as dateutil_parser
-            parsed = dateutil_parser.parse(time_str.strip(), fuzzy=True)
-            return parsed.strftime("%H:%M")
-        except Exception:
-            try:
-                parsed_time = datetime.strptime(time_str.strip(), "%I:%M %p")
-                return parsed_time.strftime("%H:%M")
-            except ValueError:
-                return time_str
+            parsed_time = datetime.strptime(time_str.strip(), "%I:%M %p")
+            return parsed_time.strftime("%H:%M")
+        except ValueError:
+            return time_str
 
     def _build_temporal_context(self) -> str:
         today_str = datetime.now().strftime("%d %B %Y")
@@ -1130,8 +1125,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         return session.get("yoga_text") or ""
 
     def _build_final_kundli_data(self, kundli_str: str, topic_emphasis: str, divisional_text: str,
-                                   yoga_text: str, missing_evidence: str = "") -> str:
-        parts = [p for p in [kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence] if p]
+                                   yoga_text: str, missing_evidence: str = "", gochar_text: str = "") -> str:
+        parts = [p for p in [kundli_str, topic_emphasis, divisional_text, yoga_text, missing_evidence, gochar_text] if p]
         return "\n\n".join(parts)
 
     def _get_recent_assistant_texts(self, session_id: str, limit: int = 5) -> List[str]:

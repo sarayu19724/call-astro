@@ -129,11 +129,11 @@ class MemoryDatabase:
                                        kundli_fetch_status, kundli_fetch_error, kundli_fetch_started_at,
                                        report_status, report_error, report_progress, report_started_at, report_file_path,
                                        latitude, longitude, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (session_id, None, None, None, 'Self', 'Hinglish', None, None, None, None,
                  None, None, None, None, None, None, None, None, None, None,
-                 "idle", None, None,
+                 None, "idle", None, None,
                  "idle", None, None, None, None,
                  None, None, now_str)
             )

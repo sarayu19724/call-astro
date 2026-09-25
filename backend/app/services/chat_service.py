@@ -69,6 +69,59 @@ class ChatService:
             formatted.append(f"{role_name}: {msg['content']}")
         return "\n".join(formatted)
 
+    def _get_context_window(self, session_id: str, session: dict) -> str:
+        """Returns the formatted context: [Rolling Summary] + [Last 4 messages]."""
+        summary = session.get("conversation_summary")
+        # Only fetch last 4 messages (2 Q&A pairs) to save context
+        recent_history = db.get_history(session_id, limit=4)
+        recent_text = self._format_history_for_llm(recent_history)
+
+        if summary:
+            return f"[SUMMARY OF EARLIER CONVERSATION]: {summary}\n\n[RECENT MESSAGES]:\n{recent_text}"
+        return recent_text
+
+    def _update_rolling_summary(self, session_id: str, session: dict) -> None:
+        """Runs in background. Every 8 unsummarized messages, summarizes the oldest 6."""
+        try:
+            history = db.get_history(session_id, limit=100)
+            total_msgs = len(history)
+            last_count = session.get("last_summarized_msg_count") or 0
+
+            # Keep the last 2 messages (1 Q&A pair) unsummarized
+            unsummarized_count = total_msgs - last_count
+            if unsummarized_count >= 8:  # 4 Q&A pairs
+                # Grab at most 8 messages (4 turns) at a time to prevent OOM on M1
+                chunk_end = min(last_count + 8, total_msgs - 2)
+                messages_to_summarize = history[last_count:chunk_end]
+                new_last_count = chunk_end
+
+                if not messages_to_summarize:
+                    return
+
+                text_to_summarize = self._format_history_for_llm(messages_to_summarize)
+                existing_summary = session.get("conversation_summary") or ""
+
+                prompt = (
+                    "You are a summarization assistant. Summarize the following astrological conversation "
+                    "in 2-3 concise sentences. Focus on the main topics discussed, predictions made, and user details.\n"
+                )
+                if existing_summary:
+                    prompt += f"\nPrevious summary:\n{existing_summary}\n"
+                prompt += f"\nNew messages to append to summary:\n{text_to_summarize}\n"
+                prompt += "\nReturn ONLY the new integrated summary, nothing else."
+
+                new_summary = llm_service.generate(prompt=prompt, temperature=0.3)
+
+                db.update_session(session_id, {
+                    "conversation_summary": new_summary.strip(),
+                    "last_summarized_msg_count": new_last_count
+                })
+                session["conversation_summary"] = new_summary.strip()
+                session["last_summarized_msg_count"] = new_last_count
+                logger.info("Successfully updated rolling conversation summary.")
+        except Exception as e:
+            logger.error(f"Failed to update rolling summary: {e}")
+
     def _to_24h(self, time_str: str) -> str:
         if not time_str:
             return ""
@@ -95,6 +148,58 @@ class ChatService:
             "explanation (e.g. 'the chart showed favorable signs during that window, and the "
             "current period continues that trend'), just never framed as something yet to happen."
         )
+
+    def _get_temperature(self, intent: str, repeat_hint: str = "") -> float:
+        """Return the right creativity level based on what the user is asking.
+
+        - timing / simple_fact  → low (0.2): needs precision, specific dates/planets
+        - explanation / strength_check → medium (0.5): factual but needs explanation
+        - remedy → medium-low (0.45): grounded but warm tone
+        - general → high (0.7): creative, warm, varied
+        - repeat_hint → always bumped to 0.8 to force fresh phrasing
+        """
+        if repeat_hint:
+            return 0.8
+        temperature_map = {
+            "timing":         0.2,
+            "simple_fact":    0.2,
+            "explanation":    0.5,
+            "strength_check": 0.5,
+            "remedy":         0.45,
+            "general":        0.7,
+        }
+        return temperature_map.get(intent, 0.7)
+
+    def _run_chain_of_thought(self, message_text: str, kundli_data: str,
+                               dasha_info: str, topic: str, language: str) -> str:
+        """Step 1 of 2: Ask the LLM to silently reason about the chart BEFORE
+        generating the final response. Returns a structured 3-point analysis
+        that gets injected into the main prompt as 'grounded facts'.
+
+        This forces the 8B model to think first, then speak — dramatically
+        reducing hallucinations and improving relevance.
+        """
+        cot_prompt = (
+            f"You are a Vedic astrology analysis engine. Given the data below, "
+            f"identify the 3 most relevant astrological facts that directly answer "
+            f"the user's question. Be specific: name actual planets, houses, and "
+            f"periods. Do NOT write a response to the user — only output 3 bullet points.\n\n"
+            f"User's Question: {message_text}\n"
+            f"Topic: {topic or 'general'}\n"
+            f"Birth Chart Summary: {kundli_data[:800]}\n"
+            f"Current Dasha: {dasha_info[:300]}\n\n"
+            f"Output format (3 lines only, no extra text):\n"
+            f"1. [Most relevant chart fact]\n"
+            f"2. [Second relevant fact or timing detail]\n"
+            f"3. [Supporting factor or cautionary note]"
+        )
+        try:
+            result = llm_service.generate(prompt=cot_prompt, temperature=0.2)
+            logger.info(f"[CoT] Reasoning facts generated: {result[:120]}...")
+            return result.strip()
+        except Exception as e:
+            logger.warning(f"[CoT] Chain-of-thought failed, skipping: {e}")
+            return ""
 
     def _check_past_date_claims(self, response_text: str) -> Optional[str]:
         if not response_text:
@@ -145,7 +250,13 @@ class ChatService:
             "as genuine future predictions."
         )
 
-    def _build_verified_chart_block(self, session: Dict) -> str:
+    def _build_chart_ground_truth(self, session: Dict) -> str:
+        """Build a strict verified chart fact block injected as {chart_ground_truth}.
+
+        Lists every planet with its sign, house number, and [Vakri / Retrograde] tag
+        where applicable. This block is placed at the bottom of ASTROLOGER_PROMPT
+        as a hard constraint — the LLM must NEVER contradict it.
+        """
         cached_raw = session.get("kundli_raw")
         if not cached_raw:
             return ""
@@ -167,19 +278,15 @@ class ChatService:
             if not name or not sign:
                 continue
             house = get_house_for_sign(sign, ascendant_sign)
-            retro = " (retrograde)" if str(p.get("isRetro", "")).lower() == "true" else ""
+            retro = " [Vakri / Retrograde]" if str(p.get("isRetro", "")).lower() == "true" else ""
             house_str = f", house {house}" if house else ""
-            lines.append(f"{name}: {sign}{house_str}{retro}")
+            lines.append(f"- {name}: {sign}{house_str}{retro}")
 
-        return (
-            "ACTUAL VERIFIED CHART PLACEMENTS (this is the user's real chart — the ONLY source of "
-            "truth for where each planet actually is):\n" + "\n".join(lines) +
-            "\n\nHARD RULE: retrieved classical text may describe a rule using a DIFFERENT house "
-            "placement for a planet as a general/illustrative example (e.g. 'if Mercury is in the "
-            "10th house...'). If that placement doesn't match the VERIFIED list above, it is NOT a "
-            "description of this user's actual chart — never state a planet's house placement that "
-            "contradicts the verified list above."
-        )
+        return "\n".join(lines)
+
+    # Legacy alias — keeps any other callers working without changes
+    def _build_verified_chart_block(self, session: Dict) -> str:
+        return self._build_chart_ground_truth(session)
 
     def _chunk_text_for_streaming(self, text: str, words_per_chunk: int = 6):
         words = text.split(' ')
@@ -326,17 +433,27 @@ class ChatService:
 
         return "No chart data available."
 
-    def _get_rag_context(self, message_text: str, topic: Optional[str] = None):
-        """Retrieves top-K chunks, logs their relevance scores (so retrieval
-        quality is actually visible/debuggable), and DROPS chunks below
-        settings.MIN_RAG_RELEVANCE instead of silently feeding weak matches
-        to the LLM as if they were solid ground truth."""
+    def _get_rag_context(self, message_text: str, topic: Optional[str] = None, llm_summary: Optional[str] = None):
+        """Retrieves Top-K candidate chunks via Hybrid Search, filters by relevance
+        threshold, then runs a Cross-Encoder re-ranking pass to select the final
+        FINAL_TOP_K_RAG chunks that actually go into the LLM prompt.
+
+        Pipeline:
+          Hybrid Search (Top-10) → MIN_RAG_RELEVANCE filter → Cross-Encoder Re-rank → Top-3 → LLM
+
+        Uses the router's LLM-generated intent summary (llm_summary) as the search query
+        when available — it's always clean English and semantically precise, which
+        dramatically improves book retrieval for Hinglish / vague queries.
+        Falls back to raw message_text if no summary exists.
+        """
         try:
-            search_query = message_text
+            # Use synthesized query if available, else raw message
+            base_query = llm_summary if llm_summary else message_text
+            search_query = base_query
             if topic:
                 bias = get_search_bias(topic)
                 if bias:
-                    search_query = f"{message_text} {bias}"
+                    search_query = f"{base_query} {bias}"
 
             query_vector = self.embeddings_provider.get_embedding(search_query)
             hits = vector_store.hybrid_search(
@@ -364,13 +481,28 @@ class ChatService:
                 logger.info("[RAG] no sufficiently relevant chunks — proceeding with no book context")
                 return "No reference available.", []
 
+            # --- Stage 2: Cross-Encoder re-ranking → keep only FINAL_TOP_K_RAG ---
+            # Use the clean base_query (not biased with topic keywords) so the
+            # cross-encoder judges relevance to what the user actually asked.
+            reranked_hits = reranker.rerank(
+                query=base_query,
+                chunks=relevant_hits,
+                top_k=settings.FINAL_TOP_K_RAG,
+            )
+
             context_chunks = []
             sources = []
-            for i, hit in enumerate(relevant_hits):
+            for i, hit in enumerate(reranked_hits):
                 source = hit["metadata"].get("source", "Unknown")
                 sources.append(source)
+                rerank_score = hit.get("rerank_score")
+                score_label = (
+                    f"rerank={rerank_score:.2f}, hybrid={hit['score']:.2f}"
+                    if rerank_score is not None
+                    else f"relevance={hit['score']:.2f}"
+                )
                 context_chunks.append(
-                    f"--- Context {i+1} [Source: {source}, relevance: {hit['score']:.2f}] ---\n{hit['text']}\n"
+                    f"--- Context {i+1} [Source: {source}, {score_label}] ---\n{hit['text']}\n"
                 )
 
             return "\n".join(context_chunks), sources
@@ -492,7 +624,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         )
         return fallback
 
-    def _build_framework_query(self, message_text: str, topic: Optional[str] = None, life_area: str = "") -> str:
+    def _build_framework_query(self, message_text: str, topic: Optional[str] = None, life_area: str = "", session: Optional[dict] = None) -> str:
         parts = [
             message_text.strip(),
             "classical astrology principles rules indications relevant factors"
@@ -503,7 +635,28 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             bias = get_search_bias(topic)
             if bias:
                 parts.append(bias)
-        return " ".join(p for p in parts if p).strip()
+
+        query = " ".join(p for p in parts if p).strip()
+        
+        if session:
+            raw = session.get("kundli_raw")
+            if raw:
+                try:
+                    import json
+                    chart = json.loads(raw) if isinstance(raw, str) else raw
+                    planets = chart.get("planets", [])
+                    msg_lower = message_text.lower()
+                    for p in planets:
+                        name = p.get("name", "")
+                        if name and str(p.get("isRetro", "")).lower() == "true":
+                            if name.lower() in msg_lower:
+                                logger.info(f"Retrograde planet '{name}' detected in query. Enriching RAG search.")
+                                query += " retrograde Vakri classical effects"
+                                break
+                except Exception as e:
+                    logger.warning(f"Failed to check retrograde planets for RAG enrichment: {e}")
+        
+        return query
 
     def _extract_referenced_factors(self, rag_hits: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
         houses: Set[str] = set()
@@ -594,7 +747,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 sign = match.get("sign_name", "")
                 house = get_house_for_sign(sign, ascendant_sign) if ascendant_sign else None
                 house_str = f", house {house}" if house else ""
-                retro = " (retrograde)" if str(match.get("isRetro", "")).lower() == "true" else ""
+                retro = " [Vakri / Retrograde]" if str(match.get("isRetro", "")).lower() == "true" else ""
                 lines.append(f"- {planet_name}: {sign}{house_str}{retro}")
 
         if dasha_info and ("dasha" in concepts or "mahadasha" in concepts or "antardasha" in concepts or not lines):
@@ -687,7 +840,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 if cached_context:
                     framework_chunks.append(cached_context)
             else:
-                framework_query = self._build_framework_query(message_text, topic, life_area)
+                framework_query = self._build_framework_query(message_text, topic, life_area, session)
                 framework_hits_raw = vector_store.dual_retrieve(
                     topic_query=framework_query,
                     global_query=message_text,
@@ -1306,10 +1459,6 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         if targeted_facts:
             final_kundli_data = f"{final_kundli_data}\n\n{targeted_facts}" if final_kundli_data else targeted_facts
 
-        verified_block = self._build_verified_chart_block(session)
-        if verified_block:
-            final_kundli_data = f"{final_kundli_data}\n\n{verified_block}" if final_kundli_data else verified_block
-
         user_memory = self._get_user_memory_block(session, topic)
         repeat_hint = self._get_repeat_topic_hint(session, topic)
 
@@ -1326,6 +1475,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             "consistency_note": consistency_note,
             "dasha_timeline_str": dasha_timeline_str,
             "evidence_vote": evidence_vote,
+            "chart_ground_truth": self._build_chart_ground_truth(session),
         }
 
     def _build_astrologer_prompt(self, session: Dict, language: str, history_text: str,
@@ -1344,6 +1494,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             consistency_note=ctx["consistency_note"] or "No specific conflict detected.",
             dasha_timeline=ctx["dasha_timeline_str"] or "No timeline data available.",
             response_contract=ctx["response_contract"],
+            chart_ground_truth=ctx.get("chart_ground_truth") or "Chart data not available.",
             history=history_text, query=message_text
         )
         if ctx["repeat_hint"]:

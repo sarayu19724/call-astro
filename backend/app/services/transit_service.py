@@ -289,6 +289,9 @@ class TransitService:
             return "No real-time transit data available."
 
         lines = [
+            "🚨 CURRENT SKY TRANSITS — DO NOT CONFUSE WITH BIRTH CHART 🚨",
+            "(The birth chart natal placements are in the CHART GROUND TRUTH section above. "
+            "The data below is ONLY the CURRENT position of planets in the sky TODAY.)",
             f"=== Real-Time Planetary Transits (Gochar for {gochar_data.get('profile_name')}) ===",
             f"- Natal Lagna: {gochar_data.get('natal_ascendant')} | Natal Moon: {gochar_data.get('natal_moon_sign')}",
             "- Active Key Transits:"

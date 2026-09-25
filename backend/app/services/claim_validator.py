@@ -1,13 +1,16 @@
 """
 Claim Validator 2.0 — verifies specific factual claims in the generated
 response against the REAL chart/Dasha data actually fed to the LLM, not
-just plausible-sounding text. Two independent checks:
+just plausible-sounding text. Three independent checks:
 
 1. Year/timeframe claims — must match the real Dasha timeline (existing).
 2. Chart-fact claims — planet-in-sign and planet-in-house statements must
-   match the actual computed chart. This catches the more dangerous
-   hallucination: the LLM confidently stating a WRONG planet placement,
-   not just a wrong date.
+   match the actual computed chart. This catches the LLM confidently stating
+   a WRONG planet placement.
+3. Natal vs Transit confusion — catches the LLM describing a NATAL birth
+   chart placement using transit language (e.g. "Saturn transiting Cancer"
+   when Cancer is actually the natal sign). This is the most common
+   hallucination for 8B models given mixed natal+transit data in the prompt.
 """
 import re
 from typing import List, Optional, Dict
@@ -25,6 +28,14 @@ ZODIAC_SIGNS = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
     "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"
 ]
+
+# Catches "Saturn transiting Cancer", "Jupiter is transiting Libra" etc.
+# Used to detect when the LLM wrongly uses transit language for natal facts.
+TRANSIT_LANGUAGE_PATTERN = re.compile(
+    r"\b(" + "|".join(PLANET_NAMES) + r")\b[^.]{0,15}?(?:transiting|is\s+transiting|currently\s+transiting)"
+    r"[^.]{0,15}?\b(" + "|".join(ZODIAC_SIGNS) + r")\b",
+    re.IGNORECASE
+)
 
 # Matches phrases like "Mercury is in Virgo", "Mercury in Virgo", "Saturn placed in Libra"
 PLANET_SIGN_PATTERN = re.compile(
@@ -103,6 +114,40 @@ def _verify_planet_house_claims(text: str, planets: List[dict], ascendant_sign: 
     return failures
 
 
+def _verify_no_transit_language_for_natal(text: str, planets: List[dict]) -> List[str]:
+    """Check 4: Catches the hallucination where the LLM uses 'transiting' or
+    'is transiting' to describe a planet's NATAL (birth chart) sign — not its
+    current sky position.
+
+    Example bad output: "with Saturn transiting Cancer" when Cancer is natal.
+    Example good output: "with your natal Saturn in Cancer" or "Saturn placed in Cancer".
+    """
+    failures = []
+    # Build a lookup: planet name → natal sign (lower-case for matching)
+    natal_signs: dict = {}
+    for p in planets:
+        name = p.get("name", "")
+        sign = p.get("sign_name", "")
+        if name and sign:
+            natal_signs[name.lower()] = sign.lower()
+
+    for match in TRANSIT_LANGUAGE_PATTERN.finditer(text):
+        planet_mentioned = match.group(1)   # e.g. "Saturn"
+        sign_mentioned   = match.group(2)   # e.g. "Cancer"
+        natal_sign = natal_signs.get(planet_mentioned.lower())
+
+        if natal_sign and natal_sign == sign_mentioned.lower():
+            # The LLM used "transiting" but the sign is actually the NATAL sign
+            failures.append(
+                f"The response incorrectly says '{planet_mentioned} transiting {sign_mentioned}', "
+                f"but {sign_mentioned} is {planet_mentioned}'s NATAL birth chart sign, NOT a current transit. "
+                f"Replace 'transiting' with 'natal placement in' or 'placed in at birth'. "
+                f"Only use 'transiting' for planets in the Real-Time Planetary Transits (Gochar) block."
+            )
+
+    return failures
+
+
 def validate_claims(
     response_text: str,
     dasha_timeline: str = "",
@@ -153,11 +198,18 @@ def validate_claims(
                 f"be stated as a certainty, especially when evidence is mixed or moderate."
             )
 
-    # --- Check 3 (NEW): Chart-fact verification ---
+    # --- Check 3: Chart-fact verification ---
     if planets:
         failures.extend(_verify_planet_sign_claims(text, planets))
         if ascendant_sign:
             failures.extend(_verify_planet_house_claims(text, planets, ascendant_sign))
+
+    # --- Check 4: Natal vs Transit confusion ---
+    # Catches cases where the LLM uses "transiting" to describe a planet's
+    # NATAL birth chart position — the most common 8B model hallucination
+    # when both natal and transit data are present in the prompt.
+    if planets:
+        failures.extend(_verify_no_transit_language_for_natal(text, planets))
 
     return failures
 

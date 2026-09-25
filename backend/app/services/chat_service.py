@@ -55,6 +55,57 @@ MONTH_NAME_TO_NUM = {
 
 COMPARISON_HINT_WORDS = (" or ", " ya ", " vs ", " versus ", "अथवा", " ki jagah ", " nahi to ")
 
+# ------------------------------------------------------------------
+# TOPIC FOCUS ENFORCEMENT
+#
+# RESPONSE_CONTRACTS in intent_service.py is keyed only by *intent*
+# (timing / explanation / remedy / ...), never by *life area* (career /
+# marriage / health / ...). ASTROLOGER_PROMPT also has no {topic}
+# placeholder at all. That means a "timing" question about career and a
+# "timing" question about marriage receive an identical instruction
+# block, and nothing in the prompt explicitly forbids the model from
+# drifting into generic, unrelated life-guidance content.
+#
+# TOPIC_ALIGNMENT_KEYWORDS + _build_topic_focus_directive() /
+# _check_topic_alignment() close that gap without touching
+# intent_service.py or templates.py: the directive is merged into the
+# contract text that already flows into {response_contract}, and the
+# alignment check plugs into the same regenerate-on-failure pattern
+# already used for claim validation, specificity, and temporal checks.
+# ------------------------------------------------------------------
+TOPIC_ALIGNMENT_KEYWORDS: Dict[str, List[str]] = {
+    "career": [
+        "career", "job", "naukri", "profession", "promotion", "business",
+        "vyapar", "salary", "workplace", "office", "employer", "employment",
+        "kaam", "kamai",
+    ],
+    "marriage": [
+        "marriage", "shaadi", "spouse", "partner", "wedding", "vivah",
+        "relationship", "rishta",
+    ],
+    "finance": [
+        "money", "finance", "wealth", "paisa", "income", "investment",
+        "dhan", "financial",
+    ],
+    "health": [
+        "health", "sehat", "illness", "wellbeing", "energy", "vitality",
+    ],
+    "education": [
+        "education", "studies", "padhai", "exam", "degree", "college",
+        "university",
+    ],
+    "foreign_travel": [
+        "abroad", "foreign", "videsh", "visa", "relocation", "overseas",
+    ],
+}
+
+# Generic filler that, if present WITHOUT any on-topic keyword, is a strong
+# signal the response drifted into unrelated weekly/mood-style guidance.
+OFF_TOPIC_DRIFT_MARKERS = [
+    "harmony", "small joys", "home life", "domestic", "creativity",
+    "emotional balance", "general mood",
+]
+
 
 class ChatService:
     def __init__(self):
@@ -249,6 +300,82 @@ class ChatService:
             "window has already passed'), and only present periods starting after the current date "
             "as genuine future predictions."
         )
+
+    # ------------------------------------------------------------------
+    # TOPIC FOCUS ENFORCEMENT
+    # ------------------------------------------------------------------
+    def _build_topic_focus_directive(self, topic: Optional[str], life_area: str,
+                                       comparison: Optional[List[str]] = None) -> str:
+        """Builds an explicit, mandatory topic-lock instruction. This is what
+        actually gets injected into {response_contract} in the prompt — the
+        one field guaranteed to reach ASTROLOGER_PROMPT — since the template
+        itself has no dedicated {topic} placeholder.
+
+        Without this, a 'timing' intent question about career and a 'timing'
+        intent question about marriage share an identical contract, and the
+        model has no hard instruction stopping it from drifting into
+        unrelated generic content (mood, home life, small joys, etc.)."""
+        resolved = (topic or life_area or "").strip().lower()
+        if not resolved or resolved == "general":
+            return ""
+
+        label = resolved.replace("_", " ")
+        directive = (
+            f"MANDATORY TOPIC FOCUS: This question is SPECIFICALLY about {label.upper()}. "
+            f"Every sentence must relate to {label} — do not answer with unrelated general "
+            f"life guidance (home life, mood, domestic harmony, unrelated relationships, "
+            f"creativity, or any other life area) unless it is directly and explicitly tied "
+            f"to {label}. If the retrieved evidence or chart data feels generic, still ground "
+            f"the answer in the {label}-relevant houses/planets already provided below — never "
+            f"substitute a generic weekly-style reading for a focused {label} answer."
+        )
+        if comparison:
+            directive += (
+                f" The user is specifically weighing {' vs '.join(comparison)} within {label} — "
+                f"address these options directly."
+            )
+        return directive
+
+    def _check_topic_alignment(self, response_text: str, topic: Optional[str], life_area: str) -> Optional[str]:
+        """Post-generation guard: if the topic was clearly career/marriage/etc.
+        and the response contains none of that topic's keywords AND contains
+        an off-topic drift marker (harmony, small joys, home life, ...), flag
+        it for regeneration — the same pattern already used for claim
+        validation, specificity, and temporal checks below."""
+        resolved = (topic or life_area or "").strip().lower()
+        if not resolved or resolved == "general" or not response_text:
+            return None
+
+        keywords = TOPIC_ALIGNMENT_KEYWORDS.get(resolved)
+        if not keywords:
+            return None
+
+        lower_text = response_text.lower()
+        has_topic_keyword = any(kw in lower_text for kw in keywords)
+        has_drift_marker = any(marker in lower_text for marker in OFF_TOPIC_DRIFT_MARKERS)
+
+        if not has_topic_keyword and has_drift_marker:
+            label = resolved.replace("_", " ")
+            return (
+                f"TOPIC DRIFT DETECTED: the user asked specifically about {label.upper()}, but "
+                f"the response contains no {label}-related content and reads like generic, "
+                f"unrelated life guidance. Rewrite the response so it directly and specifically "
+                f"addresses {label} using the chart placements, Dasha timing, and evidence "
+                f"already provided — do not answer with a generic weekly-style reading."
+            )
+
+        if not has_topic_keyword:
+            # Softer signal: no drift marker either, but still zero topic
+            # keywords — still worth nudging on regeneration if other
+            # checks already triggered a retry.
+            label = resolved.replace("_", " ")
+            return (
+                f"TOPIC FOCUS REMINDER: the user asked specifically about {label.upper()}. "
+                f"Make sure the rewritten response explicitly mentions {label}-relevant "
+                f"factors (not just chart facts in general)."
+            )
+
+        return None
 
     def _build_chart_ground_truth(self, session: Dict) -> str:
         """Build a strict verified chart fact block injected as {chart_ground_truth}.
@@ -1380,6 +1507,23 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         intent = classify_intent(message_text)
         response_contract = get_response_contract(intent)
 
+        # --- TOPIC FOCUS ENFORCEMENT ---
+        # get_response_contract() is intent-only (timing/explanation/remedy/...)
+        # and never encodes WHICH life area the question is about, and
+        # ASTROLOGER_PROMPT has no dedicated {topic} placeholder. Without an
+        # explicit, mandatory topic-lock merged in here, a correctly-classified
+        # "career" + "timing" question can still get generic weekly-style
+        # guidance. This directive rides in on {response_contract} — the one
+        # field guaranteed to reach the prompt.
+        life_area = query_understanding.get("life_area") or ""
+        comparison_options = query_understanding.get("comparison") or []
+        topic_focus_directive = self._build_topic_focus_directive(topic, life_area, comparison_options)
+        if topic_focus_directive:
+            response_contract = f"{topic_focus_directive}\n\n{response_contract}"
+            logger.info(f"[TopicFocus] enforcing mandatory topic lock for '{topic or life_area}'")
+        else:
+            logger.info("[TopicFocus] no specific topic/life_area resolved — using general contract as-is")
+
         cached_kundli = session.get("kundli_data")
         kundli_str = cached_kundli if cached_kundli else self._fetch_and_cache_kundli(session_id, session)
 
@@ -1465,6 +1609,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         return {
             "query_understanding": query_understanding,
             "topic": topic,
+            "life_area": life_area,
             "response_contract": response_contract,
             "context_str": context_str,
             "rag_hits": rag_hits,
@@ -1503,7 +1648,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         return prompt
 
     def _generate_and_validate(self, session_id: str, session: Dict, astrologer_prompt: str,
-                                 dasha_timeline_str: str, evidence_vote) -> str:
+                                 dasha_timeline_str: str, evidence_vote,
+                                 topic: Optional[str] = None, life_area: str = "") -> str:
         response_text = llm_service.generate(prompt=astrologer_prompt, temperature=0.6)
 
         recent_texts = self._get_recent_assistant_texts(session_id)
@@ -1533,7 +1679,14 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         if temporal_correction:
             logger.info("[TemporalCheck] response flagged a past date/period presented as upcoming")
 
-        if similar_to or claim_failures or specificity_correction or temporal_correction:
+        topic_alignment_correction = self._check_topic_alignment(response_text, topic, life_area)
+        if topic_alignment_correction:
+            logger.warning(
+                f"[TopicAlignment] response for topic '{topic or life_area}' failed alignment check — "
+                f"queuing regeneration"
+            )
+
+        if similar_to or claim_failures or specificity_correction or temporal_correction or topic_alignment_correction:
             retry_prompt = astrologer_prompt
             if similar_to:
                 retry_prompt += (
@@ -1549,6 +1702,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 retry_prompt += "\n\n" + specificity_correction
             if temporal_correction:
                 retry_prompt += "\n\n" + temporal_correction
+            if topic_alignment_correction:
+                retry_prompt += "\n\n" + topic_alignment_correction
 
             response_text = llm_service.generate(prompt=retry_prompt, temperature=0.75)
 
@@ -1557,10 +1712,16 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 planets=verify_planets, ascendant_sign=verify_ascendant
             )
             remaining_temporal = self._check_past_date_claims(response_text)
+            remaining_topic_issue = self._check_topic_alignment(response_text, topic, life_area)
             if remaining_claims:
                 logger.warning(f"Claim validation still found {len(remaining_claims)} issue(s) after regeneration")
             if remaining_temporal:
                 logger.warning("Temporal check still found a past-as-upcoming date after regeneration")
+            if remaining_topic_issue:
+                logger.warning(
+                    f"[TopicAlignment] regenerated response for topic '{topic or life_area}' "
+                    f"STILL failed alignment check — shipping best-effort response"
+                )
 
         return response_text
 
@@ -1639,7 +1800,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             try:
                 astrologer_prompt = self._build_astrologer_prompt(session, language, history_text, message_text, ctx)
                 response_text = self._generate_and_validate(
-                    session_id, session, astrologer_prompt, ctx["dasha_timeline_str"], ctx["evidence_vote"]
+                    session_id, session, astrologer_prompt, ctx["dasha_timeline_str"], ctx["evidence_vote"],
+                    topic=topic, life_area=ctx.get("life_area", "")
                 )
             except Exception as gen_err:
                 logger.error(f"Generation failed: {gen_err}")
@@ -1752,7 +1914,8 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             try:
                 astrologer_prompt = self._build_astrologer_prompt(session, language, history_text, message_text, ctx)
                 full_text = self._generate_and_validate(
-                    session_id, session, astrologer_prompt, ctx["dasha_timeline_str"], ctx["evidence_vote"]
+                    session_id, session, astrologer_prompt, ctx["dasha_timeline_str"], ctx["evidence_vote"],
+                    topic=topic, life_area=ctx.get("life_area", "")
                 )
             except Exception as gen_err:
                 logger.error(f"Streaming generation failed: {gen_err}")

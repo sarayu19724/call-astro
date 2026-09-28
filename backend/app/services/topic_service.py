@@ -619,20 +619,18 @@ def format_evidence_vote_for_prompt(vote: Optional[Dict], topic: Optional[str]) 
     """Render the vote as an instruction block for the LLM — this is what
     actually calibrates the model's stated certainty against real evidence
     strength instead of a fixed 'always sound confident' rule."""
-    if not vote or not topic:
+    if not vote or not topic or not vote.get("votes"):
         return ""
 
-    lines = [f"Evidence Vote for {topic} (each source scored independently):"]
+    lines = [f"Chart signal summary for {topic} (these signals may be correlated):"]
     for v in vote["votes"]:
         direction = "Supportive" if v["vote"] > 0 else ("Challenging" if v["vote"] < 0 else "No clear signal")
         lines.append(f"- {v['source']}: {direction}")
 
     lines.append(
         f"Result: {vote['positive_count']} supportive, {vote['negative_count']} challenging, "
-        f"{vote['neutral_count']} neutral — confidence score {vote['confidence_pct']}%. "
-        f"Calibrate your certainty to this: 70%+ → speak with strong confidence; "
-        f"40-70% → grounded but slightly softer confidence; below 40% or verdict 'mixed' → "
-        f"be honest about the mixed picture instead of forcing a single confident verdict."
+        f"{vote['neutral_count']} neutral. These counts describe direction, not confidence or "
+        "the probability of an event. Never guarantee an outcome or infer a deadline from these counts."
     )
     return "\n".join(lines)
 
@@ -933,6 +931,8 @@ def format_dasha_timeline_for_prompt(upcoming_periods: List[dict], favorable_per
             antar = p.get("antardasha", "")
             start = p.get("start", "").split(" ")[0]
             lines.append(f"- {maha}/{antar}: starting {start} (strong match for this question)")
+    else:
+        lines.append("No supported favorable timing window was identified for this topic. Do not infer an event deadline.")
 
     return "\n".join(lines)
 
@@ -1007,7 +1007,6 @@ def get_evidence_consensus_label(vote: Optional[Dict]) -> str:
 
     positive = vote.get("positive_count", 0)
     negative = vote.get("negative_count", 0)
-    confidence = vote.get("confidence_pct", 50)
     verdict = vote.get("verdict")
 
     # Conflicting: real disagreement between independent sources, not just
@@ -1015,9 +1014,9 @@ def get_evidence_consensus_label(vote: Optional[Dict]) -> str:
     if positive > 0 and negative > 0 and verdict == "mixed":
         return "CONFLICTING"
 
-    if confidence >= 70:
-        return "HIGH"
-    if confidence >= 55:
+    if positive > 0 and negative > 0:
+        return "CONFLICTING"
+    if max(positive, negative) >= 2:
         return "MEDIUM"
     return "LOW"
 

@@ -31,7 +31,7 @@ from app.services.transit_service import transit_service
 from app.services.relationship_service import get_relationship_context
 
 
-TOPIC_BUNDLE_LOGIC_VERSION = 3  # bumped: "timeline" removed from bundle, now computed separately (timing-gated)
+TOPIC_BUNDLE_LOGIC_VERSION = 4  # invalidate cached confidence instructions
 FRAMEWORK_CACHE_VERSION = 1
 
 # Evidence Ranking + Dedup — chunks scoring above this similarity to a
@@ -1394,6 +1394,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
 
             upcoming = dasha_api_service.get_upcoming_periods(dasha_tree, months_ahead=60)
             favorable = rank_favorable_periods(upcoming, topic)
+            session["_timing_supported"] = bool(favorable)
             timeline_str = format_dasha_timeline_for_prompt(upcoming, favorable, language)
             logger.info(f"Dasha timeline built for topic '{topic}': {len(upcoming)} periods, {len(favorable)} favorable")
             return timeline_str
@@ -1555,6 +1556,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         # timing. A "what does my 10th house mean" question never touches
         # this; a "when will I get a job" question does.
         dasha_timeline_str = ""
+        session["_timing_supported"] = False
         requires_timing = bool(query_understanding.get("requires_timing"))
         if topic and requires_timing:
             dasha_timeline_str = self._get_dasha_timeline(session_id, session, topic, language)
@@ -1606,6 +1608,25 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
         user_memory = self._get_user_memory_block(session, topic)
         repeat_hint = self._get_repeat_topic_hint(session, topic)
 
+        # Request-specific coverage must override cached chart-only optimism.
+        evidence_vote = dict(evidence_vote or {})
+        evidence_vote.update({
+            "requires_timing": requires_timing,
+            "timing_supported": session["_timing_supported"],
+            "classical_evidence_available": bool(rag_hits),
+        })
+        limited = not rag_hits or (requires_timing and not session["_timing_supported"])
+        consistency_note = (
+            "Evidence sufficiency: LOW. Do not infer an event date or promise an outcome."
+            if limited else format_evidence_vote_for_prompt(evidence_vote, topic)
+        )
+        session["_request_evidence"] = evidence_vote
+        response_contract += (
+            "\nEvidence limits override any request for a specific deadline. Never promise an outcome. "
+            "Dasha dates alone do not establish event timing. Only discuss an explicitly supported "
+            "favorable period as a possibility; otherwise say a reliable window cannot be identified."
+        )
+
         return {
             "query_understanding": query_understanding,
             "topic": topic,
@@ -1650,6 +1671,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
     def _generate_and_validate(self, session_id: str, session: Dict, astrologer_prompt: str,
                                  dasha_timeline_str: str, evidence_vote,
                                  topic: Optional[str] = None, life_area: str = "") -> str:
+        if evidence_vote and evidence_vote.get("requires_timing") and (
+            not evidence_vote.get("timing_supported") or not evidence_vote.get("classical_evidence_available")
+        ):
+            return self._limited_evidence_response(session, topic)
         response_text = llm_service.generate(prompt=astrologer_prompt, temperature=0.6)
 
         recent_texts = self._get_recent_assistant_texts(session_id)
@@ -1715,8 +1740,10 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
             remaining_topic_issue = self._check_topic_alignment(response_text, topic, life_area)
             if remaining_claims:
                 logger.warning(f"Claim validation still found {len(remaining_claims)} issue(s) after regeneration")
+                return self._limited_evidence_response(session, topic)
             if remaining_temporal:
                 logger.warning("Temporal check still found a past-as-upcoming date after regeneration")
+                return self._limited_evidence_response(session, topic)
             if remaining_topic_issue:
                 logger.warning(
                     f"[TopicAlignment] regenerated response for topic '{topic or life_area}' "
@@ -1724,6 +1751,17 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 )
 
         return response_text
+
+    @staticmethod
+    def _limited_evidence_response(session: Dict, topic: Optional[str]) -> str:
+        language = session.get("language", "English")
+        if language == "Hindi":
+            return "उपलब्ध जानकारी से किसी घटना का भरोसेमंद समय तय नहीं किया जा सकता। दशा की तारीखें किसी परिणाम की गारंटी नहीं देतीं।"
+        if language == "Hinglish":
+            return "Abhi uplabdh jaankari se koi bharosemand timing window nahi bata sakta. Dasha ki dates kisi outcome ki guarantee nahi deti hain."
+        subject = "a job offer" if topic == "career" else "this outcome"
+        return (f"The available evidence does not establish a reliable window for {subject}. "
+                "Dasha dates alone cannot establish when it will happen or guarantee the outcome.")
 
     # ------------------------------------------------------------------
     # NON-STREAMING — POST /api/chat
@@ -2045,9 +2083,9 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 )
             elif framework_hit_count == 0:
                 framework_detail = (
-                    "No classical sources scored above the relevance threshold for "
-                    "this question's core framework query (or the framework was "
-                    "reused from cache for this topic)."
+                    "No classical framework evidence is attached to this response. "
+                    f"Retrieval status: {vector_store.retrieval_status}. "
+                    + (vector_store.retrieval_error or "")
                 )
             else:
                 framework_detail = (
@@ -2285,6 +2323,12 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                     f"Could not build evidence consensus trace: {evidence_err}"
                 )
 
+            evidence_vote = session.get("_request_evidence", evidence_vote)
+            limited = not rag_hits or (isinstance(evidence_vote, dict) and
+                evidence_vote.get("requires_timing") and not evidence_vote.get("timing_supported"))
+            consensus_label = "LOW" if limited else get_evidence_consensus_label(evidence_vote)
+            consistency = ("Insufficient evidence for a reliable prediction or deadline." if limited
+                           else format_evidence_vote_for_prompt(evidence_vote, topic))
             consensus_lines = []
 
             if consensus_label:
@@ -2310,7 +2354,7 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 confidence = evidence_vote.get("confidence_pct")
                 if confidence is not None:
                     consensus_lines.append(
-                        f"• Confidence score: {confidence}%"
+                        "• Chart direction is a heuristic, not a probability or reliability score."
                     )
 
                 verdict = evidence_vote.get("verdict")
@@ -2499,6 +2543,11 @@ Respond with ONLY valid JSON in this exact shape, no markdown, no extra text:
                 "needed), current-date temporal filtering, and the relevant Kundli "
                 "and Dasha information."
             )
+            if not rag_hits:
+                synthesis_detail = (
+                    "No retrieved classical evidence supports this response. Available chart and "
+                    "Dasha data do not by themselves establish an event deadline."
+                )
 
             steps.append({
                 "step": 12,

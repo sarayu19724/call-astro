@@ -16,6 +16,7 @@ import re
 from typing import List, Optional, Dict
 
 ABSOLUTE_CLAIM_PATTERNS = [
+    r"\byou\s+will\s+(?:receive|get|secure|land|find|have|marry|conceive)\b",
     r"\bwill definitely\b", r"\byou will surely\b", r"\bguaranteed\b",
     r"\b100%\b", r"\bcertainly will\b",
     r"\bpakka\b.*\bhoga\b", r"\bzaroor\b.*\bhoga\b",
@@ -188,15 +189,7 @@ def validate_claims(
     # --- Check 2: Absolute language vs confidence ---
     has_absolute = any(re.search(p, text, re.IGNORECASE) for p in ABSOLUTE_CLAIM_PATTERNS)
     if has_absolute:
-        confidence = evidence_vote.get("confidence_pct", 50) if evidence_vote else 50
-        verdict = evidence_vote.get("verdict") if evidence_vote else None
-        if confidence < 70 or verdict == "mixed":
-            failures.append(
-                f"The response uses absolute/guaranteed language (e.g. 'will definitely', "
-                f"'guaranteed', '100%'), but the evidence confidence is only {confidence}% "
-                f"({verdict or 'uncertain'}). Remove absolute claims — astrology should never "
-                f"be stated as a certainty, especially when evidence is mixed or moderate."
-            )
+        failures.append("Remove promises or guaranteed outcomes. Chart signal scores never justify certainty about a real-world event.")
 
     # --- Check 3: Chart-fact verification ---
     if planets:

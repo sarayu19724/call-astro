@@ -21,7 +21,7 @@ import AstrologyCalendar from './components/AstrologyCalendar';
 
 
 interface Message { role: 'user' | 'assistant' | 'system'; content: string; timestamp?: string; }
-interface IngestStatus { indexing_completed: boolean; total_chunks: number; loading: boolean; }
+interface IngestStatus { indexing_completed: boolean; total_chunks: number; loading: boolean; status?: string; }
 
 /// <reference types="vite/client" />
 export const API_BASE = import.meta.env.VITE_API_URL 
@@ -376,7 +376,7 @@ function App() {
       const res = await fetch(`${API_BASE}/ingest/status`);
       if (res.ok) {
         const data = await res.json();
-        setIngestStatus({ indexing_completed: data.indexing_completed, total_chunks: data.total_chunks, loading: false });
+        setIngestStatus({ indexing_completed: data.indexing_completed, total_chunks: data.total_chunks, loading: false, status: data.status });
       }
     } catch (err) {
       console.error('Error checking ingest status:', err);
@@ -385,6 +385,11 @@ function App() {
   };
 
   // Switch to another profile
+  useEffect(() => {
+    const timer = setInterval(checkIngestStatus, 5000);
+    return () => clearInterval(timer);
+  }, []);
+
   const handleSelectProfile = (id: string) => {
     if (id === sessionId) return;
     const target = profiles.find(p => p.id === id);
@@ -809,7 +814,7 @@ function App() {
           {!ingestStatus.loading && !ingestStatus.indexing_completed && (
             <div className="bg-blue-50 border-b border-blue-200 px-4 py-2 text-sm text-blue-700 flex items-center gap-2">
               <Database size={16} className="text-blue-600 shrink-0 animate-pulse" />
-              <span><strong>Knowledge base indexing...</strong> Automatic indexing completed on server startup.</span>
+              <span><strong>Knowledge base: {ingestStatus.status || 'checking'}.</strong> {ingestStatus.status === 'failed' ? 'Retrieval is unavailable. Check the backend logs and restart after resolving the error.' : 'Retrieval will become available after the index passes validation.'}</span>
             </div>
           )}
 
@@ -868,7 +873,7 @@ function App() {
                   </div>
                 ) : (
                   <div className="flex items-center gap-1 text-slate-500 bg-slate-100 px-2.5 py-1 rounded-full text-xs font-medium border border-slate-200">
-                    <Database size={12} /><span>RAG: Initializing</span>
+                    <Database size={12} /><span>RAG: {ingestStatus.status || 'checking'}</span>
                   </div>
                 )}
               </div>

@@ -170,6 +170,9 @@ class LocalVectorStore:
 
         # Used to protect against embedding-model dimension mismatches.
         self._embedding_dim: Optional[int] = None
+        self.retrieval_status = "checking"
+        self.retrieval_error = None
+        self._compatibility_lock = threading.Lock()
 
         logger.info(
             "[VectorStore] VECTOR_STORE_V2_ACTIVE — "
@@ -199,6 +202,58 @@ class LocalVectorStore:
     def get_embedding_dim(self) -> Optional[int]:
         """Return the dimensionality the on-disk store was built with."""
         return self._embedding_dim
+
+    def ensure_compatible(self, provider):
+        """Re-embed cached text before using an unknown or changed model.
+
+        Keep the previous index on disk until every replacement vector passes
+        validation. The identity file also detects same-dimension model changes.
+        """
+        with self._compatibility_lock:
+            self.retrieval_status = "checking"
+            self.retrieval_error = None
+            identity = {"provider": provider.provider, "model": (
+                provider.local_model_name if provider.provider == "local" else provider.ollama_model
+            )}
+            identity_path = os.path.join(self.data_dir, "embedding_identity.json")
+            try:
+                probe = np.asarray(provider.get_embedding("index compatibility check"), dtype=np.float32)
+                if probe.ndim != 1 or not probe.size or not np.isfinite(probe).all() or not np.any(probe):
+                    raise ValueError("Embedding provider returned an invalid probe vector")
+                identity["dimension"] = int(probe.size)
+                stored_identity = None
+                if os.path.exists(identity_path):
+                    with open(identity_path, encoding="utf-8") as handle:
+                        stored_identity = json.load(handle)
+                if self.chunks and (stored_identity != identity or self._embedding_dim != probe.size):
+                    self.retrieval_status = "rebuilding"
+                    logger.warning("Embedding configuration changed or unknown; rebuilding cached chunk vectors")
+                    batches = []
+                    for start in range(0, len(self.chunks), 64):
+                        texts = [c["text"] for c in self.chunks[start:start + 64]]
+                        batch = np.asarray(provider.get_embeddings(texts), dtype=np.float32)
+                        if (batch.shape != (len(texts), probe.size) or not np.isfinite(batch).all()
+                                or np.any(np.linalg.norm(batch, axis=1) == 0)):
+                            raise ValueError("Embedding batch is incomplete or invalid; original index preserved")
+                        batches.append(batch)
+                    replacement = np.vstack(batches)
+                    os.makedirs(self.data_dir, exist_ok=True)
+                    temporary = self.vectors_path + ".pending"
+                    with open(temporary, "wb") as handle:
+                        np.save(handle, replacement)
+                    os.replace(temporary, self.vectors_path)
+                    self.vectors = replacement
+                    self._rebuild_normalized_cache()
+                os.makedirs(self.data_dir, exist_ok=True)
+                with open(identity_path + ".pending", "w", encoding="utf-8") as handle:
+                    json.dump(identity, handle)
+                os.replace(identity_path + ".pending", identity_path)
+                self.retrieval_status = "ready" if self.chunks else "empty"
+            except Exception as exc:
+                self.retrieval_status = "failed"
+                self.retrieval_error = str(exc)
+                logger.exception("Index compatibility recovery failed")
+                raise
 
     def load(self):
         logger.info(f"[VectorStore] data_dir = {self.data_dir}")
@@ -286,6 +341,7 @@ class LocalVectorStore:
             raise
 
     def clear(self):
+        self.retrieval_status = "empty"
         self.chunks = []
         self.vectors = None
         self._normalized_vectors = None
@@ -314,6 +370,11 @@ class LocalVectorStore:
             embeddings,
             dtype=np.float32
         )
+        if (len(texts) != len(metadatas) or new_vectors.ndim != 2
+                or new_vectors.shape[0] != len(texts) or not new_vectors.shape[1]
+                or not np.isfinite(new_vectors).all()
+                or np.any(np.linalg.norm(new_vectors, axis=1) == 0)):
+            raise ValueError("Each chunk must have one finite, nonzero embedding and metadata entry")
 
         if (
             self.vectors is not None
@@ -371,6 +432,7 @@ class LocalVectorStore:
 
         self._rebuild_normalized_cache()
         self.save()
+        self.retrieval_status = "ready"
 
     def _lexical_score(
         self,
@@ -411,6 +473,8 @@ class LocalVectorStore:
         )
 
         if query_dim != self._embedding_dim:
+            self.retrieval_status = "failed"
+            self.retrieval_error = "Embedding dimensions do not match; restart to rebuild the index."
             logger.error(
                 f"[VectorStore] EMBEDDING DIMENSION MISMATCH: "
                 f"the knowledge base index was built with "
@@ -446,6 +510,8 @@ class LocalVectorStore:
         Preferred sources receive a boost but the entire knowledge base
         remains searchable.
         """
+        if self.retrieval_status != "ready":
+            return []
         if (
             not self.chunks
             or self.vectors is None

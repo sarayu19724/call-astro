@@ -11,10 +11,10 @@ async def check_ingest_status():
     try:
         # Check if chunks are loaded in vector memory
         total_chunks = len(vector_store.chunks)
-        indexing_completed = total_chunks > 0
+        indexing_completed = total_chunks > 0 and vector_store.retrieval_status == "ready"
         
         return StatusResponse(
-            status="success",
+            status=vector_store.retrieval_status,
             indexing_completed=indexing_completed,
             total_chunks=total_chunks
         )

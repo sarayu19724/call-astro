@@ -156,6 +156,9 @@ class DocumentIndexer:
         downstream) until you run force_rebuild=True to re-index them with
         page tracking.
         """
+        # Validate even when all source files have already been indexed.
+        # Recovery uses cached text, so it also works if the source folder moved.
+        vector_store.ensure_compatible(self.embeddings_provider)
         kb_dir = settings.KNOWLEDGE_BASE_DIR
         if not os.path.exists(kb_dir):
             os.makedirs(kb_dir, exist_ok=True)

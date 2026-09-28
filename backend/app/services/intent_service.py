@@ -1,6 +1,7 @@
 """
 Intent + time-horizon classifier — deterministic, keyword-based (no LLM call).
-Also includes chart-fact detection and the top-level query router.
+Also includes chart-fact detection, life-area detection, weekly-guidance detection,
+and the top-level query router.
 """
 import re
 from typing import Optional, Dict
@@ -40,9 +41,40 @@ STYLE_PATTERNS = {
     "detailed": [r"\bdetail\b", r"\bexplain properly\b", r"\bvistaar\b", r"\bpuri baat\b"],
 }
 
+LIFE_AREA_PATTERNS = {
+    "career": [
+        r"\bjob\b", r"\bcareer\b", r"\bemployment\b", r"\bprofession\b",
+        r"\bpromotion\b", r"\bsalary\b", r"\binterview\b", r"\bplacement\b",
+        r"\binternship\b", r"\bgetting hired\b", r"\bget hired\b",
+        r"\bnaukri\b", r"\bjob milegi\b", r"\bcareer growth\b",
+    ],
+    "marriage": [
+        r"\bmarriage\b", r"\bmarry\b", r"\bmarried\b", r"\bshaadi\b",
+        r"\bvivah\b", r"\bspouse\b", r"\bhusband\b", r"\bwife\b",
+    ],
+    "education": [
+        r"\bstudy\b", r"\beducation\b", r"\bexam\b", r"\bcollege\b",
+        r"\buniversity\b", r"\bdegree\b", r"\bresult\b",
+    ],
+    "finance": [
+        r"\bmoney\b", r"\bfinance\b", r"\bfinancial\b", r"\bincome\b",
+        r"\bwealth\b", r"\bbusiness\b", r"\bprofit\b",
+    ],
+    "health": [
+        r"\bhealth\b", r"\bhealthcare\b", r"\billness\b", r"\bdisease\b",
+        r"\bwellness\b",
+    ],
+}
+
+WEEKLY_GUIDANCE_PATTERNS = [
+    r"\bthis week\b", r"\bweekly guidance\b", r"\bweek ahead\b",
+    r"\bhow will my week be\b", r"\bhow is my week\b",
+    r"\bthis week's guidance\b", r"\bwhat should i focus on this week\b",
+    r"\biss hafte\b", r"\bis hafte\b",
+]
+
 
 def classify_intent(message: str) -> str:
-    # Returns timing, simple_fact, explanation, strength_check, remedy, or general
     text = message.lower()
     for intent, patterns in INTENT_PATTERNS.items():
         for pattern in patterns:
@@ -68,15 +100,27 @@ def detect_requested_style(message: str) -> Optional[str]:
     return None
 
 
+def detect_life_area(message: str) -> Optional[str]:
+    text = message.lower()
+    for life_area, patterns in LIFE_AREA_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, text):
+                return life_area
+    return None
+
+
+def is_weekly_guidance_request(message: str) -> bool:
+    text = message.lower().strip()
+    return any(re.search(pattern, text) for pattern in WEEKLY_GUIDANCE_PATTERNS)
+
+
 def is_followup(message: str, history_text: str) -> bool:
-    # Short message + existing history + followup markers suggests a followup
     if not history_text:
         return False
     word_count = len(message.split())
     followup_markers = ["what about", "aur", "uske baad", "then", "also", "and"]
     has_marker = any(m in message.lower() for m in followup_markers)
     return word_count <= 8 or has_marker
-
 
 RESPONSE_CONTRACTS: Dict[str, str] = {
     "simple_fact": (
@@ -88,8 +132,8 @@ RESPONSE_CONTRACTS: Dict[str, str] = {
         "This is a TIMING question. Structure your answer as: (1) the most "
         "relevant upcoming or current period, (2) why that period is "
         "relevant (which planet/house), (3) one practical note. Be specific "
-        "about WHEN using the Dasha timeline provided — do not give a vague "
-        "'in the future' answer if real period data is available."
+        "about WHEN using the Dasha timeline provided. Answer the user's "
+        "actual life-area question, not generic weekly guidance."
     ),
     "explanation": (
         "This is a WHY question. Lead with the main chart factor causing "
@@ -103,12 +147,12 @@ RESPONSE_CONTRACTS: Dict[str, str] = {
     ),
     "remedy": (
         "This is a REMEDY question. Suggest ONE, at most TWO, low-risk "
-        "remedies (gemstone, simple practice) tied to the specific weak/"
-        "afflicted factor in their chart. Do not list many remedies."
+        "remedies tied to the specific weak/afflicted factor in their chart. "
+        "Do not list many remedies."
     ),
     "general": (
-        "Give a natural, integrated prediction weaving chart placement and "
-        "timing together, as per your normal style."
+        "Give a natural, integrated prediction focused on the user's actual "
+        "question and identified life area. Do not default to weekly guidance."
     ),
 }
 
@@ -116,10 +160,6 @@ RESPONSE_CONTRACTS: Dict[str, str] = {
 def get_response_contract(intent: str) -> str:
     return RESPONSE_CONTRACTS.get(intent, RESPONSE_CONTRACTS["general"])
 
-
-# ------------------------------------------------------------------
-# Chart-fact detection — questions answerable directly from Kundli data
-# ------------------------------------------------------------------
 CHART_FACT_PATTERNS = {
     "ascendant": [r"\bmy ascendant\b", r"\bmera lagna\b", r"\blagna kya\b", r"\brising sign\b"],
     "moon_sign": [r"\bmy moon sign\b", r"\bmera (chandra )?rashi\b", r"\bmoon sign kya\b"],
@@ -135,7 +175,6 @@ CHART_FACT_PATTERNS = {
 
 
 def is_chart_fact_question(message: str) -> Optional[str]:
-    # Returns fact type if answerable directly from Kundli data, else None
     text = message.lower()
     for fact_type, patterns in CHART_FACT_PATTERNS.items():
         for pattern in patterns:
@@ -143,10 +182,6 @@ def is_chart_fact_question(message: str) -> Optional[str]:
                 return fact_type
     return None
 
-
-# ------------------------------------------------------------------
-# Query Router — top-level decision for RAG/Kundli/topic-bundle usage
-# ------------------------------------------------------------------
 KNOWLEDGE_ONLY_PATTERNS = [
     r"\bwhat does .* mean\b", r"\bwhat is .* in vedic astrology\b",
     r"\bkya matlab hai\b", r"\bwhat does .* signify\b",
@@ -156,18 +191,16 @@ KNOWLEDGE_ONLY_PATTERNS = [
 
 
 def route_query(message: str, history_text: str = "") -> str:
-    # Returns one of: chart_fact, knowledge, timing, analysis
+    if is_weekly_guidance_request(message):
+        return "weekly_guidance"
     if is_chart_fact_question(message):
         return "chart_fact"
-
     intent = classify_intent(message)
     if intent == "timing":
         return "timing"
     if intent in ("explanation", "strength_check"):
         return "analysis"
-
     text = message.lower()
-    if any(re.search(p, text) for p in KNOWLEDGE_ONLY_PATTERNS):
+    if any(re.search(pattern, text) for pattern in KNOWLEDGE_ONLY_PATTERNS):
         return "knowledge"
-
     return "analysis"

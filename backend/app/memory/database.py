@@ -48,6 +48,10 @@ class MemoryDatabase:
                     dasha_tree_raw TEXT,
                     topic_cache TEXT,
                     house_insights_cache TEXT,
+                    user_memory_json TEXT,
+                    prediction_journal_json TEXT,
+                    conversation_summary TEXT,
+                    last_summarized_msg_count INTEGER DEFAULT 0,
                     kundli_fetch_status TEXT,
                     kundli_fetch_error TEXT,
                     kundli_fetch_started_at TEXT,
@@ -85,6 +89,10 @@ class MemoryDatabase:
                 ("dasha_tree_raw", "TEXT"),
                 ("topic_cache", "TEXT"),
                 ("house_insights_cache", "TEXT"),
+                ("user_memory_json", "TEXT"),
+                ("prediction_journal_json", "TEXT"),
+                ("conversation_summary", "TEXT"),
+                ("last_summarized_msg_count", "INTEGER DEFAULT 0"),
                 ("kundli_fetch_status", "TEXT"),
                 ("kundli_fetch_error", "TEXT"),
                 ("kundli_fetch_started_at", "TEXT"),
@@ -119,40 +127,63 @@ class MemoryDatabase:
                 return dict(row)
 
             now_str = datetime.utcnow().isoformat()
+
+            # Build columns and values from ONE dictionary.
+            # This prevents SQLite binding errors when new session fields
+            # such as automatic memory/journal fields are added.
+            session_defaults = {
+                "session_id": session_id,
+                "dob": None,
+                "birth_time": None,
+                "birth_place": None,
+                "gender": None,
+                "name": None,
+                "relation": "Self",
+                "language": "Hinglish",
+                "pending_field": None,
+                "kundli_data": None,
+                "kundli_raw": None,
+                "kundli_dasha": None,
+                "kundli_divisional": None,
+                "kundli_full_raw": None,
+                "topic_memory": None,
+                "last_reasoning_trace": None,
+                "dashboard_prediction": None,
+                "dashboard_lucky_color": None,
+                "dashboard_date": None,
+                "weekly_guidance": None,
+                "weekly_week_start": None,
+                "yoga_text": None,
+                "dasha_tree_raw": None,
+                "topic_cache": None,
+                "house_insights_cache": None,
+                "user_memory_json": None,
+                "prediction_journal_json": None,
+                "conversation_summary": None,
+                "last_summarized_msg_count": 0,
+                "kundli_fetch_status": "idle",
+                "kundli_fetch_error": None,
+                "kundli_fetch_started_at": None,
+                "report_status": "idle",
+                "report_error": None,
+                "report_progress": None,
+                "report_started_at": None,
+                "report_file_path": None,
+                "latitude": None,
+                "longitude": None,
+                "updated_at": now_str,
+            }
+
+            columns = list(session_defaults.keys())
+            placeholders = ", ".join(["?"] * len(columns))
+            values = [session_defaults[column] for column in columns]
+
             cursor.execute(
-                """
-                INSERT INTO sessions (session_id, dob, birth_time, birth_place, relation, language,
-                                       pending_field, kundli_data, kundli_raw, kundli_dasha, kundli_divisional,
-                                       kundli_full_raw, topic_memory, last_reasoning_trace, dashboard_prediction,
-                                       dashboard_lucky_color, dashboard_date, yoga_text, dasha_tree_raw, topic_cache,
-                                       house_insights_cache,
-                                       kundli_fetch_status, kundli_fetch_error, kundli_fetch_started_at,
-                                       report_status, report_error, report_progress, report_started_at, report_file_path,
-                                       latitude, longitude, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (session_id, None, None, None, 'Self', 'Hinglish', None, None, None, None,
-                 None, None, None, None, None, None, None, None, None, None,
-                 None, "idle", None, None,
-                 "idle", None, None, None, None,
-                 None, None, now_str)
+                f"INSERT INTO sessions ({', '.join(columns)}) VALUES ({placeholders})",
+                values,
             )
             conn.commit()
-
-            return {
-                "session_id": session_id, "dob": None, "birth_time": None, "birth_place": None,
-                "gender": None, "name": None, "relation": "Self", "language": "Hinglish", "pending_field": None,
-                "kundli_data": None, "kundli_raw": None, "kundli_dasha": None, "kundli_divisional": None,
-                "kundli_full_raw": None,
-                "topic_memory": None, "last_reasoning_trace": None,
-                "dashboard_prediction": None, "dashboard_lucky_color": None, "dashboard_date": None,
-                "yoga_text": None, "dasha_tree_raw": None, "topic_cache": None,
-                "house_insights_cache": None,
-                "kundli_fetch_status": "idle", "kundli_fetch_error": None, "kundli_fetch_started_at": None,
-                "report_status": "idle", "report_error": None, "report_progress": None,
-                "report_started_at": None, "report_file_path": None,
-                "latitude": None, "longitude": None, "updated_at": now_str
-            }
+            return session_defaults
 
     def update_session(self, session_id: str, updates: Dict) -> Dict:
         if not updates:
@@ -164,7 +195,8 @@ class MemoryDatabase:
             "kundli_divisional", "kundli_full_raw", "topic_memory", "last_reasoning_trace",
             "dashboard_prediction", "dashboard_lucky_color", "dashboard_date",
             "weekly_guidance", "weekly_week_start", "yoga_text", "dasha_tree_raw", "topic_cache",
-            "house_insights_cache",
+            "house_insights_cache", "user_memory_json", "prediction_journal_json",
+            "conversation_summary", "last_summarized_msg_count",
             "kundli_fetch_status", "kundli_fetch_error", "kundli_fetch_started_at",
             "report_status", "report_error", "report_progress", "report_started_at", "report_file_path",
         }
@@ -173,7 +205,8 @@ class MemoryDatabase:
             "kundli_full_raw", "topic_memory", "last_reasoning_trace",
             "dashboard_prediction", "dashboard_lucky_color", "dashboard_date",
             "weekly_guidance", "weekly_week_start", "yoga_text", "dasha_tree_raw", "topic_cache",
-            "house_insights_cache",
+            "house_insights_cache", "user_memory_json", "prediction_journal_json",
+            "conversation_summary", "last_summarized_msg_count",
             "kundli_fetch_status", "kundli_fetch_error", "kundli_fetch_started_at",
             "report_status", "report_error", "report_progress", "report_started_at", "report_file_path",
         }
@@ -222,23 +255,8 @@ class MemoryDatabase:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-            cursor.execute("UPDATE sessions SET topic_memory = NULL, updated_at = ? WHERE session_id = ?",
+            cursor.execute("UPDATE sessions SET topic_memory = NULL, conversation_summary = NULL, last_summarized_msg_count = 0, updated_at = ? WHERE session_id = ?",
                            (datetime.utcnow().isoformat(), session_id))
             conn.commit()
-    
-    def get_all_valid_profiles(self) -> List[Dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT session_id, name, relation, dob, birth_time, birth_place, gender, language, updated_at
-                FROM sessions
-                WHERE name IS NOT NULL AND dob IS NOT NULL AND birth_place IS NOT NULL
-                ORDER BY updated_at DESC
-                """
-            )
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
-
 
 db = MemoryDatabase()
